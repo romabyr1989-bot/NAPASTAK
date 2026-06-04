@@ -50,11 +50,15 @@ STORAGE_RUNNING=0
 if [ -x "$STORAGE" ]; then
     "$STORAGE" -p "$ST_PORT" -d "$ST_DATA_DIR" >"$ST_DATA_DIR/st.log" 2>&1 &
     ST_PID=$!
-    # Wait up to 3s for storage node
+    # Wait up to 3s for storage node. dfo_storage speaks a binary cluster
+    # protocol (proto_recv/proto_send), NOT HTTP — there is no /health
+    # endpoint, so liveness == the listen socket accepting a TCP connect.
     for i in $(seq 1 15); do
-        ST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "http://127.0.0.1:$ST_PORT/health" 2>/dev/null || true)
-        [ "$ST_STATUS" = "200" ] && STORAGE_RUNNING=1 && break
+        if (exec 3<>"/dev/tcp/127.0.0.1/$ST_PORT") 2>/dev/null; then
+            exec 3>&- 3<&-
+            STORAGE_RUNNING=1
+            break
+        fi
         sleep 0.2
     done
     check "storage node started" "$([ "$STORAGE_RUNNING" = "1" ] && echo 1 || echo 0)"

@@ -15,7 +15,16 @@
 #include <pthread.h>
 
 static volatile sig_atomic_t g_shutdown = 0;
-static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
+static volatile sig_atomic_t g_srv_fd   = -1;
+static void sig_handler(int sig) {
+    (void)sig;
+    g_shutdown = 1;
+    /* Belt-and-suspenders for Linux: shutdown() (async-signal-safe) wakes a
+       blocked accept(). On macOS/BSD this is a no-op on a listening socket
+       (ENOTCONN); there the real mechanism is blocking these signals in the
+       client threads (see client_thread_fn) so main always gets the EINTR. */
+    if (g_srv_fd >= 0) shutdown(g_srv_fd, SHUT_RDWR);
+}
 
 static char     g_data_dir[512] = "./data_node";
 static Catalog *g_catalog       = NULL;
@@ -84,6 +93,16 @@ static void handle_replicate(int fd, ProtoHeader *hdr, void *body, size_t blen) 
 }
 
 static void *client_thread_fn(void *arg) {
+    /* Block SIGINT/SIGTERM here so they are always delivered to the main
+       thread, whose accept() (installed without SA_RESTART) then returns
+       EINTR and lets the shutdown loop exit. Without this a client thread
+       blocked in recv() can swallow the signal and the node ignores it. */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &block, NULL);
+
     ClientCtx *ctx = (ClientCtx *)arg;
     int fd = ctx->fd;
     free(ctx);
@@ -131,8 +150,16 @@ int main(int argc, char **argv) {
     log_init(&g_log, stderr, LOG_INFO, 0);
     LOG_INFO("storage_node starting — port=%d data_dir=%s", port, g_data_dir);
 
-    signal(SIGINT,  sig_handler);
-    signal(SIGTERM, sig_handler);
+    /* No SA_RESTART: SIGINT/SIGTERM must interrupt the blocking accept()
+       (EINTR) so the while(!g_shutdown) loop can re-check and exit. On
+       macOS/BSD plain signal() installs handlers with SA_RESTART, which
+       auto-restarts accept() and makes the node ignore SIGTERM. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sig_handler;
+    sa.sa_flags   = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     char db_path[512];
@@ -142,6 +169,7 @@ int main(int argc, char **argv) {
     hm_init(&g_tables, NULL, 32);
 
     int srv_fd = socket(AF_INET, SOCK_STREAM, 0);
+    g_srv_fd = srv_fd;
     int opt = 1;
     setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
