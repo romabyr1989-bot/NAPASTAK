@@ -253,6 +253,17 @@ int pipeline_from_json(Pipeline *p, const char *json) {
                     json_str(json_get(s, "python_code"), ""),
                     sizeof(st->python_code) - 1);
             st->python_timeout_sec = (int)json_int(json_get(s, "python_timeout_sec"), 300);
+            /* SCD2 step (optional) — missing fields default to "" (back-compat) */
+            strncpy(st->scd2_business_key,       json_str(json_get(s,"scd2_business_key"),""),       sizeof(st->scd2_business_key)-1);
+            strncpy(st->scd2_effective_from_col, json_str(json_get(s,"scd2_effective_from_col"),""), sizeof(st->scd2_effective_from_col)-1);
+            strncpy(st->scd2_effective_to_col,   json_str(json_get(s,"scd2_effective_to_col"),""),   sizeof(st->scd2_effective_to_col)-1);
+            strncpy(st->scd2_current_flag_col,   json_str(json_get(s,"scd2_current_flag_col"),""),   sizeof(st->scd2_current_flag_col)-1);
+            strncpy(st->scd2_version_col,        json_str(json_get(s,"scd2_version_col"),""),        sizeof(st->scd2_version_col)-1);
+            strncpy(st->scd2_hash_col,           json_str(json_get(s,"scd2_hash_col"),""),           sizeof(st->scd2_hash_col)-1);
+            strncpy(st->scd2_compare_columns,    json_str(json_get(s,"scd2_compare_columns"),""),    sizeof(st->scd2_compare_columns)-1);
+            strncpy(st->scd2_transaction_time,   json_str(json_get(s,"scd2_transaction_time"),""),   sizeof(st->scd2_transaction_time)-1);
+            strncpy(st->scd2_deleted_flag,       json_str(json_get(s,"scd2_deleted_flag"),""),       sizeof(st->scd2_deleted_flag)-1);
+            strncpy(st->scd2_ignored_columns,    json_str(json_get(s,"scd2_ignored_columns"),""),    sizeof(st->scd2_ignored_columns)-1);
             st->max_retries = (int)json_int(json_get(s,"max_retries"), 3);
             st->retry_delay_sec = (int)json_int(json_get(s,"retry_delay_sec"), 30);
             st->retry_count = 0;
@@ -294,6 +305,17 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
             jb_key(&jb,"python_code");        jb_str(&jb, st->python_code);
             jb_key(&jb,"python_timeout_sec"); jb_int(&jb, st->python_timeout_sec);
         }
+        /* SCD2 fields — emitted only when set, so pre-SCD2 pipelines round-trip unchanged */
+        if (st->scd2_business_key[0])       { jb_key(&jb,"scd2_business_key");       jb_str(&jb, st->scd2_business_key); }
+        if (st->scd2_effective_from_col[0]) { jb_key(&jb,"scd2_effective_from_col"); jb_str(&jb, st->scd2_effective_from_col); }
+        if (st->scd2_effective_to_col[0])   { jb_key(&jb,"scd2_effective_to_col");   jb_str(&jb, st->scd2_effective_to_col); }
+        if (st->scd2_current_flag_col[0])   { jb_key(&jb,"scd2_current_flag_col");   jb_str(&jb, st->scd2_current_flag_col); }
+        if (st->scd2_version_col[0])        { jb_key(&jb,"scd2_version_col");        jb_str(&jb, st->scd2_version_col); }
+        if (st->scd2_hash_col[0])           { jb_key(&jb,"scd2_hash_col");           jb_str(&jb, st->scd2_hash_col); }
+        if (st->scd2_compare_columns[0])    { jb_key(&jb,"scd2_compare_columns");    jb_str(&jb, st->scd2_compare_columns); }
+        if (st->scd2_transaction_time[0])   { jb_key(&jb,"scd2_transaction_time");   jb_str(&jb, st->scd2_transaction_time); }
+        if (st->scd2_deleted_flag[0])       { jb_key(&jb,"scd2_deleted_flag");       jb_str(&jb, st->scd2_deleted_flag); }
+        if (st->scd2_ignored_columns[0])    { jb_key(&jb,"scd2_ignored_columns");    jb_str(&jb, st->scd2_ignored_columns); }
         jb_key(&jb,"max_retries");      jb_int(&jb,st->max_retries);
         jb_key(&jb,"retry_delay_sec");  jb_int(&jb,st->retry_delay_sec);
         jb_key(&jb,"status");           jb_int(&jb,(int)st->status);

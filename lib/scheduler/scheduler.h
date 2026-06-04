@@ -56,6 +56,21 @@ typedef struct {
      * Requires `pandas` available to the system `python3`. */
     char        python_code[8192];
     int         python_timeout_sec;   /* default: 300 */
+
+    /* SCD2 (slowly-changing-dimension, type 2) step config. All optional —
+     * empty strings mean "not an SCD2 step", preserving back-compat for
+     * pipelines saved before these fields existed. Column names below refer
+     * to columns of target_table. */
+    char        scd2_business_key[256];      /* natural key col(s), comma-separated for composite */
+    char        scd2_effective_from_col[128];/* timestamp col: when a version becomes valid */
+    char        scd2_effective_to_col[128];  /* timestamp col: when a version is superseded */
+    char        scd2_current_flag_col[128];  /* bool col: is this the current version */
+    char        scd2_version_col[128];       /* monotonic version-number col */
+    char        scd2_hash_col[128];          /* row-hash col used for change detection */
+    char        scd2_compare_columns[512];   /* cols compared to detect change, comma-separated */
+    char        scd2_transaction_time[128];  /* col ordered DESC to pick the current version (window ORDER BY); defaults to effective_from when empty */
+    char        scd2_deleted_flag[128];      /* source col: truthy → close the key without a new version (soft delete) */
+    char        scd2_ignored_columns[512];   /* cols excluded from change comparison when compare_columns is empty, comma-separated */
 } PipelineStep;
 
 typedef struct {
