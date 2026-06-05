@@ -78,6 +78,68 @@ alert_cooldown: 300
 The schema mirrors the REST API JSON exactly. See [TRIGGERS.md](TRIGGERS.md)
 for the trigger reference.
 
+## MDM pipeline (incremental → normalize → match → SCD2)
+
+The YAML schema is a 1:1 map of the step JSON, so MDM fields need no special
+syntax — just set them on the step:
+
+- **Incremental pull**: `connector_config.read_mode: cursor` + `cursor_column`
+  (a monotonic column like `updated_at`/`id`/`lsn`). The connector reads only
+  rows newer than the last high-watermark instead of the full table.
+- **Match**: an ordinary SQL step using the `jaro_winkler(a, b)` /
+  `levenshtein(a, b)` scalar functions.
+- **SCD2**: set `scd2_business_key` (this is what makes the step an SCD2 step) plus the
+  `scd2_*` columns; the step historises `target_table` from its `transform_sql`
+  source slice.
+
+```yaml
+# pipelines/mdm_customer.yaml
+name: mdm_customer
+enabled: true
+
+steps:
+  # 1. Incremental source — only rows whose updated_at advanced since last run
+  - id: ingest
+    connector_type: postgresql
+    connector_config:
+      host: db.prod.internal
+      dbname: crm
+      table: customers
+      read_mode: cursor          # full | cursor | cdc
+      cursor_column: updated_at  # high-watermark column
+    target_table: raw_customers
+
+  # 2. Normalize with plain SQL (trim/lower are built-in scalars)
+  - id: normalize
+    transform_sql: |
+      SELECT id, trim(lower(name)) AS name, lower(email) AS email, updated_at
+      FROM raw_customers
+    target_table: clean_customers
+
+  # 3. Fuzzy match candidate duplicates via jaro_winkler
+  - id: match
+    transform_sql: |
+      SELECT a.id AS a_id, b.id AS b_id,
+             jaro_winkler(a.name, b.name) AS similarity
+      FROM clean_customers a, clean_customers b
+      WHERE a.id < b.id AND jaro_winkler(a.name, b.name) >= 0.9
+    target_table: customer_matches
+
+  # 4. SCD2 — historise the golden dimension
+  - id: historise
+    transform_sql: "SELECT * FROM clean_customers"
+    target_table: dim_customer
+    scd2_business_key: id              # presence of this field = SCD2 step
+    scd2_compare_columns: name,email   # empty = compare all non-meta columns
+    scd2_transaction_time: updated_at  # ORDER BY for the current-version window
+    scd2_effective_from_col: valid_from
+    scd2_effective_to_col: valid_to
+    scd2_deleted_flag: is_deleted      # source soft-delete marker
+```
+
+`connector_config` is written as a nested map; the loader serialises it back to
+the JSON string the step schema expects, so `cursor_column` survives intact.
+
 ## YAML subset supported
 
 The built-in parser accepts a constrained subset — sufficient for

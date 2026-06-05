@@ -416,8 +416,8 @@ async function runStepPreview(idx, opts = {}) {
   };
 
   if (!step) { setStatus(`step #${idx} не найден в pb.steps (length=${pb.steps.length})`, 'var(--red)'); return; }
-  if (!step.transform_sql && !step.python_code && !step.connector_type) {
-    setStatus('Шаг пустой — заполни SQL, Python или подключи коннектор', 'var(--amber)');
+  if (!step.transform_sql && !step.python_code && !step.connector_type && !step.scd2_business_key) {
+    setStatus('Шаг пустой — заполни SQL, Python, коннектор или SCD2', 'var(--amber)');
     return;
   }
   if (save && !step.target_table) {
@@ -436,6 +436,7 @@ async function runStepPreview(idx, opts = {}) {
    * overrides only the LAST step's target_table for save=0, so intermediate
    * tables are written for real — same as running the pipeline up to here. */
   const chain = pb.steps.slice(0, idx + 1).map((s, i) => ({
+    ...stepForApi(s),               /* carries scd2_ and any new fields through */
     id:                 s.id || `s${i}`,
     name:               s.name || `step ${i + 1}`,
     connector_type:     s.connector_type || '',
@@ -1096,6 +1097,119 @@ function pbUpdateConnConfig(idx, field, val) {
   pb.steps[idx].connector_config = JSON.stringify(cfg);
 }
 
+/* ── Step "type" ────────────────────────────────────────────────────────────
+ * A step has no explicit "type" field — the backend dispatches on WHICH field
+ * is filled (python_code → connector_type → scd2_business_key → transform_sql).
+ * The UI mirrors that: `_ui_type` is a transient authoring hint (stripped before
+ * any API call by stepForApi) so a half-filled SCD2/Match step keeps its form
+ * shown; when absent (e.g. a pipeline loaded from the server) we derive it. */
+const SCD2_FIELDS = ['scd2_business_key','scd2_compare_columns','scd2_transaction_time',
+                     'scd2_effective_from_col','scd2_effective_to_col','scd2_deleted_flag',
+                     'scd2_ignored_columns'];
+const PY_STARTER =
+  '# input  : df  (pandas DataFrame from transform_sql)\n' +
+  '# output : df  (will be written to target_table as CSV)\n' +
+  'df["score"] = df["score"] * 2\n' +
+  'df = df[df["score"] > 50]';
+
+const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','s3','kafka','airbyte'];
+
+function stepType(step) {
+  if (step._ui_type) return step._ui_type;
+  if (step.scd2_business_key) return 'scd2';
+  if (step.python_code)       return 'python';
+  if (step.connector_type)    return step.connector_type;  /* the specific connector */
+  return 'sql';
+}
+
+/* Shallow copy of a step WITHOUT UI-only (underscore-prefixed) keys — used
+ * everywhere a step is sent to the API so _ui_type / _match_* never leak. */
+function stepForApi(s) {
+  const out = {};
+  for (const k in s) if (!k.startsWith('_')) out[k] = s[k];
+  return out;
+}
+
+function pbChangeStepType(idx, type) {
+  const s = pb.steps[idx];
+  s._ui_type = type;
+  /* Reset every discriminating field so only the chosen one stays set. */
+  s.connector_type = '';
+  s.connector_config = '';
+  s.python_code = '';
+  SCD2_FIELDS.forEach(k => delete s[k]);
+  if (type === 'python') {
+    s.python_code = PY_STARTER;
+  } else if (CONNECTOR_TYPES.includes(type)) {
+    s.connector_type = type;
+    s.connector_config = '{}';
+  } else if (type === 'scd2') {
+    s.scd2_business_key       = s.scd2_business_key       || '';
+    s.scd2_effective_from_col = s.scd2_effective_from_col || 'valid_from';
+    s.scd2_effective_to_col   = s.scd2_effective_to_col   || 'valid_to';
+  }
+  renderBuilderSteps();
+}
+
+/* Match step → builds a jaro_winkler() cross-match query into transform_sql.
+ * Match is just a SQL step on the backend, so this only seeds the textarea;
+ * the user can edit the generated SQL freely afterwards. */
+function pbGenerateMatchSQL(idx) {
+  const s = pb.steps[idx];
+  const A  = (s._match_left  || 'table_a').trim();
+  const B  = (s._match_right || 'table_b').trim();
+  const c  = (s._match_col   || 'name').trim();
+  const th = (s._match_threshold != null ? s._match_threshold : 0.85);
+  s.transform_sql =
+`SELECT a.${c} AS left_${c}, b.${c} AS right_${c},
+       jaro_winkler(a.${c}, b.${c}) AS similarity
+FROM ${A} a, ${B} b
+WHERE jaro_winkler(a.${c}, b.${c}) >= ${th}`;
+  renderBuilderSteps();
+}
+
+function makeScd2FieldsHTML(step, idx) {
+  const f = (label, key, ph, hint) => `
+    <div class="form-group" style="margin:0"><label>${label}${hint ? ` <span class="label-hint">${hint}</span>` : ''}</label>
+      <input type="text" value="${escAttr(step[key] || '')}" placeholder="${ph}"
+             oninput="pbUpdateStep(${idx},'${key}',this.value)"></div>`;
+  return `
+    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+        🕒 SCD2 (тип 2). Поле <strong>SQL-трансформация</strong> ниже = входящий срез источника.</div>
+      <div class="step-row-2">${f('Business key','scd2_business_key','customer_id','через запятую')}${f('Compare columns','scd2_compare_columns','name,email,city','пусто = все')}</div>
+      <div class="step-row-2" style="margin-top:.4rem">${f('valid_from колонка','scd2_effective_from_col','valid_from')}${f('valid_to колонка','scd2_effective_to_col','valid_to')}</div>
+      <div class="step-row-2" style="margin-top:.4rem">${f('transaction_time','scd2_transaction_time','updated_at','для ORDER BY окна')}${f('deleted_flag','scd2_deleted_flag','is_deleted','soft-delete в источнике')}</div>
+    </div>`;
+}
+
+function makeMatchFieldsHTML(step, idx) {
+  const thr = step._match_threshold != null ? step._match_threshold : 0.85;
+  return `
+    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+        🔗 Match (fuzzy). Кнопка соберёт SQL c <code>jaro_winkler()</code> в поле <strong>SQL-трансформация</strong> ниже — его можно править.</div>
+      <div class="step-row-2">
+        <div class="form-group" style="margin:0"><label>Таблица A</label>
+          <input type="text" value="${escAttr(step._match_left || '')}" placeholder="customers_crm"
+                 oninput="pbUpdateStep(${idx},'_match_left',this.value)"></div>
+        <div class="form-group" style="margin:0"><label>Таблица B</label>
+          <input type="text" value="${escAttr(step._match_right || '')}" placeholder="customers_erp"
+                 oninput="pbUpdateStep(${idx},'_match_right',this.value)"></div>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0"><label>Ключевая колонка</label>
+          <input type="text" value="${escAttr(step._match_col || '')}" placeholder="name"
+                 oninput="pbUpdateStep(${idx},'_match_col',this.value)"></div>
+        <div class="form-group" style="margin:0"><label>Порог similarity (0..1)</label>
+          <input type="number" min="0" max="1" step="0.05" value="${escAttr(thr)}"
+                 oninput="pbUpdateStep(${idx},'_match_threshold',parseFloat(this.value))"></div>
+      </div>
+      <button type="button" class="btn btn-sm btn-primary" style="margin-top:.5rem"
+              onclick="event.stopPropagation();pbGenerateMatchSQL(${idx})">⚙ Сгенерировать SQL</button>
+    </div>`;
+}
+
 function pbToggleDep(stepIdx, depIdx, checked) {
   const deps = pb.steps[stepIdx].deps || [];
   if (checked && !deps.includes(depIdx)) deps.push(depIdx);
@@ -1205,6 +1319,7 @@ function makeStepCard(step, idx) {
       runStepPreview(idx);
     }
   });
+  const t = stepType(step);
   div.innerHTML = `
     <div class="step-header">
       <span class="step-num">${idx + 1}</span>
@@ -1220,17 +1335,23 @@ function makeStepCard(step, idx) {
     <div class="step-body">
       <div class="step-row-2">
         <div class="form-group" style="margin:0">
-          <label>Источник данных</label>
-          <select onchange="pbChangeConnType(${idx}, this.value)">
-            <option value=""           ${!step.connector_type && !step.python_code ?'selected':''}>— только SQL-трансформация —</option>
-            <option value="__python"   ${!!step.python_code                         ?'selected':''}>🐍 Python-скрипт (pandas DataFrame)</option>
-            <option value="csv"        ${step.connector_type==='csv'               ?'selected':''}>CSV файл</option>
-            <option value="parquet"    ${step.connector_type==='parquet'           ?'selected':''}>Parquet файл</option>
-            <option value="json_http"  ${step.connector_type==='json_http'         ?'selected':''}>HTTP / REST API (JSON)</option>
-            <option value="postgresql" ${step.connector_type==='postgresql'        ?'selected':''}>PostgreSQL</option>
-            <option value="s3"         ${step.connector_type==='s3'                ?'selected':''}>S3 / MinIO</option>
-            <option value="kafka"      ${step.connector_type==='kafka'             ?'selected':''}>Kafka</option>
-            <option value="airbyte"    ${step.connector_type==='airbyte'           ?'selected':''}>🛬 Airbyte (любой источник)</option>
+          <label>Тип шага <span class="label-hint">= какое поле заполнено</span></label>
+          <select onchange="pbChangeStepType(${idx}, this.value)">
+            <optgroup label="Трансформации">
+              <option value="sql"    ${t==='sql'   ?'selected':''}>SQL-трансформация</option>
+              <option value="python" ${t==='python'?'selected':''}>🐍 Python (pandas)</option>
+              <option value="scd2"   ${t==='scd2'  ?'selected':''}>🕒 SCD2 (историзация)</option>
+              <option value="match"  ${t==='match' ?'selected':''}>🔗 Match (fuzzy)</option>
+            </optgroup>
+            <optgroup label="Источники (коннекторы)">
+              <option value="csv"        ${t==='csv'       ?'selected':''}>CSV файл</option>
+              <option value="parquet"    ${t==='parquet'   ?'selected':''}>Parquet файл</option>
+              <option value="json_http"  ${t==='json_http' ?'selected':''}>HTTP / REST API (JSON)</option>
+              <option value="postgresql" ${t==='postgresql'?'selected':''}>🗄 PostgreSQL (БД)</option>
+              <option value="s3"         ${t==='s3'        ?'selected':''}>S3 / MinIO</option>
+              <option value="kafka"      ${t==='kafka'     ?'selected':''}>📨 Kafka</option>
+              <option value="airbyte"    ${t==='airbyte'   ?'selected':''}>🛬 Airbyte (любой источник)</option>
+            </optgroup>
           </select>
         </div>
         <div class="form-group" style="margin:0">
@@ -1241,6 +1362,8 @@ function makeStepCard(step, idx) {
         </div>
       </div>
       <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(step, idx)}</div>
+      ${t === 'scd2'  ? makeScd2FieldsHTML(step, idx)  : ''}
+      ${t === 'match' ? makeMatchFieldsHTML(step, idx) : ''}
       <div class="step-row-2" style="margin-top:0.75rem">
         <div class="form-group" style="margin:0">
           <label>Max retries</label>
@@ -1417,6 +1540,23 @@ function makeConnectorConfigHTML(step, idx) {
                oninput="pbUpdateConnConfig(${idx},'table',this.value)"
                placeholder="orders или SELECT * FROM orders WHERE active=true">
       </div>
+    </div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Режим забора <span class="label-hint">incremental → cursor_column</span></label>
+        <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>full — полная выгрузка</option>
+          <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>cursor — инкремент по высокой отметке</option>
+          <option value="cdc"    ${cfg.read_mode==='cdc'            ?'selected':''}>cdc — потоковый (фаза 3)</option>
+        </select>
+      </div>
+      ${(cfg.read_mode==='cursor' || cfg.read_mode==='cdc') ? `
+      <div class="form-group" style="margin:0;flex:2">
+        <label>cursor_column <span class="label-hint">монотонное поле: id / updated_at / lsn</span></label>
+        <input type="text" value="${escAttr(cfg.cursor_column || '')}"
+               oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)"
+               placeholder="updated_at">
+      </div>` : ''}
     </div>`;
 
   if (type === 'airbyte') {
@@ -1492,6 +1632,7 @@ async function persistBuilderPipeline() {
   if (!name) { showToast('Необходимо указать название конвейера', 'error'); return null; }
 
   const steps = pb.steps.map((s, i) => ({
+    ...stepForApi(s),               /* carries scd2_ and any new fields through */
     id:               s.id || `step_${i + 1}`,
     name:             s.name || `Шаг ${i + 1}`,
     connector_type:   s.connector_type   || '',
