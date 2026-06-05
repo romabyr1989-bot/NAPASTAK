@@ -402,6 +402,60 @@ static bool is_agg_name(const char *fn) {
            !strcasecmp(fn,"AVG")   || !strcasecmp(fn,"MIN") || !strcasecmp(fn,"MAX");
 }
 
+/* ── Fuzzy-match primitives for eval_func (Match step). Ported from the
+ *    qengine.c implementations so the gateway query engine — which is this
+ *    file's eval_func, NOT qengine.c — can score candidate pairs. ── */
+static int api_levenshtein(const char *x, const char *y, Arena *a) {
+    size_t lx = strlen(x), ly = strlen(y);
+    if (lx == 0) return (int)ly;
+    if (ly == 0) return (int)lx;
+    int *prev = arena_alloc(a, (ly + 1) * sizeof(int));
+    int *cur  = arena_alloc(a, (ly + 1) * sizeof(int));
+    for (size_t j = 0; j <= ly; j++) prev[j] = (int)j;
+    for (size_t i = 1; i <= lx; i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= ly; j++) {
+            int cost = (x[i-1] == y[j-1]) ? 0 : 1;
+            int del = prev[j] + 1, ins = cur[j-1] + 1, sub = prev[j-1] + cost;
+            int m = del < ins ? del : ins;
+            cur[j] = m < sub ? m : sub;
+        }
+        int *t = prev; prev = cur; cur = t;
+    }
+    return prev[ly];
+}
+
+static double api_jaro_winkler(const char *s1, const char *s2, Arena *a) {
+    size_t l1 = strlen(s1), l2 = strlen(s2);
+    if (l1 == 0 || l2 == 0) return (l1 == l2) ? 1.0 : 0.0;
+    size_t maxl = l1 > l2 ? l1 : l2;
+    long win = (long)(maxl / 2) - 1; if (win < 0) win = 0;
+    char *m1 = arena_calloc(a, l1);
+    char *m2 = arena_calloc(a, l2);
+    size_t matches = 0;
+    for (size_t i = 0; i < l1; i++) {
+        long lo = (long)i - win; if (lo < 0) lo = 0;
+        long hi = (long)i + win; if (hi >= (long)l2) hi = (long)l2 - 1;
+        for (long j = lo; j <= hi; j++)
+            if (!m2[j] && s1[i] == s2[j]) { m1[i] = 1; m2[j] = 1; matches++; break; }
+    }
+    if (matches == 0) return 0.0;
+    size_t t = 0, k = 0;
+    for (size_t i = 0; i < l1; i++) {
+        if (!m1[i]) continue;
+        while (!m2[k]) k++;
+        if (s1[i] != s2[k]) t++;
+        k++;
+    }
+    double mm = (double)matches, tt = (double)t / 2.0;
+    double jaro = (mm/(double)l1 + mm/(double)l2 + (mm - tt)/mm) / 3.0;
+    size_t pref = 0;
+    for (size_t i = 0; i < l1 && i < l2 && i < 4; i++) {
+        if (s1[i] == s2[i]) pref++; else break;
+    }
+    return jaro + (double)pref * 0.1 * (1.0 - jaro);
+}
+
 static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena *a) {
     /* scalar functions */
     if (!strcasecmp(fn,"coalesce") || !strcasecmp(fn,"ifnull") || !strcasecmp(fn,"nvl")) {
@@ -588,6 +642,15 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
                 char *tok=strtok(tmp,s1); int i=1;
                 while(tok&&i<idx){tok=strtok(NULL,s1);i++;}
                 return tok?vstr_s(arena_strdup(a,tok)):vnull();
+            }
+            /* fuzzy match (MDM Match step) */
+            if (!strcasecmp(fn,"levenshtein")) {
+                if (a0.is_null||a1.is_null) return vnull();
+                return vnum((double)api_levenshtein(s0, s1, a));
+            }
+            if (!strcasecmp(fn,"jaro_winkler")) {
+                if (a0.is_null||a1.is_null) return vnull();
+                return vnum(api_jaro_winkler(s0, s1, a));
             }
 
             if (nargs >= 3) {
@@ -3338,7 +3401,13 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
         jb_obj_begin(&jb);
         jb_key(&jb, "error"); jb_str(&jb, plp->error_msg[0] ? plp->error_msg : "step failed");
         jb_obj_end(&jb);
-        http_resp_json(resp, 500, jb_done(&jb));
+        /* Copy the body out of the arena BEFORE destroying it — resp->body is
+         * zero-copy and the HTTP framework sends it after this handler returns
+         * (matches the success path below; omitting this was a use-after-free). */
+        const char *body = jb_done(&jb);
+        static _Thread_local char err_buf[1024];
+        snprintf(err_buf, sizeof(err_buf), "%s", body ? body : "{\"error\":\"step failed\"}");
+        http_resp_json(resp, 500, err_buf);
         arena_destroy(a);
         free(plp);
         return;
@@ -3557,8 +3626,12 @@ static void send_pipeline_alert(Pipeline *p, const char *message, bool success) 
 /* ── Run one connector step: pull all batches into target_table ── */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
     char so_path[1024];
+    /* Map UI/YAML connector names to the built .so basename. The PostgreSQL
+     * plugin ships as pg_connector.so, but the UI/YAML use "postgresql". */
+    const char *conn = st->connector_type;
+    if (!strcmp(conn, "postgresql") || !strcmp(conn, "postgres")) conn = "pg";
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
-             app->plugins_dir, st->connector_type);
+             app->plugins_dir, conn);
 
     ConnectorInst *inst = connector_load(so_path, st->connector_config, a);
     if (!inst) {

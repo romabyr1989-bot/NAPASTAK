@@ -15,6 +15,71 @@ static bool bit_is_null(uint8_t *bm, int i) {
     return bm && !!(bm[i/8] & (1u << (i%8)));
 }
 
+/* Coerce any scalar to text for the string / fuzzy-match builtins below.
+ * Returns NULL for SQL NULL so callers can propagate NULL. */
+static const char *qe_text(Scalar s, Arena *a) {
+    switch (s.type) {
+    case SV_TEXT:   return s.val.sval;
+    case SV_INT:    return arena_sprintf(a, "%lld", (long long)s.val.ival);
+    case SV_DOUBLE: return arena_sprintf(a, "%.10g", s.val.fval);
+    case SV_BOOL:   return s.val.bval ? "true" : "false";
+    default:        return NULL;  /* SV_NULL */
+    }
+}
+
+/* Levenshtein edit distance (two-row DP, arena-backed). */
+static int qe_levenshtein(const char *x, const char *y, Arena *a) {
+    size_t lx = strlen(x), ly = strlen(y);
+    if (lx == 0) return (int)ly;
+    if (ly == 0) return (int)lx;
+    int *prev = arena_alloc(a, (ly + 1) * sizeof(int));
+    int *cur  = arena_alloc(a, (ly + 1) * sizeof(int));
+    for (size_t j = 0; j <= ly; j++) prev[j] = (int)j;
+    for (size_t i = 1; i <= lx; i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= ly; j++) {
+            int cost = (x[i-1] == y[j-1]) ? 0 : 1;
+            int del = prev[j] + 1, ins = cur[j-1] + 1, sub = prev[j-1] + cost;
+            int m = del < ins ? del : ins;
+            cur[j] = m < sub ? m : sub;
+        }
+        int *t = prev; prev = cur; cur = t;
+    }
+    return prev[ly];
+}
+
+/* Jaro-Winkler similarity in [0,1] (prefix weight p=0.1, max prefix 4). */
+static double qe_jaro_winkler(const char *s1, const char *s2, Arena *a) {
+    size_t l1 = strlen(s1), l2 = strlen(s2);
+    if (l1 == 0 || l2 == 0) return (l1 == l2) ? 1.0 : 0.0;
+    size_t maxl = l1 > l2 ? l1 : l2;
+    long win = (long)(maxl / 2) - 1; if (win < 0) win = 0;
+    char *m1 = arena_calloc(a, l1);  /* match flags */
+    char *m2 = arena_calloc(a, l2);
+    size_t matches = 0;
+    for (size_t i = 0; i < l1; i++) {
+        long lo = (long)i - win; if (lo < 0) lo = 0;
+        long hi = (long)i + win; if (hi >= (long)l2) hi = (long)l2 - 1;
+        for (long j = lo; j <= hi; j++)
+            if (!m2[j] && s1[i] == s2[j]) { m1[i] = 1; m2[j] = 1; matches++; break; }
+    }
+    if (matches == 0) return 0.0;
+    size_t t = 0, k = 0;
+    for (size_t i = 0; i < l1; i++) {
+        if (!m1[i]) continue;
+        while (!m2[k]) k++;
+        if (s1[i] != s2[k]) t++;
+        k++;
+    }
+    double mm = (double)matches, tt = (double)t / 2.0;
+    double jaro = (mm/(double)l1 + mm/(double)l2 + (mm - tt)/mm) / 3.0;
+    size_t pref = 0;
+    for (size_t i = 0; i < l1 && i < l2 && i < 4; i++) {
+        if (s1[i] == s2[i]) pref++; else break;
+    }
+    return jaro + (double)pref * 0.1 * (1.0 - jaro);
+}
+
 Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
     Scalar s = {SV_NULL};
     if (!e) return s;
@@ -63,6 +128,28 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
         /* aggregate functions return 0/null in scalar context */
         if (!strcasecmp(fn,"count")) { s.type=SV_INT; s.val.ival=0; return s; }
         if (!strcasecmp(fn,"now"))   { s.type=SV_INT; s.val.ival=(int64_t)time(NULL); return s; }
+        /* variadic string builtins (handle their own args) */
+        if (!strcasecmp(fn,"coalesce") && e->nargs > 0) {
+            for (int i = 0; i < e->nargs; i++) {
+                Scalar v = eval_expr(e->args[i], ctx, a);
+                if (v.type != SV_NULL) return v;
+            }
+            return s;  /* all NULL */
+        }
+        if (!strcasecmp(fn,"concat") && e->nargs > 0) {
+            size_t cap = 64, off = 0;
+            char *out = arena_alloc(a, cap);
+            for (int i = 0; i < e->nargs; i++) {
+                const char *t = qe_text(eval_expr(e->args[i], ctx, a), a);
+                if (!t) continue;  /* NULL treated as empty, like SQL CONCAT */
+                size_t tl = strlen(t);
+                if (off + tl + 1 > cap) { while (off+tl+1>cap) cap*=2;
+                    char *nb=arena_alloc(a,cap); memcpy(nb,out,off); out=nb; }
+                memcpy(out+off, t, tl); off += tl;
+            }
+            out[off] = '\0';
+            s.type=SV_TEXT; s.val.sval=out; return s;
+        }
         if (e->nargs > 0) {
             Scalar arg0 = eval_expr(e->args[0], ctx, a);
             if (!strcasecmp(fn,"abs")) {
@@ -81,6 +168,49 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
             }
             if (!strcasecmp(fn,"length") && arg0.type==SV_TEXT) {
                 s.type=SV_INT; s.val.ival=(int64_t)strlen(arg0.val.sval); return s;
+            }
+            if (!strcasecmp(fn,"trim")) {
+                const char *t = qe_text(arg0, a);
+                if (!t) return s;  /* NULL → NULL */
+                const char *b = t;
+                while (*b==' '||*b=='\t'||*b=='\n'||*b=='\r') b++;
+                const char *en = t + strlen(t);
+                while (en>b && (en[-1]==' '||en[-1]=='\t'||en[-1]=='\n'||en[-1]=='\r')) en--;
+                char *out = arena_alloc(a, (size_t)(en-b)+1);
+                memcpy(out, b, (size_t)(en-b)); out[en-b]='\0';
+                s.type=SV_TEXT; s.val.sval=out; return s;
+            }
+            if (!strcasecmp(fn,"substr") && e->nargs >= 2) {
+                const char *t = qe_text(arg0, a);
+                if (!t) return s;
+                Scalar a1 = eval_expr(e->args[1], ctx, a);
+                long tl = (long)strlen(t);
+                long start = (a1.type==SV_INT)?(long)a1.val.ival
+                           : (a1.type==SV_DOUBLE)?(long)a1.val.fval : 1;
+                if (start < 1) start = 1;            /* SQL substr is 1-indexed */
+                long n = tl - (start - 1); if (n < 0) n = 0;
+                if (e->nargs >= 3) {
+                    Scalar a2 = eval_expr(e->args[2], ctx, a);
+                    long want = (a2.type==SV_INT)?(long)a2.val.ival
+                              : (a2.type==SV_DOUBLE)?(long)a2.val.fval : n;
+                    if (want < 0) want = 0;
+                    if (want < n) n = want;
+                }
+                char *out = arena_alloc(a, (size_t)n + 1);
+                memcpy(out, t + (start - 1), (size_t)n); out[n]='\0';
+                s.type=SV_TEXT; s.val.sval=out; return s;
+            }
+            if (!strcasecmp(fn,"levenshtein") && e->nargs >= 2) {
+                const char *x = qe_text(arg0, a);
+                const char *y = qe_text(eval_expr(e->args[1], ctx, a), a);
+                if (!x || !y) return s;  /* NULL → NULL */
+                s.type=SV_INT; s.val.ival = qe_levenshtein(x, y, a); return s;
+            }
+            if (!strcasecmp(fn,"jaro_winkler") && e->nargs >= 2) {
+                const char *x = qe_text(arg0, a);
+                const char *y = qe_text(eval_expr(e->args[1], ctx, a), a);
+                if (!x || !y) return s;
+                s.type=SV_DOUBLE; s.val.fval = qe_jaro_winkler(x, y, a); return s;
             }
         }
         return s;
