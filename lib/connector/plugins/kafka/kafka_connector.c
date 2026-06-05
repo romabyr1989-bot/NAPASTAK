@@ -6,6 +6,7 @@
 #include <librdkafka/rdkafka.h>
 #include <pthread.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp */
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -292,8 +293,10 @@ static void kafka_destroy(void *vctx)
         rd_kafka_topic_partition_list_destroy(ctx->tplist);
 
     pthread_mutex_destroy(&ctx->buf_mu);
-    arena_destroy(ctx->arena);
-    free(ctx);
+    /* NB: ctx (and ctx->arena) are owned by the HOST — ctx was allocated with
+     * arena_calloc(host_arena, ...). Do NOT arena_destroy() the host's arena or
+     * free() arena memory here (that corrupted the host heap and crashed the
+     * gateway). Mirror pg_connector: release only the plugin's own resources. */
 }
 
 static int kafka_list_entities(void *vctx, Arena *a, DfoEntityList *out)
@@ -549,7 +552,11 @@ static int kafka_ping(void *vctx)
 
 /* ── Entry point ── */
 
-static DfoConnector kafka_connector = {
+/* Exported as a DATA symbol (const struct) — the loader dlsym()s this name and
+ * reads it as a DfoConnector*, exactly like every other plugin. (It used to be
+ * a function returning the struct, which the loader mis-read as the struct
+ * itself → garbage abi_version. Never caught because the .so never built.) */
+const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "kafka",
     .version       = "1.0.0",
@@ -563,5 +570,3 @@ static DfoConnector kafka_connector = {
     .cdc_stop      = kafka_cdc_stop,
     .ping          = kafka_ping,
 };
-
-DfoConnector *dfo_connector_entry(void) { return &kafka_connector; }

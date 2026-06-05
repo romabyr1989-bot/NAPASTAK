@@ -46,6 +46,10 @@ void log_new_correlation_id(void) {
 
 void log_write(Logger *l, LogLevel level, const char *file, int line,
                const char *fmt, ...) {
+    /* A plugin .so links its own copy of this logger; loaded via dlopen its
+     * g_log is zero-initialised (out == NULL). Never deref a NULL stream —
+     * otherwise the first LOG_* from inside a connector crashes the host. */
+    if (!l || !l->out) return;
     if (level < l->min_level) return;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm; gmtime_r(&ts.tv_sec, &tm);

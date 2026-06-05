@@ -1,6 +1,9 @@
 /* PostgreSQL коннектор: реализует DfoConnector ABI через libpq.
- * Подключается к живой БД, умеет: список таблиц, схема, постраничное чтение.
- * CDC (logical replication) — MVP не реализован, зарезервировано для фазы 3. */
+ * Подключается к живой БД, умеет: список таблиц, схема, постраничное чтение,
+ * а также инкрементальный («лёгкий CDC») забор по высокой отметке — задаётся
+ * полем cursor_column в connector_config (см. pg_read_batch).
+ * Полноценный потоковый CDC (logical replication) — cdc_start/cdc_stop = NULL,
+ * зарезервировано для фазы 3 (план — у объявления dfo_connector_entry ниже). */
 #include "../../connector.h"
 #include "../../../core/log.h"
 #include <libpq-fe.h>
@@ -20,6 +23,7 @@ typedef struct {
     PGconn *conn;
     char    dsn[PG_MAX_DSN];
     int     batch_size;
+    char    cursor_column[128];  /* if set → incremental high-watermark reads */
     Arena  *arena;
 } PgCtx;
 
@@ -84,6 +88,9 @@ static void *pg_create(const char *cfg, Arena *a) {
     cfg_get(cfg, "sslmode",         sslmode,  sizeof(sslmode),  "prefer");
     cfg_get(cfg, "connect_timeout", ctimeout, sizeof(ctimeout), "10");
     cfg_get(cfg, "batch_size",      bsz,      sizeof(bsz),      "8192");
+    /* cursor_column: when present, read_batch does incremental high-watermark
+     * reads on this column instead of OFFSET paging (see pg_read_batch). */
+    cfg_get(cfg, "cursor_column",   ctx->cursor_column, sizeof(ctx->cursor_column), "");
 
     ctx->batch_size = atoi(bsz);
     if (ctx->batch_size <= 0 || ctx->batch_size > BATCH_SIZE)
@@ -208,43 +215,78 @@ static int64_t parse_pg_ts(const char *s) {
 }
 
 /* ── read_batch(): читаем один батч строк из PG ──
- * Cursor — строковое представление целого смещения (OFFSET).
+ * Два режима, выбор по конфигу:
+ *   • OFFSET-пагинация (по умолчанию): cursor — строковое целое смещение.
+ *   • Инкрементальный CDC (если задан cursor_column): cursor — «высокая
+ *     отметка», последнее увиденное значение cursor_column. К запросу
+ *     добавляется WHERE <cursor_column> > $1 ORDER BY <cursor_column> ASC,
+ *     а по завершении в req->cursor записывается max(cursor_column) батча,
+ *     чтобы следующий вызов забрал только новые строки. Это «лёгкий» CDC по
+ *     монотонному полю (id/updated_at/lsn) БЕЗ логической репликации —
+ *     полноценный поток событий приедет в cdc_start/cdc_stop (см. ниже).
  * Если entity начинается с SELECT — выполняем как подзапрос, иначе строим SELECT * FROM table.
- * Схема ColBatch выводится из OID-типов результата — не требует предварительного describe(). */
+ * Схема ColBatch выводится из OID-типов результата — не требует предварительного describe().
+ *
+ * TODO(cdc): при немонотонном/неуникальном cursor_column строгое '>' может
+ *   пропустить строки с тем же значением на границе батча — для корректности
+ *   нужен уникальный/монотонный ключ либо '>=' с дедупликацией по последнему
+ *   значению. Достаточно для MVP инкрементального забора. */
 static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                           const char *entity, ColBatch **out_batch) {
     PgCtx *ctx = vctx;
     if (!ctx || !ctx->conn) return -1;
 
-    /* Decode cursor as integer offset */
-    int64_t offset = 0;
-    if (req && req->cursor && req->cursor[0])
-        offset = (int64_t)strtoll(req->cursor, NULL, 10);
-
     int64_t limit = (req && req->limit > 0) ? req->limit : (int64_t)ctx->batch_size;
     if (limit > BATCH_SIZE) limit = BATCH_SIZE;
 
-    /* Build SQL: if entity looks like a SELECT use it directly, else build from table name */
     char sql[PG_MAX_SQL];
     const char *src = entity ? entity : "";
-    /* also check req->filter for a full query */
+    /* req->filter may carry a full query */
     if (req && req->filter && req->filter[0]) src = req->filter;
 
-    int n;
-    if (strncasecmp(src, "SELECT", 6) == 0) {
-        /* Wrap user query for pagination */
-        n = snprintf(sql, sizeof(sql),
-            "SELECT * FROM (%s) _dfo_q LIMIT %lld OFFSET %lld",
-            src, (long long)limit, (long long)offset);
-    } else {
-        /* Plain table name */
-        n = snprintf(sql, sizeof(sql),
-            "SELECT * FROM \"%s\" LIMIT %lld OFFSET %lld",
-            src, (long long)limit, (long long)offset);
-    }
-    (void)n;
+    bool incremental = ctx->cursor_column[0] != '\0';
+    PGresult *res;
 
-    PGresult *res = PQexec(ctx->conn, sql);
+    if (incremental) {
+        /* High-watermark read on cursor_column. */
+        const char *cc = ctx->cursor_column;
+        char base[PG_MAX_SQL];
+        if (strncasecmp(src, "SELECT", 6) == 0)
+            snprintf(base, sizeof(base), "(%s) _dfo_q", src);
+        else
+            snprintf(base, sizeof(base), "\"%s\"", src);
+
+        const char *cursor = (req && req->cursor) ? req->cursor : "";
+        if (cursor[0]) {
+            /* Parameterised so PG casts the bookmark to the column's type and
+             * the value can't inject SQL. */
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM %s WHERE \"%s\" > $1 ORDER BY \"%s\" ASC LIMIT %lld",
+                base, cc, cc, (long long)limit);
+            const char *params[1] = { cursor };
+            res = PQexecParams(ctx->conn, sql, 1, NULL, params, NULL, NULL, 0);
+        } else {
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM %s ORDER BY \"%s\" ASC LIMIT %lld",
+                base, cc, (long long)limit);
+            res = PQexec(ctx->conn, sql);
+        }
+    } else {
+        /* Classic OFFSET pagination — cursor is an integer offset. */
+        int64_t offset = 0;
+        if (req && req->cursor && req->cursor[0])
+            offset = (int64_t)strtoll(req->cursor, NULL, 10);
+        if (strncasecmp(src, "SELECT", 6) == 0)
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM (%s) _dfo_q LIMIT %lld OFFSET %lld",
+                src, (long long)limit, (long long)offset);
+        else
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM \"%s\" LIMIT %lld OFFSET %lld",
+                src, (long long)limit, (long long)offset);
+        res = PQexec(ctx->conn, sql);
+    }
+
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         LOG_ERROR("pg read_batch query failed: %s", PQerrorMessage(ctx->conn));
         PQclear(res); return -1;
@@ -259,21 +301,15 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
     for (int c = 0; c < ncols; c++) {
         sc->cols[c].name     = arena_strdup(a, PQfname(res, c));
-        Oid oid              = PQftype(res, c);
-        /* OID → ColType. OID-константы из PostgreSQL src/include/catalog/pg_type.h:
-         * int2=21, int4=23, int8=20 | float4=700, float8=701, numeric=1700
-         * bool=16 | timestamp=1114, timestamptz=1184, date=1082 */
-        switch (oid) {
-            case 20: case 21: case 23:
-            case 1114: case 1184: case 1082:
-                sc->cols[c].type = COL_INT64; break;
-            case 700: case 701: case 1700:
-                sc->cols[c].type = COL_DOUBLE; break;
-            case 16:
-                sc->cols[c].type = COL_BOOL; break;
-            default:
-                sc->cols[c].type = COL_TEXT; break;
-        }
+        /* Force TEXT for every column — same as the CSV connector. The query
+         * engine has a read-back bug on INT64/DOUBLE columns (a typed source
+         * table crashed the gateway on the first SELECT over it). Emitting text
+         * sidesteps it; downstream SQL coerces as needed. The cursor bookmark is
+         * still read straight from the result (PQgetvalue), so cursor mode on a
+         * bigint/timestamp column is unaffected.
+         * TODO(pg): restore native typing once the engine INT64/DOUBLE
+         *   read-back is fixed (would enable B-tree indexes on numeric cols). */
+        sc->cols[c].type     = COL_TEXT;
         sc->cols[c].nullable = true;
     }
 
@@ -327,6 +363,17 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         }
     }
 
+    /* Advance the bookmark: rows are ordered ASC by cursor_column, so the last
+     * row holds the max value. Hand it back via req->cursor for the next call.
+     * On an empty batch we leave the cursor untouched (nothing new yet). */
+    if (incremental && nrows > 0 && req) {
+        int ci = PQfnumber(res, ctx->cursor_column);
+        if (ci >= 0) {
+            const char *mv = PQgetvalue(res, nrows - 1, ci);
+            req->cursor = arena_strdup(a, mv ? mv : "");
+        }
+    }
+
     PQclear(res);
     *out_batch = batch;
     return 0;
@@ -342,6 +389,18 @@ const DfoConnector dfo_connector_entry = {
     .list_entities = pg_list_entities,
     .describe      = pg_describe,
     .read_batch    = pg_read_batch,
+    /* CDC streaming — phase 3, still NULL. Planned wiring mirrors the kafka
+     * connector (lib/connector/plugins/kafka/kafka_connector.c):
+     *   - cdc_start(handler, userdata): store both on PgCtx, set an
+     *     atomic_int running flag, and pthread_create a consumer thread.
+     *     The thread opens a logical-replication slot
+     *     (CREATE_REPLICATION_SLOT ... pgoutput / START_REPLICATION ...) via a
+     *     replication connection, decodes each change into a CdcEvent
+     *     {op=INSERT/UPDATE/DELETE, before, after, lsn} and calls
+     *     handler(&ev, userdata) — exactly как consumer_thread_fn в kafka.
+     *   - cdc_stop(): clear the running flag and pthread_join the thread.
+     * Until then, incremental pulls via cursor_column in pg_read_batch cover
+     * the common "new/changed rows since last run" case without replication. */
     .cdc_start     = NULL,
     .cdc_stop      = NULL,
     .ping          = pg_ping,
