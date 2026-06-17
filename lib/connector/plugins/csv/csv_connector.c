@@ -169,6 +169,77 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 
 /* helper needed from storage.h for bit ops */
 static void bit_set(uint8_t *bm, int i) { bm[i/8] |= (1u << (i%8)); }
+static int  bit_get(const uint8_t *bm, int i) { return bm ? ((bm[i/8] >> (i%8)) & 1u) : 0; }
+
+/* ── CSV field escaping (RFC-4180): quote if contains delim/quote/CR/LF ── */
+static void csv_write_field(FILE *f, const char *v, char delim) {
+    if (!v) v = "";
+    int needq = 0;
+    for (const char *p = v; *p; p++)
+        if (*p == delim || *p == '"' || *p == '\n' || *p == '\r') { needq = 1; break; }
+    if (!needq) { fputs(v, f); return; }
+    fputc('"', f);
+    for (const char *p = v; *p; p++) { if (*p == '"') fputc('"', f); fputc(*p, f); }
+    fputc('"', f);
+}
+
+/* Render one cell of a column-batch as text (sink input is always TEXT). */
+static const char *csv_cell_text(const ColBatch *b, int c, int r, char *tmp, size_t tn) {
+    if (bit_get(b->null_bitmap[c], r)) return "";
+    ColType t = b->schema ? b->schema->cols[c].type : COL_TEXT;
+    switch (t) {
+        case COL_INT64:  snprintf(tmp, tn, "%lld", (long long)((int64_t*)b->values[c])[r]); return tmp;
+        case COL_DOUBLE: snprintf(tmp, tn, "%.10g", ((double*)b->values[c])[r]); return tmp;
+        default: { char *s = ((char**)b->values[c])[r]; return s ? s : ""; }
+    }
+}
+
+/* ── Sink: append/overwrite rows to a CSV file ──
+ * Destination = `entity` if given, else the configured "path". The header row
+ * is written when the file is created fresh (overwrite, or append to an empty/
+ * absent file). Returns rows written. */
+static int csv_write_batch(void *vctx, Arena *a, const char *entity,
+                           const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a;
+    CsvCtx *ctx = vctx;
+    const char *path = (entity && entity[0]) ? entity : ctx->path;
+    if (!path || !path[0]) { return -1; }
+    char delim = ctx->delimiter ? ctx->delimiter : ',';
+
+    int write_header;
+    FILE *f;
+    if (mode == DFO_SINK_OVERWRITE) {
+        f = fopen(path, "w");
+        write_header = 1;
+    } else {
+        /* append — write header only if the file is new or empty */
+        FILE *probe = fopen(path, "r");
+        long sz = 0;
+        if (probe) { fseek(probe, 0, SEEK_END); sz = ftell(probe); fclose(probe); }
+        write_header = (sz <= 0);
+        f = fopen(path, "a");
+    }
+    if (!f) return -1;
+
+    int ncols = batch->ncols;
+    if (write_header && schema) {
+        for (int c = 0; c < ncols; c++) {
+            if (c) fputc(delim, f);
+            csv_write_field(f, schema->cols[c].name, delim);
+        }
+        fputc('\n', f);
+    }
+    char tmp[64];
+    for (int r = 0; r < batch->nrows; r++) {
+        for (int c = 0; c < ncols; c++) {
+            if (c) fputc(delim, f);
+            csv_write_field(f, csv_cell_text(batch, c, r, tmp, sizeof(tmp)), delim);
+        }
+        fputc('\n', f);
+    }
+    fclose(f);
+    return batch->nrows;
+}
 
 const DfoConnector dfo_connector_entry = {
     .abi_version = DFO_CONNECTOR_ABI_VERSION,
@@ -183,4 +254,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start   = NULL,
     .cdc_stop    = NULL,
     .ping        = csv_ping,
+    .write_batch = csv_write_batch,
 };

@@ -71,6 +71,15 @@ typedef struct {
     char        scd2_transaction_time[128];  /* col ordered DESC to pick the current version (window ORDER BY); defaults to effective_from when empty */
     char        scd2_deleted_flag[128];      /* source col: truthy → close the key without a new version (soft delete) */
     char        scd2_ignored_columns[512];   /* cols excluded from change comparison when compare_columns is empty, comma-separated */
+
+    /* Sink step (приёмник). When is_sink=true, this step does NOT load data
+     * into a target_table — instead it READS its input rows from transform_sql
+     * (a SELECT over existing tables) and WRITES them OUT to an external system
+     * via the connector's write_batch. connector_type/connector_config pick and
+     * configure the sink (csv/pg/s3/json_http/kafka). Empty → not a sink. */
+    bool        is_sink;
+    char        sink_entity[256];   /* destination: table / object key / topic / file path */
+    char        sink_mode[16];      /* "append" (default) | "overwrite" */
 } PipelineStep;
 
 typedef struct {

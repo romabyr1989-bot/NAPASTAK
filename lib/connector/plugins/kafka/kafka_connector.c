@@ -550,6 +550,88 @@ static int kafka_ping(void *vctx)
     return 0;
 }
 
+/* ── Sink: produce one JSON message per row to a topic ──
+ * Topic = `entity` if given, else the configured "topic". A fresh producer is
+ * created per call, all rows are produced, then flushed. mode is ignored (Kafka
+ * is an append-only log). Returns rows produced or <0 on error.
+ *
+ * NOTE: compiles and follows the standard rdkafka producer flow, but not
+ * exercised against a live broker in this environment. */
+static void kafka_json_escape(char **buf, size_t *len, size_t *cap, const char *s) {
+    for (const char *p = s ? s : ""; *p; p++) {
+        char esc[8]; const char *w; int n;
+        switch (*p) {
+            case '"':  w="\\\""; n=2; break;  case '\\': w="\\\\"; n=2; break;
+            case '\n': w="\\n";  n=2; break;  case '\r': w="\\r";  n=2; break;
+            case '\t': w="\\t";  n=2; break;
+            default:
+                if ((unsigned char)*p < 0x20) { snprintf(esc,sizeof(esc),"\\u%04x",*p); w=esc; n=6; }
+                else { esc[0]=*p; w=esc; n=1; }
+        }
+        if (*len + (size_t)n + 1 > *cap) { while (*len+(size_t)n+1 > *cap) *cap*=2; *buf=realloc(*buf,*cap); }
+        memcpy(*buf+*len, w, (size_t)n); *len += (size_t)n;
+    }
+}
+
+static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
+                             const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a; (void)mode;
+    KafkaCtx *ctx = vctx;
+    const char *topic = (entity && entity[0]) ? entity : ctx->topic_name;
+    if (!topic || !topic[0]) { LOG_ERROR("kafka sink: no topic"); return -1; }
+    if (!ctx->brokers[0])    { LOG_ERROR("kafka sink: no brokers"); return -1; }
+
+    char errstr[512];
+    rd_kafka_conf_t *conf = rd_kafka_conf_new();
+    if (rd_kafka_conf_set(conf, "bootstrap.servers", ctx->brokers, errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+        LOG_ERROR("kafka sink: conf: %s", errstr); rd_kafka_conf_destroy(conf); return -1;
+    }
+    rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+    if (!rk) { LOG_ERROR("kafka sink: producer: %s", errstr); return -1; }
+    rd_kafka_topic_t *rkt = rd_kafka_topic_new(rk, topic, NULL);
+    if (!rkt) { LOG_ERROR("kafka sink: topic_new failed"); rd_kafka_destroy(rk); return -1; }
+
+    int produced = 0;
+    char numbuf[64];
+    for (int r = 0; r < batch->nrows; r++) {
+        size_t cap = 256, len = 0; char *msg = malloc(cap);
+        msg[len++] = '{';
+        for (int c = 0; c < batch->ncols; c++) {
+            if (c) { msg[len++]=','; }
+            msg[len++]='"'; kafka_json_escape(&msg,&len,&cap,schema->cols[c].name);
+            if (len+2>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"'; msg[len++]=':';
+            const uint8_t *bm = batch->null_bitmap[c];
+            if (bm && ((bm[r/8]>>(r%8))&1u)) {
+                if (len+4>cap){cap*=2;msg=realloc(msg,cap);} memcpy(msg+len,"null",4); len+=4; continue;
+            }
+            const char *v;
+            switch (schema->cols[c].type) {
+                case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
+                case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
+                default:         v=((char**)batch->values[c])[r]; break;
+            }
+            if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"';
+            kafka_json_escape(&msg,&len,&cap,v);
+            if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"';
+        }
+        if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='}';
+        int rc = rd_kafka_produce(rkt, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY,
+                                  msg, len, NULL, 0, NULL);
+        free(msg);
+        if (rc == -1) { LOG_ERROR("kafka sink: produce: %s",
+                                  rd_kafka_err2str(rd_kafka_last_error())); }
+        else produced++;
+        rd_kafka_poll(rk, 0);
+    }
+    rd_kafka_flush(rk, 10000);
+    int unsent = rd_kafka_outq_len(rk);
+    rd_kafka_topic_destroy(rkt);
+    rd_kafka_destroy(rk);
+    if (unsent > 0) { LOG_ERROR("kafka sink: %d messages not delivered", unsent); return -1; }
+    LOG_INFO("kafka sink: produced %d rows → topic '%s'", produced, topic);
+    return produced;
+}
+
 /* ── Entry point ── */
 
 /* Exported as a DATA symbol (const struct) — the loader dlsym()s this name and
@@ -569,4 +651,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start     = kafka_cdc_start,
     .cdc_stop      = kafka_cdc_stop,
     .ping          = kafka_ping,
+    .write_batch   = kafka_write_batch,
 };

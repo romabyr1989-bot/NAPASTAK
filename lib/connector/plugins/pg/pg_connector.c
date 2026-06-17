@@ -379,6 +379,97 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     return 0;
 }
 
+/* ── Sink: write the batch into a PG table ──
+ * The destination table `entity` is created if absent (all columns TEXT,
+ * matching pipeline output). mode=OVERWRITE truncates it first (applied only
+ * on the first batch of a run). Rows are inserted in chunks of PG_INS_CHUNK
+ * via multi-row INSERT with libpq literal/identifier escaping. Returns rows
+ * written or <0 on error. */
+#define PG_INS_CHUNK 250
+static int pg_exec_ok(PGconn *c, const char *sql) {
+    PGresult *r = PQexec(c, sql);
+    int ok = (PQresultStatus(r) == PGRES_COMMAND_OK || PQresultStatus(r) == PGRES_TUPLES_OK);
+    if (!ok) LOG_ERROR("pg sink: %s — %s", sql, PQerrorMessage(c));
+    PQclear(r);
+    return ok ? 0 : -1;
+}
+static int pg_write_batch(void *vctx, Arena *a, const char *entity,
+                          const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a;
+    PgCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) { LOG_ERROR("pg sink: no connection"); return -1; }
+    if (!entity || !entity[0]) { LOG_ERROR("pg sink: empty target table"); return -1; }
+    int ncols = batch->ncols;
+
+    char *eident = PQescapeIdentifier(ctx->conn, entity, strlen(entity));
+    if (!eident) return -1;
+
+    /* CREATE TABLE IF NOT EXISTS <entity> (col TEXT, ...) */
+    {
+        size_t cap = 64 + (size_t)ncols * 80; char *ddl = malloc(cap); size_t off = 0;
+        off += (size_t)snprintf(ddl+off, cap-off, "CREATE TABLE IF NOT EXISTS %s (", eident);
+        for (int c = 0; c < ncols; c++) {
+            char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
+            off += (size_t)snprintf(ddl+off, cap-off, "%s%s TEXT", c?", ":"", col ? col : "\"col\"");
+            if (col) PQfreemem(col);
+        }
+        snprintf(ddl+off, cap-off, ")");
+        int rc = pg_exec_ok(ctx->conn, ddl); free(ddl);
+        if (rc < 0) { PQfreemem(eident); return -1; }
+    }
+    if (mode == DFO_SINK_OVERWRITE) {
+        char trunc[512]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE %s", eident);
+        if (pg_exec_ok(ctx->conn, trunc) < 0) { PQfreemem(eident); return -1; }
+    }
+
+    /* Column list "(c1, c2, ...)" reused for every INSERT. */
+    char collist[4096]; size_t co = 0; collist[0] = '\0';
+    co += (size_t)snprintf(collist+co, sizeof(collist)-co, "(");
+    for (int c = 0; c < ncols; c++) {
+        char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
+        co += (size_t)snprintf(collist+co, sizeof(collist)-co, "%s%s", c?", ":"", col ? col : "\"col\"");
+        if (col) PQfreemem(col);
+    }
+    snprintf(collist+co, sizeof(collist)-co, ")");
+
+    int written = 0;
+    for (int start = 0; start < batch->nrows; start += PG_INS_CHUNK) {
+        int end = start + PG_INS_CHUNK; if (end > batch->nrows) end = batch->nrows;
+        size_t cap = 4096; char *sql = malloc(cap); size_t off = 0;
+        #define PG_APP(...) do { \
+            int need = snprintf(NULL,0,__VA_ARGS__); \
+            if (off + (size_t)need + 1 > cap) { while (off+(size_t)need+1>cap) cap*=2; sql=realloc(sql,cap);} \
+            off += (size_t)snprintf(sql+off, cap-off, __VA_ARGS__); } while(0)
+        PG_APP("INSERT INTO %s %s VALUES ", eident, collist);
+        for (int r = start; r < end; r++) {
+            PG_APP("%s(", r>start?", ":"");
+            for (int c = 0; c < ncols; c++) {
+                const uint8_t *bm = batch->null_bitmap[c];
+                int isnull = (bm && ((bm[r/8] >> (r%8)) & 1u));
+                if (isnull) { PG_APP("%sNULL", c?", ":""); continue; }
+                char numbuf[64]; const char *v;
+                switch (schema->cols[c].type) {
+                    case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
+                    case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
+                    default:         v = ((char**)batch->values[c])[r]; if(!v) v=""; break;
+                }
+                char *lit = PQescapeLiteral(ctx->conn, v, strlen(v));
+                PG_APP("%s%s", c?", ":"", lit ? lit : "''");
+                if (lit) PQfreemem(lit);
+            }
+            PG_APP(")");
+        }
+        #undef PG_APP
+        int rc = pg_exec_ok(ctx->conn, sql); free(sql);
+        if (rc < 0) { PQfreemem(eident); return -1; }
+        written += (end - start);
+    }
+    PQfreemem(eident);
+    LOG_INFO("pg sink: %d rows → %s (%s)", written, entity,
+             mode==DFO_SINK_OVERWRITE?"overwrite":"append");
+    return written;
+}
+
 const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "postgresql",
@@ -404,4 +495,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start     = NULL,
     .cdc_stop      = NULL,
     .ping          = pg_ping,
+    .write_batch   = pg_write_batch,
 };

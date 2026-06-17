@@ -336,6 +336,106 @@ static int jh_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     return ((int)arr->nitems<ctx->page_size)?1:0;
 }
 
+/* ── JSON-escape a string into a growable buffer ── */
+static void jh_json_escape(CurlBuf *b, const char *s) {
+    char tmp[8];
+    for (const char *p = s ? s : ""; *p; p++) {
+        const char *esc = NULL; int n = 0; char c = *p;
+        switch (c) {
+            case '"':  esc = "\\\""; n=2; break;
+            case '\\': esc = "\\\\"; n=2; break;
+            case '\n': esc = "\\n";  n=2; break;
+            case '\r': esc = "\\r";  n=2; break;
+            case '\t': esc = "\\t";  n=2; break;
+            default:
+                if ((unsigned char)c < 0x20) { snprintf(tmp,sizeof(tmp),"\\u%04x",c); esc=tmp; n=6; }
+        }
+        if (esc) curl_write((void*)esc, 1, (size_t)n, b);
+        else     curl_write((void*)&c, 1, 1, b);
+    }
+}
+
+/* ── Sink: POST the batch as a JSON array of row-objects ──
+ * Target URL = `entity` if it starts with http(s)://, else the configured
+ * "url". Auth headers (bearer / api_key) from config are reused. Returns rows
+ * written on HTTP 2xx, -1 otherwise. mode is ignored (every call POSTs its own
+ * batch; the remote endpoint decides append vs replace). */
+static const char *bit_isnull(const ColBatch *b, int c, int r) {
+    const uint8_t *bm = b->null_bitmap[c];
+    return (bm && ((bm[r/8] >> (r%8)) & 1u)) ? "" : NULL; /* "" sentinel = null */
+}
+static int jh_write_batch(void *vctx, Arena *a, const char *entity,
+                          const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a; (void)mode;
+    JHCtx *ctx = vctx;
+    const char *url = (entity && (strncmp(entity,"http://",7)==0 || strncmp(entity,"https://",8)==0))
+                      ? entity : ctx->url;
+    if (!url || !url[0]) return -1;
+
+    /* Build JSON body: [{"col":"val",...},...] (cells are TEXT). */
+    CurlBuf body = {NULL,0,0};
+    curl_write((void*)"[", 1, 1, &body);
+    char tmp[64];
+    for (int r = 0; r < batch->nrows; r++) {
+        if (r) curl_write((void*)",", 1, 1, &body);
+        curl_write((void*)"{", 1, 1, &body);
+        for (int c = 0; c < batch->ncols; c++) {
+            if (c) curl_write((void*)",", 1, 1, &body);
+            curl_write((void*)"\"", 1, 1, &body);
+            jh_json_escape(&body, schema->cols[c].name);
+            curl_write((void*)"\":", 1, 2, &body);
+            int isnull = (bit_isnull(batch, c, r) != NULL);
+            if (isnull) { curl_write((void*)"null", 1, 4, &body); continue; }
+            const char *v;
+            switch (schema->cols[c].type) {
+                case COL_INT64:  snprintf(tmp,sizeof(tmp),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=tmp; break;
+                case COL_DOUBLE: snprintf(tmp,sizeof(tmp),"%.10g",((double*)batch->values[c])[r]); v=tmp; break;
+                default:         v = ((char**)batch->values[c])[r]; break;
+            }
+            curl_write((void*)"\"", 1, 1, &body);
+            jh_json_escape(&body, v ? v : "");
+            curl_write((void*)"\"", 1, 1, &body);
+        }
+        curl_write((void*)"}", 1, 1, &body);
+    }
+    curl_write((void*)"]", 1, 1, &body);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) { free(body.data); return -1; }
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    if (strcasecmp(ctx->auth_type,"bearer")==0 && ctx->auth_token[0]) {
+        char h[600]; snprintf(h,sizeof(h),"Authorization: Bearer %s",ctx->auth_token);
+        hdrs = curl_slist_append(hdrs, h);
+    } else if (strcasecmp(ctx->auth_type,"api_key")==0 && ctx->auth_token[0]) {
+        const char *hname = ctx->auth_header[0]?ctx->auth_header:"X-API-Key";
+        char h[600]; snprintf(h,sizeof(h),"%s: %s",hname,ctx->auth_token);
+        hdrs = curl_slist_append(hdrs, h);
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data ? body.data : "[]");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.len);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    CurlBuf resp = {NULL,0,0};
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    free(body.data); free(resp.data);
+
+    if (res != CURLE_OK) { LOG_ERROR("json_http sink: curl: %s", curl_easy_strerror(res)); return -1; }
+    if (code < 200 || code >= 300) { LOG_ERROR("json_http sink: HTTP %ld", code); return -1; }
+    LOG_INFO("json_http sink: POST %d rows → %s (HTTP %ld)", batch->nrows, url, code);
+    return batch->nrows;
+}
+
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "json_http",
@@ -349,4 +449,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start    = NULL,
     .cdc_stop     = NULL,
     .ping         = jh_ping,
+    .write_batch  = jh_write_batch,
 };

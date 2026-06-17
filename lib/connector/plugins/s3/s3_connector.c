@@ -5,6 +5,7 @@
 #include "../../../core/log.h"
 #include "aws_sig4.h"
 #include <curl/curl.h>
+#include <openssl/sha.h>
 #include <string.h>
 #include <stdlib.h>
 #include <strings.h>
@@ -245,11 +246,13 @@ static void *s3_create(const char *config_json, Arena *arena)
 
 static void s3_destroy(void *vctx)
 {
-    S3Ctx *ctx = (S3Ctx *)vctx;
-    if (!ctx) return;
-    arena_destroy(ctx->arena);
-    free(ctx);
-    curl_global_cleanup();
+    /* ctx and ctx->arena are owned by the CALLER (connector_load passes its
+     * request arena to create(), and ctx itself is arena_calloc'd from it).
+     * The previous code did arena_destroy(ctx->arena)+free(ctx)+curl_global_
+     * cleanup() here, which (a) freed arena-owned memory → SIGABRT, (b) tore
+     * down the caller's arena mid-request, and (c) shut down libcurl while
+     * other connectors still used it. Nothing to free here — match csv/pg. */
+    (void)vctx;
 }
 
 static int s3_list_entities(void *vctx, Arena *a, DfoEntityList *out)
@@ -525,9 +528,118 @@ static int s3_ping(void *vctx)
     return -1;
 }
 
-/* ── Entry point ── */
+/* ── Sink: serialize the batch to CSV and PUT it as an object ──
+ * Object key = prefix + (entity if given, else "export.csv"). The body's real
+ * SHA-256 is signed (sigv4) and sent as x-amz-content-sha256. mode is advisory:
+ * an object PUT always replaces the key, so APPEND and OVERWRITE behave the
+ * same (one object per run). Returns rows written or <0 on error.
+ *
+ * NOTE: verified to compile and to sign with the real payload hash, but not
+ * exercised against a live bucket in this environment. */
+static void s3_csv_field(DynBuf *b, const char *v) {
+    if (!v) v = "";
+    int needq = 0;
+    for (const char *p=v; *p; p++) if (*p==','||*p=='"'||*p=='\n'||*p=='\r') { needq=1; break; }
+    if (!needq) { write_callback((void*)v, 1, strlen(v), b); return; }
+    write_callback((void*)"\"", 1, 1, b);
+    for (const char *p=v; *p; p++) { if (*p=='"') write_callback((void*)"\"",1,1,b); write_callback((void*)p,1,1,b); }
+    write_callback((void*)"\"", 1, 1, b);
+}
 
-static DfoConnector s3_connector = {
+static int s3_write_batch(void *vctx, Arena *a, const char *entity,
+                          const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a; (void)mode;
+    S3Ctx *ctx = vctx;
+    if (!ctx->bucket[0]) { LOG_ERROR("s3 sink: no bucket configured"); return -1; }
+
+    /* 1. Serialize batch → CSV body */
+    DynBuf body = {0};
+    char tmp[64];
+    for (int c = 0; c < batch->ncols; c++) {
+        if (c) write_callback((void*)",", 1, 1, &body);
+        s3_csv_field(&body, schema->cols[c].name);
+    }
+    write_callback((void*)"\n", 1, 1, &body);
+    for (int r = 0; r < batch->nrows; r++) {
+        for (int c = 0; c < batch->ncols; c++) {
+            if (c) write_callback((void*)",", 1, 1, &body);
+            const uint8_t *bm = batch->null_bitmap[c];
+            if (bm && ((bm[r/8]>>(r%8))&1u)) continue;
+            const char *v;
+            switch (schema->cols[c].type) {
+                case COL_INT64:  snprintf(tmp,sizeof(tmp),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=tmp; break;
+                case COL_DOUBLE: snprintf(tmp,sizeof(tmp),"%.10g",((double*)batch->values[c])[r]); v=tmp; break;
+                default:         v=((char**)batch->values[c])[r]; break;
+            }
+            s3_csv_field(&body, v);
+        }
+        write_callback((void*)"\n", 1, 1, &body);
+    }
+    if (!body.data) { body.data = strdup(""); body.len = 0; }
+
+    /* 2. Object key: prefix + entity (default export.csv) */
+    char key[512];
+    const char *obj = (entity && entity[0]) ? entity : "export.csv";
+    snprintf(key, sizeof(key), "%s%s", ctx->prefix, obj);
+    char url_path[640];
+    snprintf(url_path, sizeof(url_path), "/%s/%s", ctx->bucket, key);
+
+    /* 3. Real payload SHA-256 (sigv4 requires it for body requests) */
+    unsigned char dg[32]; char payload_hex[65];
+    SHA256((const unsigned char*)body.data, body.len, dg);
+    for (int i=0;i<32;i++) snprintf(payload_hex+i*2,3,"%02x",dg[i]);
+
+    /* 4. Host from endpoint */
+    char host[256]; const char *ep = ctx->endpoint;
+    if (strncmp(ep,"https://",8)==0) ep+=8; else if (strncmp(ep,"http://",7)==0) ep+=7;
+    const char *slash = strchr(ep,'/');
+    if (slash) snprintf(host,sizeof(host),"%.*s",(int)(slash-ep),ep);
+    else snprintf(host,sizeof(host),"%s",ep);
+
+    char auth_hdr[512], date_hdr[32];
+    aws_sig4_sign(&ctx->creds, "PUT", host, url_path, "", payload_hex,
+                  auth_hdr, sizeof(auth_hdr), date_hdr, sizeof(date_hdr), ctx->arena);
+
+    char *url = build_url(ctx, url_path, NULL);
+    CURL *curl = curl_easy_init();
+    if (!curl) { free(url); free(body.data); return -1; }
+    struct curl_slist *headers = NULL;
+    char auth_full[600], date_full[64], sha_full[96];
+    snprintf(auth_full,sizeof(auth_full),"Authorization: %s",auth_hdr);
+    snprintf(date_full,sizeof(date_full),"x-amz-date: %s",date_hdr);
+    snprintf(sha_full,sizeof(sha_full),"x-amz-content-sha256: %s",payload_hex);
+    headers = curl_slist_append(headers, auth_full);
+    headers = curl_slist_append(headers, date_full);
+    headers = curl_slist_append(headers, sha_full);
+    headers = curl_slist_append(headers, "Content-Type: text/csv");
+
+    DynBuf resp = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.len);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long code = 0; curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(headers); curl_easy_cleanup(curl);
+    free(url); free(body.data); free(resp.data);
+
+    if (res != CURLE_OK) { LOG_ERROR("s3 sink: curl: %s", curl_easy_strerror(res)); return -1; }
+    if (code < 200 || code >= 300) { LOG_ERROR("s3 sink: HTTP %ld for %s", code, url_path); return -1; }
+    LOG_INFO("s3 sink: PUT %d rows → s3://%s/%s (HTTP %ld)", batch->nrows, ctx->bucket, key, code);
+    return batch->nrows;
+}
+
+/* ── Entry point ──
+ * Exported as a DATA symbol (const struct), matching every other plugin and
+ * what the loader dlsym()s. (Previously a function returning the struct, which
+ * the loader mis-read as the struct → garbage abi_version → never loaded.) */
+const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "s3",
     .version       = "1.0.0",
@@ -540,6 +652,5 @@ static DfoConnector s3_connector = {
     .cdc_start     = s3_cdc_start,
     .cdc_stop      = s3_cdc_stop,
     .ping          = s3_ping,
+    .write_batch   = s3_write_batch,
 };
-
-DfoConnector *dfo_connector_entry(void) { return &s3_connector; }

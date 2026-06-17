@@ -1114,8 +1114,12 @@ const PY_STARTER =
 
 const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','s3','kafka','airbyte'];
 
+/* Connectors that can act as sinks (write_batch in ABI v2). */
+const SINK_TYPES = ['csv','json_http','postgresql','s3','kafka'];
+
 function stepType(step) {
   if (step._ui_type) return step._ui_type;
+  if (step.is_sink && step.connector_type) return 'sink:' + step.connector_type;
   if (step.scd2_business_key) return 'scd2';
   if (step.python_code)       return 'python';
   if (step.connector_type)    return step.connector_type;  /* the specific connector */
@@ -1137,8 +1141,16 @@ function pbChangeStepType(idx, type) {
   s.connector_type = '';
   s.connector_config = '';
   s.python_code = '';
+  s.is_sink = false;
   SCD2_FIELDS.forEach(k => delete s[k]);
-  if (type === 'python') {
+  if (type.startsWith('sink:')) {
+    /* Sink (приёмник): write transform_sql rows OUT via the connector. */
+    s.is_sink = true;
+    s.connector_type = type.slice(5);
+    s.connector_config = '{}';
+    if (!s.sink_mode) s.sink_mode = 'append';
+    if (s.sink_entity == null) s.sink_entity = '';
+  } else if (type === 'python') {
     s.python_code = PY_STARTER;
   } else if (CONNECTOR_TYPES.includes(type)) {
     s.connector_type = type;
@@ -1166,6 +1178,40 @@ function pbGenerateMatchSQL(idx) {
 FROM ${A} a, ${B} b
 WHERE jaro_winkler(a.${c}, b.${c}) >= ${th}`;
   renderBuilderSteps();
+}
+
+/* Sink (приёмник) fields: destination entity + write mode. The connection
+ * config (path/host/bucket/brokers/...) is rendered by makeConnectorConfigHTML
+ * above, since a sink reuses the connector's own config form. */
+function makeSinkFieldsHTML(step, idx) {
+  const ENT = {
+    csv:        ['Путь файла',        './data/export.csv'],
+    json_http:  ['URL (пусто = из конфига)', 'https://hooks.example.com/ingest'],
+    postgresql: ['Таблица назначения', 'public.export_table'],
+    s3:         ['Ключ объекта',       'exports/revenue.csv'],
+    kafka:      ['Топик',              'dfo_export'],
+  }[step.connector_type] || ['Назначение', ''];
+  const mode = step.sink_mode || 'append';
+  return `
+    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+        📤 Приёмник. Поле <strong>SQL-трансформация</strong> ниже = запрос-источник
+        (его строки выгружаются наружу). Поле «Результат → таблица» для приёмника не используется.</div>
+      <div class="step-row-2">
+        <div class="form-group" style="margin:0">
+          <label>${ENT[0]}</label>
+          <input type="text" value="${escAttr(step.sink_entity || '')}" placeholder="${escAttr(ENT[1])}"
+                 oninput="pbUpdateStep(${idx},'sink_entity',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Режим записи</label>
+          <select onchange="pbUpdateStep(${idx},'sink_mode',this.value)">
+            <option value="append"    ${mode==='append'   ?'selected':''}>Дозапись (append)</option>
+            <option value="overwrite" ${mode==='overwrite'?'selected':''}>Перезапись (overwrite)</option>
+          </select>
+        </div>
+      </div>
+    </div>`;
 }
 
 function makeScd2FieldsHTML(step, idx) {
@@ -1352,6 +1398,13 @@ function makeStepCard(step, idx) {
               <option value="kafka"      ${t==='kafka'     ?'selected':''}>📨 Kafka</option>
               <option value="airbyte"    ${t==='airbyte'   ?'selected':''}>🛬 Airbyte (любой источник)</option>
             </optgroup>
+            <optgroup label="Приёмники (запись наружу)">
+              <option value="sink:csv"        ${t==='sink:csv'       ?'selected':''}>📤 CSV файл</option>
+              <option value="sink:json_http"  ${t==='sink:json_http' ?'selected':''}>📤 HTTP / Webhook (JSON)</option>
+              <option value="sink:postgresql" ${t==='sink:postgresql'?'selected':''}>📤 PostgreSQL (БД)</option>
+              <option value="sink:s3"         ${t==='sink:s3'        ?'selected':''}>📤 S3 / MinIO</option>
+              <option value="sink:kafka"      ${t==='sink:kafka'     ?'selected':''}>📤 Kafka</option>
+            </optgroup>
           </select>
         </div>
         <div class="form-group" style="margin:0">
@@ -1362,6 +1415,7 @@ function makeStepCard(step, idx) {
         </div>
       </div>
       <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(step, idx)}</div>
+      ${t.startsWith('sink:') ? makeSinkFieldsHTML(step, idx) : ''}
       ${t === 'scd2'  ? makeScd2FieldsHTML(step, idx)  : ''}
       ${t === 'match' ? makeMatchFieldsHTML(step, idx) : ''}
       <div class="step-row-2" style="margin-top:0.75rem">

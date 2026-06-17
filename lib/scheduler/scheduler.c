@@ -264,6 +264,10 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             strncpy(st->scd2_transaction_time,   json_str(json_get(s,"scd2_transaction_time"),""),   sizeof(st->scd2_transaction_time)-1);
             strncpy(st->scd2_deleted_flag,       json_str(json_get(s,"scd2_deleted_flag"),""),       sizeof(st->scd2_deleted_flag)-1);
             strncpy(st->scd2_ignored_columns,    json_str(json_get(s,"scd2_ignored_columns"),""),    sizeof(st->scd2_ignored_columns)-1);
+            /* Sink step (optional) — missing fields default to off (back-compat) */
+            st->is_sink = json_bool(json_get(s,"is_sink"), false);
+            strncpy(st->sink_entity, json_str(json_get(s,"sink_entity"),""), sizeof(st->sink_entity)-1);
+            strncpy(st->sink_mode,   json_str(json_get(s,"sink_mode"),"append"), sizeof(st->sink_mode)-1);
             st->max_retries = (int)json_int(json_get(s,"max_retries"), 3);
             st->retry_delay_sec = (int)json_int(json_get(s,"retry_delay_sec"), 30);
             st->retry_count = 0;
@@ -316,6 +320,12 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
         if (st->scd2_transaction_time[0])   { jb_key(&jb,"scd2_transaction_time");   jb_str(&jb, st->scd2_transaction_time); }
         if (st->scd2_deleted_flag[0])       { jb_key(&jb,"scd2_deleted_flag");       jb_str(&jb, st->scd2_deleted_flag); }
         if (st->scd2_ignored_columns[0])    { jb_key(&jb,"scd2_ignored_columns");    jb_str(&jb, st->scd2_ignored_columns); }
+        /* Sink fields — emitted only for sink steps, so non-sink pipelines round-trip unchanged */
+        if (st->is_sink) {
+            jb_key(&jb,"is_sink");     jb_bool(&jb, st->is_sink);
+            jb_key(&jb,"sink_entity"); jb_str(&jb, st->sink_entity);
+            jb_key(&jb,"sink_mode");   jb_str(&jb, st->sink_mode[0] ? st->sink_mode : "append");
+        }
         jb_key(&jb,"max_retries");      jb_int(&jb,st->max_retries);
         jb_key(&jb,"retry_delay_sec");  jb_int(&jb,st->retry_delay_sec);
         jb_key(&jb,"status");           jb_int(&jb,(int)st->status);

@@ -3703,6 +3703,97 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     return total_rows;
 }
 
+/* ── Run one sink step (приёмник): SELECT rows → connector write_batch ──
+ * Reads the step's input rows from transform_sql (a SELECT over existing
+ * tables) and streams them OUT to an external system via the connector's
+ * write_batch. The first batch applies sink_mode (append/overwrite); later
+ * batches always append. Returns rows written or <0 on error. */
+static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
+    if (!st->transform_sql[0]) {
+        snprintf(errbuf, errsz, "sink step %s: transform_sql (SELECT источника) обязателен", st->id);
+        return -1;
+    }
+    /* 1. Materialize the source rows */
+    Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+    if (stmt->error) {
+        snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
+        return -1;
+    }
+    RS *rs = exec_stmt(a, stmt, NULL);
+    if (!rs) {
+        snprintf(errbuf, errsz, "sink step %s: исходный SELECT вернул NULL", st->id);
+        return -1;
+    }
+
+    /* 2. Build a TEXT schema from the result columns */
+    Schema *schema = arena_calloc(a, sizeof(Schema));
+    schema->ncols = rs->ncols;
+    schema->cols  = arena_alloc(a, (size_t)rs->ncols * sizeof(ColDef));
+    for (int c = 0; c < rs->ncols; c++) {
+        schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
+        schema->cols[c].type     = COL_TEXT;
+        schema->cols[c].nullable = true;
+    }
+
+    /* 3. Load the sink connector (.so). Map UI/YAML names to .so basenames. */
+    const char *conn = st->connector_type;
+    if (!strcmp(conn, "postgresql") || !strcmp(conn, "postgres")) conn = "pg";
+    char so_path[1024];
+    snprintf(so_path, sizeof(so_path), "%s/%s_connector.so", app->plugins_dir, conn);
+    ConnectorInst *inst = connector_load(so_path, st->connector_config, a);
+    if (!inst) {
+        snprintf(errbuf, errsz, "sink step %s: connector_load(%s) failed — проверьте connector_config",
+                 st->id, so_path);
+        return -1;
+    }
+    const DfoConnector *api = connector_api(inst);
+    void *ctx = connector_ctx(inst);
+    if (api->abi_version < 2 || !api->write_batch) {
+        connector_unload(inst);
+        snprintf(errbuf, errsz, "sink step %s: коннектор '%s' не поддерживает запись (write_batch)",
+                 st->id, st->connector_type);
+        return -1;
+    }
+
+    const char *entity = st->sink_entity[0] ? st->sink_entity : st->target_table;
+    int mode = (strcasecmp(st->sink_mode, "overwrite") == 0) ? DFO_SINK_OVERWRITE : DFO_SINK_APPEND;
+
+    /* 4. Stream rows out in BATCH_SIZE chunks. */
+    char ***cv = arena_alloc(a, (size_t)rs->ncols * sizeof(char **));
+    for (int c = 0; c < rs->ncols; c++)
+        cv[c] = arena_alloc(a, BATCH_SIZE * sizeof(char *));
+    ColBatch batch = {0};
+    batch.schema = schema; batch.ncols = rs->ncols;
+    for (int c = 0; c < rs->ncols; c++) batch.values[c] = cv[c];
+
+    int total = 0, first = 1;
+    for (int r = 0; r < rs->nrows; r++) {
+        for (int c = 0; c < rs->ncols; c++) {
+            const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
+            cv[c][batch.nrows] = (char *)(v ? v : "");
+        }
+        if (++batch.nrows == BATCH_SIZE) {
+            int n = api->write_batch(ctx, a, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
+            if (n < 0) { connector_unload(inst);
+                snprintf(errbuf, errsz, "sink step %s: write_batch failed", st->id); return -1; }
+            total += batch.nrows; batch.nrows = 0; first = 0;
+        }
+    }
+    /* Final (or only) chunk — also covers the empty-result overwrite case so
+     * the destination is truncated even when there are 0 rows. */
+    if (batch.nrows > 0 || first) {
+        int n = api->write_batch(ctx, a, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
+        if (n < 0) { connector_unload(inst);
+            snprintf(errbuf, errsz, "sink step %s: write_batch failed", st->id); return -1; }
+        total += batch.nrows;
+    }
+
+    connector_unload(inst);
+    LOG_INFO("sink step '%s' → %s:%s: %d rows (%s)", st->id, st->connector_type,
+             entity, total, st->sink_mode[0] ? st->sink_mode : "append");
+    return total;
+}
+
 /* ── Python step ────────────────────────────────────────────────
  * Runs `python3 -c <wrapper>` as a subprocess. The wrapper reads
  * stdin as CSV into a pandas DataFrame called `df`, executes the
@@ -4293,7 +4384,18 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
         while (true) {
             st->status = STEP_RUNNING;
 
-            if (st->python_code[0]) {
+            if (st->is_sink) {
+                /* Sink step (приёмник): write transform_sql rows OUT via the
+                 * connector. Checked before the connector-source branch since a
+                 * sink also has connector_type set. */
+                int n = run_sink_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                if (n < 0) {
+                    st->status = STEP_FAILED;
+                } else {
+                    total_rows += n;
+                    st->status = STEP_SUCCESS;
+                }
+            } else if (st->python_code[0]) {
                 /* Python step takes precedence over connector / transform_sql.
                  * If transform_sql is set, it provides input data; otherwise
                  * the user's script starts with an empty DataFrame. */

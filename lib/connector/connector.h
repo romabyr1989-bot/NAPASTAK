@@ -3,7 +3,7 @@
 #include "../storage/storage.h"
 #include <stdint.h>
 
-#define DFO_CONNECTOR_ABI_VERSION 1
+#define DFO_CONNECTOR_ABI_VERSION 2
 
 typedef struct {
     const char *entity;  /* table / endpoint name */
@@ -58,7 +58,23 @@ typedef struct {
 
     /* health */
     int (*ping)(void *ctx);
+
+    /* ── Sink / приёмник (optional, ABI v2) ──
+     * Write a batch of rows OUT to an external entity (table / object key /
+     * topic / file). `entity` is the destination name; `schema` describes the
+     * batch columns; `batch` holds the rows (all cells are TEXT for pipeline
+     * output). `mode`: SINK_APPEND keeps existing data, SINK_OVERWRITE replaces
+     * it (truncate / recreate / new object). On the first call of a multi-batch
+     * write the connector applies `mode`; subsequent calls always append.
+     * Returns rows written (>=0) or <0 on error. NULL if the connector is
+     * read-only. */
+    int (*write_batch)(void *ctx, Arena *a, const char *entity,
+                       const Schema *schema, const ColBatch *batch, int mode);
 } DfoConnector;
+
+/* write_batch mode */
+#define DFO_SINK_APPEND    0
+#define DFO_SINK_OVERWRITE 1
 
 /* export symbol name in every plugin .so */
 #define DFO_CONNECTOR_EXPORT_SYM "dfo_connector_entry"
