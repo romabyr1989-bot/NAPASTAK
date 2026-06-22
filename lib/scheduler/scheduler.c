@@ -253,6 +253,11 @@ int pipeline_from_json(Pipeline *p, const char *json) {
                     json_str(json_get(s, "python_code"), ""),
                     sizeof(st->python_code) - 1);
             st->python_timeout_sec = (int)json_int(json_get(s, "python_timeout_sec"), 300);
+            /* Scala step (optional) */
+            strncpy(st->scala_code,
+                    json_str(json_get(s, "scala_code"), ""),
+                    sizeof(st->scala_code) - 1);
+            st->scala_timeout_sec = (int)json_int(json_get(s, "scala_timeout_sec"), 600);
             /* SCD2 step (optional) — missing fields default to "" (back-compat) */
             strncpy(st->scd2_business_key,       json_str(json_get(s,"scd2_business_key"),""),       sizeof(st->scd2_business_key)-1);
             strncpy(st->scd2_effective_from_col, json_str(json_get(s,"scd2_effective_from_col"),""), sizeof(st->scd2_effective_from_col)-1);
@@ -308,6 +313,10 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
         if (st->python_code[0]) {
             jb_key(&jb,"python_code");        jb_str(&jb, st->python_code);
             jb_key(&jb,"python_timeout_sec"); jb_int(&jb, st->python_timeout_sec);
+        }
+        if (st->scala_code[0]) {
+            jb_key(&jb,"scala_code");        jb_str(&jb, st->scala_code);
+            jb_key(&jb,"scala_timeout_sec"); jb_int(&jb, st->scala_timeout_sec);
         }
         /* SCD2 fields — emitted only when set, so pre-SCD2 pipelines round-trip unchanged */
         if (st->scd2_business_key[0])       { jb_key(&jb,"scd2_business_key");       jb_str(&jb, st->scd2_business_key); }

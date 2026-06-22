@@ -1,8 +1,12 @@
+/* Expose BSD/Darwin extensions (mkdtemp) that the global _POSIX_C_SOURCE
+ * otherwise hides on macOS. No-op on Linux/glibc (covered by _GNU_SOURCE). */
+#define _DARWIN_C_SOURCE
 #include "app.h"
 #include "../../lib/core/json.h"
 #include "../../lib/core/log.h"
 #include "../../lib/sql_parser/sql.h"
 #include "../../lib/yaml/yaml_loader.h"
+#include "../../lib/yaml/yaml_template.h"
 #include "../../lib/pgwire/pgwire.h"
 #include "../../lib/storage/storage.h"
 #include "../../lib/storage/compress.h"
@@ -27,6 +31,12 @@
 #include <poll.h>
 #include <math.h>
 #include <dirent.h>
+/* MD5 for SCD2 row-hash change detection (scd2_hash_col). -lcrypto is already
+ * in LDFLAGS. OPENSSL_SUPPRESS_DEPRECATED silences OpenSSL 3's deprecation of
+ * the one-shot MD5() under -Wall (we only need a fast non-cryptographic digest
+ * for change detection, not a security primitive). */
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/md5.h>
 
 /* Thread-local: txn_id active during exec_stmt call (0 = auto-commit) */
 static _Thread_local TxnId g_txn_current = 0;
@@ -3522,6 +3532,67 @@ static void h_pipeline_preview_yaml(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, normalized);
 }
 
+/* ── POST /api/pipelines/from-template ──
+ * Body JSON: { "template_yaml": "<yaml with {{vars}}>", "vars": { "k": "v" } }
+ * Expands {{ }} placeholders (external vars{} override the template's own vars:
+ * block), parses the resulting YAML → pipeline, SAVES it (catalog + scheduler),
+ * and returns the full Pipeline JSON — same shape and side effects as
+ * POST /api/pipelines, but driven by a template instead of ready JSON. */
+static void h_pipeline_from_template(HttpReq *req, HttpResp *resp) {
+    if (!req->body || !req->body_len) { http_resp_error(resp, 400, "empty body"); return; }
+    Arena *a = req->arena;
+
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root || root->type != JV_OBJECT) {
+        http_resp_error(resp, 400, "expected JSON object"); return;
+    }
+    const char *tmpl = json_str(json_get(root, "template_yaml"), "");
+    if (!tmpl[0]) { http_resp_error(resp, 400, "template_yaml is required"); return; }
+
+    /* Collect vars{} → keys[]/vals[] (override the template's own vars:). */
+    const char *keys[128]; const char *vals[128]; int nkvs = 0;
+    JVal *vars_obj = json_get(root, "vars");
+    if (vars_obj && vars_obj->type == JV_OBJECT) {
+        for (int i = 0; i < (int)vars_obj->nkeys && nkvs < 128; i++) {
+            keys[nkvs] = vars_obj->keys[i];
+            vals[nkvs] = json_str(vars_obj->vals[i], "");
+            nkvs++;
+        }
+    }
+
+    char *expanded = yaml_expand_vars(a, tmpl, strlen(tmpl), keys, vals, nkvs);
+    if (!expanded) { http_resp_error(resp, 500, "template expansion failed"); return; }
+
+    YamlError yerr = {0};
+    char *json = NULL;
+    if (yaml_to_json(expanded, strlen(expanded), a, &json, &yerr) < 0) {
+        char *msg = arena_sprintf(a,
+            "{\"error\":\"yaml parse error\",\"detail\":\"%s\",\"line\":%d,\"col\":%d}",
+            yerr.buf, yerr.line, yerr.col);
+        resp->status = 400; resp->content_type = "application/json";
+        resp->body = msg; resp->body_len = strlen(msg);
+        return;
+    }
+
+    Pipeline p; memset(&p, 0, sizeof(p));
+    if (pipeline_from_json(&p, json) < 0) {
+        http_resp_error(resp, 400, "expanded yaml is not a valid pipeline"); return;
+    }
+    if (!p.id[0]) {
+        static volatile int _tpl_seq = 0;
+        int seq = __atomic_fetch_add(&_tpl_seq, 1, __ATOMIC_RELAXED);
+        snprintf(p.id, sizeof(p.id), "p_%lld_%d", (long long)time(NULL), seq);
+    }
+    scheduler_add(g_app.scheduler, &p);
+    char *pj = pipeline_to_json(&p, a);
+    catalog_save_pipeline(g_app.catalog, p.id, pj);
+    http_resp_json(resp, 201, pj);
+
+    Arena *ba = arena_create(256);
+    app_ws_broadcast(&g_app, arena_sprintf(ba, "{\"event\":\"pipeline_created\",\"id\":\"%s\"}", p.id));
+    arena_destroy(ba);
+}
+
 /* ── GET /api/pipelines/:id ── */
 static void h_pipeline_get(HttpReq *req, HttpResp *resp) {
     const char *id=hm_get(&req->params,"id");
@@ -3623,13 +3694,20 @@ static void send_pipeline_alert(Pipeline *p, const char *message, bool success) 
     }
 }
 
+/* Map UI/YAML connector_type names to the built .so basename. Most names map
+ * 1:1 (csv → csv_connector.so); a few plugins ship under a short basename:
+ *   postgresql / postgres → pg ; greenplum → gp. */
+static const char *connector_so_name(const char *conn) {
+    if (!conn) return "";
+    if (!strcmp(conn, "postgresql") || !strcmp(conn, "postgres")) return "pg";
+    if (!strcmp(conn, "greenplum")) return "gp";
+    return conn;
+}
+
 /* ── Run one connector step: pull all batches into target_table ── */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
     char so_path[1024];
-    /* Map UI/YAML connector names to the built .so basename. The PostgreSQL
-     * plugin ships as pg_connector.so, but the UI/YAML use "postgresql". */
-    const char *conn = st->connector_type;
-    if (!strcmp(conn, "postgresql") || !strcmp(conn, "postgres")) conn = "pg";
+    const char *conn = connector_so_name(st->connector_type);
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
              app->plugins_dir, conn);
 
@@ -3736,8 +3814,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     }
 
     /* 3. Load the sink connector (.so). Map UI/YAML names to .so basenames. */
-    const char *conn = st->connector_type;
-    if (!strcmp(conn, "postgresql") || !strcmp(conn, "postgres")) conn = "pg";
+    const char *conn = connector_so_name(st->connector_type);
     char so_path[1024];
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so", app->plugins_dir, conn);
     ConnectorInst *inst = connector_load(so_path, st->connector_config, a);
@@ -3794,37 +3871,43 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     return total;
 }
 
-/* ── Python step ────────────────────────────────────────────────
- * Runs `python3 -c <wrapper>` as a subprocess. The wrapper reads
- * stdin as CSV into a pandas DataFrame called `df`, executes the
- * user's code, then writes `df` back to stdout as CSV. Caller is
- * responsible for piping input CSV in and ingesting the result.
+/* ── Script steps (Python / Scala) ──────────────────────────────
+ * A "script step" hands the step's input rows to a subprocess as CSV
+ * on stdin, runs user code that mutates a tabular `df`, and reads the
+ * result back as CSV on stdout. Python (pandas) and Scala (Spark) are
+ * two front-ends over the exact same plumbing; the three helpers below
+ * are shared so adding a language is just "build a wrapper + argv".
  *
- * Why subprocess and not embedded CPython:
- * - keeps gateway's pure-C core free of libpython dependency
+ * Why subprocess and not an embedded runtime:
+ * - keeps the gateway's pure-C core free of libpython / a JVM dependency
  * - matches the trust model of the existing bash/connector step
  *   (no sandbox; same uid as gateway)
- * - lets users freely install pandas/numpy without coordinating
- *   with gateway lifecycle
+ * - lets users install pandas / scala-cli without coordinating with the
+ *   gateway lifecycle
  *
- * Error handling: on non-zero exit, the script's stderr is captured
+ * Error handling: on non-zero exit, the child's stderr tail is captured
  * into `errbuf`; the step is marked failed and retry semantics apply
- * normally. */
-static int run_python_step(App *app, Arena *a, PipelineStep *st,
-                           char *errbuf, size_t errsz) {
-    /* 1. Materialize input CSV from transform_sql (or empty if none). */
+ * normally. `label` is a human prefix like "python step s1" reused in
+ * every diagnostic so messages are language-aware. */
+
+/* 1. Materialize the step's transform_sql result as a CSV blob (header +
+ * rows). Empty transform_sql → empty string. 0 on success (sets
+ * out_csv/out_len), -1 on SQL parse/exec error (errbuf set). */
+static int script_step_input_csv(Arena *a, PipelineStep *st, const char *label,
+                                 char **out_csv, size_t *out_len,
+                                 char *errbuf, size_t errsz) {
     char *input_csv = NULL;
     size_t input_len = 0;
     if (st->transform_sql[0]) {
         Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
         if (!stmt || stmt->error) {
-            snprintf(errbuf, errsz, "python step %s: input SQL parse error: %s",
-                     st->id, stmt && stmt->error ? stmt->error : "null");
+            snprintf(errbuf, errsz, "%s: input SQL parse error: %s",
+                     label, stmt && stmt->error ? stmt->error : "null");
             return -1;
         }
         RS *rs = exec_stmt(a, stmt, NULL);
         if (!rs) {
-            snprintf(errbuf, errsz, "python step %s: input SQL exec failed", st->id);
+            snprintf(errbuf, errsz, "%s: input SQL exec failed", label);
             return -1;
         }
         /* Build CSV: header + rows */
@@ -3874,37 +3957,28 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
         input_csv = (char *)"";
         input_len = 0;
     }
+    *out_csv = input_csv;
+    *out_len = input_len;
+    return 0;
+}
 
-    /* 2. Build the wrapper script. The user code is interpolated as-is. */
-    const char *user_code = st->python_code;
-    size_t code_len = strlen(user_code);
-    size_t wrap_cap = code_len + 1024;
-    char *wrapper = arena_alloc(a, wrap_cap);
-    snprintf(wrapper, wrap_cap,
-        "import sys, io\n"
-        "try:\n"
-        "    import pandas as pd\n"
-        "except ImportError:\n"
-        "    sys.stderr.write('error: `pandas` is not installed for python3. '\n"
-        "                     'Install with: python3 -m pip install pandas\\n')\n"
-        "    sys.exit(2)\n"
-        "_csv_in = sys.stdin.read()\n"
-        "df = pd.read_csv(io.StringIO(_csv_in)) if _csv_in.strip() else pd.DataFrame()\n"
-        "# ── user code ──\n"
-        "%s\n"
-        "# ── /user code ──\n"
-        "df.to_csv(sys.stdout, index=False)\n",
-        user_code);
-
-    /* 3. Spawn subprocess with bidirectional pipes. */
+/* 2. Spawn argv[] (argv[0] resolved via $PATH), write input_csv to its
+ * stdin, collect stdout (CSV) into *out_buf_p and the tail of stderr for
+ * diagnostics. Enforces a wall-clock timeout (SIGKILL on expiry).
+ * 0 on a clean exit(0); -1 otherwise (errbuf set, incl. stderr tail). */
+static int run_csv_subprocess(Arena *a, char *const argv[],
+                              const char *input_csv, size_t input_len,
+                              int timeout_sec, const char *label,
+                              char **out_buf_p, size_t *out_len_p,
+                              char *errbuf, size_t errsz) {
     int in_pipe[2], out_pipe[2], err_pipe[2];
     if (pipe(in_pipe) || pipe(out_pipe) || pipe(err_pipe)) {
-        snprintf(errbuf, errsz, "python step %s: pipe() failed", st->id);
+        snprintf(errbuf, errsz, "%s: pipe() failed", label);
         return -1;
     }
     pid_t pid = fork();
     if (pid < 0) {
-        snprintf(errbuf, errsz, "python step %s: fork() failed", st->id);
+        snprintf(errbuf, errsz, "%s: fork() failed", label);
         return -1;
     }
     if (pid == 0) {
@@ -3915,15 +3989,14 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
-        execlp("python3", "python3", "-c", wrapper, (char *)NULL);
+        execvp(argv[0], argv);
         _exit(127);
     }
     /* PARENT */
     close(in_pipe[0]); close(out_pipe[1]); close(err_pipe[1]);
 
-    /* Write input CSV in a small thread-style loop (no pthread; just
-     * non-blocking writes interleaved with reads). For now, simple:
-     * write all at once since CSV is bounded by query result size. */
+    /* Write input CSV. Simple: write all at once since CSV is bounded by
+     * query result size. */
     if (input_len > 0) {
         ssize_t left = (ssize_t)input_len;
         const char *p = input_csv;
@@ -3935,9 +4008,8 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
     }
     close(in_pipe[1]);
 
-    /* Read stdout + stderr with a per-fd buffer. Use poll() with the
-     * step's timeout. */
-    int timeout_ms = (st->python_timeout_sec > 0 ? st->python_timeout_sec : 300) * 1000;
+    /* Read stdout + stderr with a per-fd buffer. poll() with the timeout. */
+    int timeout_ms = (timeout_sec > 0 ? timeout_sec : 300) * 1000;
     int64_t deadline = (int64_t)time(NULL) * 1000 + timeout_ms;
     size_t out_cap = 65536, out_len = 0;
     char *out_buf = arena_alloc(a, out_cap);
@@ -3950,8 +4022,8 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
         int64_t now_ms = (int64_t)time(NULL) * 1000;
         if (now_ms >= deadline) {
             kill(pid, SIGKILL);
-            snprintf(errbuf, errsz, "python step %s: timeout (%ds)",
-                     st->id, st->python_timeout_sec > 0 ? st->python_timeout_sec : 300);
+            snprintf(errbuf, errsz, "%s: timeout (%ds)",
+                     label, timeout_sec > 0 ? timeout_sec : 300);
             close(out_pipe[0]); close(err_pipe[0]);
             int s; waitpid(pid, &s, 0);
             return -1;
@@ -3999,14 +4071,23 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
     int wstatus = 0;
     waitpid(pid, &wstatus, 0);
     if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
-        snprintf(errbuf, errsz, "python step %s: exit=%d, stderr: %.300s",
-                 st->id, WEXITSTATUS(wstatus), err_tail);
+        snprintf(errbuf, errsz, "%s: exit=%d, stderr: %.300s",
+                 label, WEXITSTATUS(wstatus), err_tail);
         return -1;
     }
+    *out_buf_p = out_buf;
+    *out_len_p = out_len;
+    return 0;
+}
 
-    /* 4. Ingest output CSV into target_table.
-     * Reuse the same code path as POST /api/ingest/csv by calling into
-     * the connector via direct ingest helper.  Simplest: parse the CSV
+/* 3. Parse the subprocess's CSV stdout and ingest into st->target_table.
+ * Returns rows written (0 if no target / empty output), -1 on malformed
+ * CSV (errbuf set). out_buf is mutated in place during tokenization. */
+static int script_step_ingest_output(App *app, Arena *a, PipelineStep *st,
+                                      const char *label,
+                                      char *out_buf, size_t out_len,
+                                      char *errbuf, size_t errsz) {
+    /* Reuse the same code path as POST /api/ingest/csv: parse the CSV
      * ourselves into a Schema+rows and call write_rs_to_table. */
     if (!st->target_table[0] || out_len == 0) {
         return 0;
@@ -4014,7 +4095,7 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
     /* Tokenize header line */
     char *nl = strchr(out_buf, '\n');
     if (!nl) {
-        snprintf(errbuf, errsz, "python step %s: output CSV has no header", st->id);
+        snprintf(errbuf, errsz, "%s: output CSV has no header", label);
         return -1;
     }
     *nl = '\0';
@@ -4050,8 +4131,190 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
     }
 
     int rows_written = write_rs_to_table(app, a, st->target_table, rs);
-    LOG_INFO("python step '%s' → %s: %d rows", st->id, st->target_table, rows_written);
+    LOG_INFO("%s → %s: %d rows", label, st->target_table, rows_written);
     return rows_written;
+}
+
+/* Python step: `python3 -c <wrapper>`. The wrapper reads stdin CSV into a
+ * pandas DataFrame `df`, runs the user code, writes `df` back as CSV. */
+static int run_python_step(App *app, Arena *a, PipelineStep *st,
+                           char *errbuf, size_t errsz) {
+    char label[128];
+    snprintf(label, sizeof(label), "python step %s", st->id);
+
+    char *input_csv; size_t input_len;
+    if (script_step_input_csv(a, st, label, &input_csv, &input_len, errbuf, errsz) < 0)
+        return -1;
+
+    const char *user_code = st->python_code;
+    size_t wrap_cap = strlen(user_code) + 1024;
+    char *wrapper = arena_alloc(a, wrap_cap);
+    snprintf(wrapper, wrap_cap,
+        "import sys, io\n"
+        "try:\n"
+        "    import pandas as pd\n"
+        "except ImportError:\n"
+        "    sys.stderr.write('error: `pandas` is not installed for python3. '\n"
+        "                     'Install with: python3 -m pip install pandas\\n')\n"
+        "    sys.exit(2)\n"
+        "_csv_in = sys.stdin.read()\n"
+        "df = pd.read_csv(io.StringIO(_csv_in)) if _csv_in.strip() else pd.DataFrame()\n"
+        "# ── user code ──\n"
+        "%s\n"
+        "# ── /user code ──\n"
+        "df.to_csv(sys.stdout, index=False)\n",
+        user_code);
+
+    char *argv[] = { (char *)"python3", (char *)"-c", wrapper, NULL };
+    int timeout = st->python_timeout_sec > 0 ? st->python_timeout_sec : 300;
+    char *out_buf; size_t out_len;
+    if (run_csv_subprocess(a, argv, input_csv, input_len, timeout, label,
+                           &out_buf, &out_len, errbuf, errsz) < 0)
+        return -1;
+
+    return script_step_ingest_output(app, a, st, label, out_buf, out_len, errbuf, errsz);
+}
+
+/* ── Scala step ─────────────────────────────────────────────────
+ * Runs `scala-cli run <script.scala>` as a subprocess. The script spins up
+ * an embedded local[*] SparkSession, reads stdin CSV into a Spark DataFrame
+ * `df`, runs the user's Scala code, then writes `df` back to stdout as CSV.
+ * On par with the Python step — same input/output plumbing, different
+ * front-end. Spark dependency is pulled by scala-cli via a `//> using`
+ * directive, so no separate cluster is required.
+ *
+ * Unlike `python3 -c`, scala-cli takes a script *file* (stdin carries the
+ * data), so the wrapper is written to a temp `.scala` file in a private temp
+ * dir (scala-cli drops a `.scala-build/` next to it), executed, then the whole
+ * dir is removed afterwards. */
+
+/* Recursively delete a file or directory tree. Best-effort: failures are
+ * ignored (the path lives under /tmp). */
+static void rmrf_path(const char *path) {
+    struct stat stbuf;
+    if (lstat(path, &stbuf) != 0) return;
+    if (S_ISDIR(stbuf.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                char child[2048];
+                snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+                rmrf_path(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+static int run_scala_step(App *app, Arena *a, PipelineStep *st,
+                          char *errbuf, size_t errsz) {
+    char label[128];
+    snprintf(label, sizeof(label), "scala step %s", st->id);
+
+    char *input_csv; size_t input_len;
+    if (script_step_input_csv(a, st, label, &input_csv, &input_len, errbuf, errsz) < 0)
+        return -1;
+
+    /* Build the wrapper script. The user code is interpolated as-is into
+     * main(), where `df` is an in-scope `var df: DataFrame`. All columns are
+     * read as String (mirrors the CSV round-trip of the Python step). */
+    const char *user_code = st->scala_code;
+    size_t wrap_cap = strlen(user_code) + 4096;
+    char *wrapper = arena_alloc(a, wrap_cap);
+    snprintf(wrapper, wrap_cap,
+        "//> using scala 2.13.14\n"
+        "//> using dep org.apache.spark::spark-sql:3.5.1\n"
+        /* Spark 3.5 on JDK 17 needs these module opens or SparkContext init
+         * dies with IllegalAccessError on sun.nio.ch.DirectBuffer. Harmless
+         * on JDK 11/8. scala-cli passes them at JVM launch. */
+        "//> using javaOpt \"--add-opens=java.base/java.lang=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.lang.invoke=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.io=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.net=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.nio=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.util=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.util.concurrent=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/sun.nio.ch=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/sun.nio.cs=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/sun.security.action=ALL-UNNAMED\", "
+        "\"--add-opens=java.base/sun.util.calendar=ALL-UNNAMED\"\n"
+        "import org.apache.spark.sql.{SparkSession, DataFrame}\n"
+        "object DfoScalaStep {\n"
+        "  def esc(s: String): String =\n"
+        "    if (s.contains(\",\") || s.contains(\"\\\"\") || s.contains(\"\\n\"))\n"
+        "      \"\\\"\" + s.replace(\"\\\"\", \"\\\"\\\"\") + \"\\\"\" else s\n"
+        "  def main(args: Array[String]): Unit = {\n"
+        "    val spark = SparkSession.builder()\n"
+        "      .appName(\"dfo-scala-step\").master(\"local[*]\")\n"
+        "      .config(\"spark.ui.enabled\", \"false\")\n"
+        "      .config(\"spark.sql.shuffle.partitions\", \"4\")\n"
+        "      .getOrCreate()\n"
+        "    spark.sparkContext.setLogLevel(\"ERROR\")\n"
+        "    import spark.implicits._\n"
+        "    val lines = scala.io.Source.stdin.getLines().toList\n"
+        "    var df: DataFrame =\n"
+        "      if (lines.isEmpty || lines.forall(_.trim.isEmpty)) spark.emptyDataFrame\n"
+        "      else spark.read.option(\"header\", \"true\").option(\"inferSchema\", \"false\").csv(lines.toDS())\n"
+        "    // ── user code ──\n"
+        "    %s\n"
+        "    // ── /user code ──\n"
+        "    val cols = df.columns\n"
+        "    val sb = new StringBuilder\n"
+        "    if (cols.nonEmpty) {\n"
+        "      sb.append(cols.map(esc).mkString(\",\")).append(\"\\n\")\n"
+        "      df.collect().foreach { r =>\n"
+        "        sb.append((0 until r.length).map(i => esc(Option(r.get(i)).map(_.toString).getOrElse(\"\"))).mkString(\",\")).append(\"\\n\")\n"
+        "      }\n"
+        "    }\n"
+        "    print(sb.toString)\n"
+        "    spark.stop()\n"
+        "  }\n"
+        "}\n",
+        user_code);
+
+    /* Write the wrapper to a temp .scala file inside a private temp dir.
+     * scala-cli needs a file path (stdin is reserved for the input data) and
+     * a `.scala` extension to recognise the source. */
+    char tmpdir[] = "/tmp/dfo_scala_XXXXXX";
+    if (!mkdtemp(tmpdir)) {
+        snprintf(errbuf, errsz, "%s: mkdtemp() failed: %s", label, strerror(errno));
+        return -1;
+    }
+    char script_path[256];
+    snprintf(script_path, sizeof(script_path), "%s/step.scala", tmpdir);
+    int sfd = open(script_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (sfd < 0) {
+        snprintf(errbuf, errsz, "%s: open(%s) failed: %s", label, script_path, strerror(errno));
+        rmrf_path(tmpdir);
+        return -1;
+    }
+    {
+        ssize_t left = (ssize_t)strlen(wrapper);
+        const char *p = wrapper;
+        while (left > 0) {
+            ssize_t w = write(sfd, p, (size_t)left);
+            if (w < 0) { if (errno == EINTR) continue; break; }
+            p += w; left -= w;
+        }
+        close(sfd);
+    }
+
+    char *argv[] = { (char *)"scala-cli", (char *)"run", (char *)"--quiet",
+                     script_path, NULL };
+    int timeout = st->scala_timeout_sec > 0 ? st->scala_timeout_sec : 600;
+    char *out_buf; size_t out_len;
+    int rc = run_csv_subprocess(a, argv, input_csv, input_len, timeout, label,
+                                &out_buf, &out_len, errbuf, errsz);
+    rmrf_path(tmpdir);
+    if (rc < 0) return -1;
+
+    return script_step_ingest_output(app, a, st, label, out_buf, out_len, errbuf, errsz);
 }
 
 /* ── SCD2 helpers ───────────────────────────────────────────────── */
@@ -4103,6 +4366,30 @@ static bool scd2_truthy(const char *v) {
     if (!strcasecmp(v, "0") || !strcasecmp(v, "false") ||
         !strcasecmp(v, "f") || !strcasecmp(v, "no") || !strcasecmp(v, "n")) return false;
     return true;
+}
+
+/* Compute MD5 hex over cmp_cols values (unit-separator delimited) for a single
+ * source row. Used by scd2_hash_col change detection: one hash compare replaces
+ * N column strcmps, and a stored hash distinguishes "" from a genuinely
+ * different value across runs. `out` must be char[33] (32 hex + NUL). */
+static void scd2_compute_hash(const RS *src, int row,
+                               char **cmp_cols, int ncmp,
+                               char out[33]) {
+    char raw[4096]; size_t off = 0;
+    for (int i = 0; i < ncmp; i++) {
+        int ci = scd2_rs_col_index(src, cmp_cols[i]);
+        const char *v = (ci >= 0 && src->rows[row].cells[ci])
+                        ? src->rows[row].cells[ci] : "";
+        if (i && off < sizeof(raw) - 1) raw[off++] = '\x1f';
+        size_t vl = strlen(v);
+        if (off + vl >= sizeof(raw)) vl = sizeof(raw) - 1 - off;
+        memcpy(raw + off, v, vl); off += vl;
+    }
+    raw[off] = '\0';
+    unsigned char digest[16];
+    MD5((const unsigned char *)raw, off, digest);
+    for (int b = 0; b < 16; b++) snprintf(out + b*2, 3, "%02x", digest[b]);
+    out[32] = '\0';
 }
 
 /* ── SCD2 (slowly-changing-dimension, type 2) step ──────────────────
@@ -4284,12 +4571,30 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
             if (n_new < MAX_RS_ROWS) new_rows[n_new++] = r;                            /* NEW */
         } else {
             bool changed = false;
-            for (int k = 0; k < ncmp && !changed; k++) {
-                int si = scd2_rs_col_index(src, cmp_cols[k]);
-                int ci = scd2_rs_col_index(cur, cmp_cols[k]);
-                const char *vs = (si >= 0 && cells[si]) ? cells[si] : "";
-                const char *vc = (ci >= 0 && cur_cells[ci]) ? cur_cells[ci] : "";
-                if (strcmp(vs, vc) != 0) changed = true;   /* TODO(scd2): NULL-safe compare */
+            bool hash_compared = false;
+            /* O(1) hash compare when the current version carries a stored hash.
+             * This also detects "" vs NULL changes the column strcmp can't (a
+             * stored hash differs from a freshly computed one). */
+            if (st->scd2_hash_col[0]) {
+                int hash_cur_idx = scd2_rs_col_index(cur, st->scd2_hash_col);
+                if (hash_cur_idx >= 0) {
+                    char src_hex[33];
+                    scd2_compute_hash(src, r, cmp_cols, ncmp, src_hex);
+                    const char *cur_hex = cur_cells[hash_cur_idx]
+                                          ? cur_cells[hash_cur_idx] : "";
+                    changed = strcmp(src_hex, cur_hex) != 0;
+                    hash_compared = true;
+                }
+            }
+            if (!hash_compared) {
+                /* Fallback: column-by-column strcmp (existing behaviour). */
+                for (int k = 0; k < ncmp && !changed; k++) {
+                    int si = scd2_rs_col_index(src, cmp_cols[k]);
+                    int ci = scd2_rs_col_index(cur, cmp_cols[k]);
+                    const char *vs = (si >= 0 && cells[si]) ? cells[si] : "";
+                    const char *vc = (ci >= 0 && cur_cells[ci]) ? cur_cells[ci] : "";
+                    if (strcmp(vs, vc) != 0) changed = true;   /* TODO(scd2): NULL-safe compare */
+                }
             }
             if (changed) {
                 if (n_closed < MAX_RS_ROWS) closed_keys[n_closed++] = key;
@@ -4313,10 +4618,14 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         tcols = hist->col_names; tncols = hist->ncols;
     } else {
         tncols = 0;
-        tcols = arena_alloc(a, (size_t)(src->ncols + 2) * sizeof(char *));
+        tcols = arena_alloc(a, (size_t)(src->ncols + 3) * sizeof(char *));
         for (int c = 0; c < src->ncols; c++) tcols[tncols++] = src->col_names[c];
         if (scd2_rs_col_index(src, vf) < 0) tcols[tncols++] = arena_strdup(a, vf);
         if (scd2_rs_col_index(src, vt) < 0) tcols[tncols++] = arena_strdup(a, vt);
+        /* Row-hash column for change detection (optional; off when unset). */
+        if (st->scd2_hash_col[0] && scd2_rs_col_index(src, st->scd2_hash_col) < 0
+                                 && tncols < MAX_COLS)
+            tcols[tncols++] = arena_strdup(a, st->scd2_hash_col);
     }
     int t_vt_idx = -1;
     for (int j = 0; j < tncols; j++) if (tcols[j] && !strcasecmp(tcols[j], vt)) { t_vt_idx = j; break; }
@@ -4351,6 +4660,17 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
             else {
                 int si = scd2_rs_col_index(src, name);
                 cells[j] = (si >= 0 && scells[si]) ? scells[si] : (char *)"";
+            }
+        }
+        /* Stamp the row hash for this new version (if requested). */
+        if (st->scd2_hash_col[0]) {
+            int ti = -1;
+            for (int j = 0; j < tncols; j++)
+                if (tcols[j] && !strcasecmp(tcols[j], st->scd2_hash_col)) { ti = j; break; }
+            if (ti >= 0) {
+                char hex[33];
+                scd2_compute_hash(src, new_rows[i], cmp_cols, ncmp, hex);
+                cells[ti] = arena_strdup(a, hex);
             }
         }
         rs_add(out, a, cells, NULL);
@@ -4400,6 +4720,17 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                  * If transform_sql is set, it provides input data; otherwise
                  * the user's script starts with an empty DataFrame. */
                 int n = run_python_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                if (n < 0) {
+                    st->status = STEP_FAILED;
+                } else {
+                    total_rows += n;
+                    st->status = STEP_SUCCESS;
+                }
+            } else if (st->scala_code[0]) {
+                /* Scala step (Spark DataFrame) — same precedence rules as the
+                 * Python step: takes input from transform_sql if set, else the
+                 * user's script starts from an empty DataFrame. */
+                int n = run_scala_step(app, a, st, p->error_msg, sizeof(p->error_msg));
                 if (n < 0) {
                     st->status = STEP_FAILED;
                 } else {
@@ -4852,7 +5183,7 @@ static ConnectorInst *load_connector_by_type(Arena *a, const char *type,
                                                const char *cfg_json) {
     char so_path[1024];
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
-             g_app.plugins_dir, type);
+             g_app.plugins_dir, connector_so_name(type));
     return connector_load(so_path, cfg_json, a);
 }
 
@@ -5285,6 +5616,7 @@ void api_register_routes(Router *r) {
     router_add(r,"POST", "/api/pipelines",           h_pipeline_create);
     router_add(r,"POST", "/api/pipelines/preview-yaml", h_pipeline_preview_yaml); /* Step 5 */
     router_add(r,"POST", "/api/pipelines/preview-step", h_pipeline_preview_step);
+    router_add(r,"POST", "/api/pipelines/from-template", h_pipeline_from_template);
     router_add(r,"GET",  "/api/pipelines/:id",       h_pipeline_get);
     router_add(r,"POST", "/api/pipelines/:id/run",   h_pipeline_run);
     router_add(r,"DELETE","/api/pipelines/:id",      h_pipeline_delete);

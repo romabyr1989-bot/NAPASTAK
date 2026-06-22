@@ -385,6 +385,56 @@ async function runStepPython(idx) {
   }
 }
 
+/* Run ONLY this step's scala_code (with its transform_sql as input data) —
+ * no upstream chain. Single-step POST to /api/pipelines/preview-step. */
+async function runStepScala(idx) {
+  const step = pb.steps[idx];
+  const panel = document.getElementById(`step-preview-${idx}`);
+  if (!panel) return;
+  panel.style.display = '';
+  if (!step?.scala_code) {
+    panel.innerHTML = '<div style="padding:.6rem;color:var(--amber)">Scala-код пустой</div>';
+    return;
+  }
+  panel.innerHTML = '<div style="padding:.6rem;color:var(--muted)">Выполняется Scala (Spark прогревается)…</div>';
+
+  const payload = {
+    name: 'preview',
+    enabled: false,
+    steps: [{
+      id:                'preview',
+      name:              step.name || 'preview',
+      connector_type:    '',
+      connector_config:  '',
+      transform_sql:     step.transform_sql || '',
+      scala_code:        step.scala_code,
+      scala_timeout_sec: step.scala_timeout_sec || 600,
+      target_table:      '',
+      max_retries:       0,
+      retry_delay_sec:   1,
+      deps:              [],
+    }],
+  };
+  const limit = prefs.rowLimit || 100;
+  const t0 = performance.now();
+  try {
+    const data = await apiPost(`/api/pipelines/preview-step?save=0&limit=${limit}`, payload);
+    if (!data) { panel.innerHTML = '<div style="padding:.6rem;color:var(--red)">Сервер вернул undefined</div>'; return; }
+    const ms = (performance.now() - t0).toFixed(1);
+    const rows = data.rows || [];
+    panel.innerHTML = '';
+    const status = document.createElement('div');
+    status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.4rem';
+    status.innerHTML = `▶ Scala — ${rows.length} ${pluralRows(rows.length)} · ${ms} мс`;
+    panel.appendChild(status);
+    panel.appendChild(makeResultTable(data));
+  } catch (err) {
+    let msg = String(err);
+    try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
+    panel.innerHTML = `<div style="padding:.75rem;color:var(--red);background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:.78rem">${escHtml(msg)}</div>`;
+  }
+}
+
 async function runStepPreview(idx, opts = {}) {
   const save = !!opts.save;
   const step = pb.steps[idx];
@@ -416,8 +466,8 @@ async function runStepPreview(idx, opts = {}) {
   };
 
   if (!step) { setStatus(`step #${idx} не найден в pb.steps (length=${pb.steps.length})`, 'var(--red)'); return; }
-  if (!step.transform_sql && !step.python_code && !step.connector_type && !step.scd2_business_key) {
-    setStatus('Шаг пустой — заполни SQL, Python, коннектор или SCD2', 'var(--amber)');
+  if (!step.transform_sql && !step.python_code && !step.scala_code && !step.connector_type && !step.scd2_business_key) {
+    setStatus('Шаг пустой — заполни SQL, Python, Scala, коннектор или SCD2', 'var(--amber)');
     return;
   }
   if (save && !step.target_table) {
@@ -444,6 +494,8 @@ async function runStepPreview(idx, opts = {}) {
     transform_sql:      s.transform_sql || '',
     python_code:        s.python_code || '',
     python_timeout_sec: s.python_timeout_sec || 300,
+    scala_code:         s.scala_code || '',
+    scala_timeout_sec:  s.scala_timeout_sec || 600,
     target_table:       s.target_table || '',
     max_retries:        0,
     retry_delay_sec:    1,
@@ -1105,14 +1157,20 @@ function pbUpdateConnConfig(idx, field, val) {
  * shown; when absent (e.g. a pipeline loaded from the server) we derive it. */
 const SCD2_FIELDS = ['scd2_business_key','scd2_compare_columns','scd2_transaction_time',
                      'scd2_effective_from_col','scd2_effective_to_col','scd2_deleted_flag',
-                     'scd2_ignored_columns'];
+                     'scd2_ignored_columns','scd2_hash_col'];
 const PY_STARTER =
   '# input  : df  (pandas DataFrame from transform_sql)\n' +
   '# output : df  (will be written to target_table as CSV)\n' +
   'df["score"] = df["score"] * 2\n' +
   'df = df[df["score"] > 50]';
+const SCALA_STARTER =
+  '// input  : df  (Spark DataFrame from transform_sql; all cols are String)\n' +
+  '// output : df  (will be written to target_table as CSV)\n' +
+  'import org.apache.spark.sql.functions._\n' +
+  'df = df.withColumn("score", col("score").cast("int") * 2)\n' +
+  'df = df.filter(col("score") > 50)';
 
-const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','s3','kafka','airbyte'];
+const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','s3','kafka','airbyte'];
 
 /* Connectors that can act as sinks (write_batch in ABI v2). */
 const SINK_TYPES = ['csv','json_http','postgresql','s3','kafka'];
@@ -1122,6 +1180,7 @@ function stepType(step) {
   if (step.is_sink && step.connector_type) return 'sink:' + step.connector_type;
   if (step.scd2_business_key) return 'scd2';
   if (step.python_code)       return 'python';
+  if (step.scala_code)        return 'scala';
   if (step.connector_type)    return step.connector_type;  /* the specific connector */
   return 'sql';
 }
@@ -1141,6 +1200,7 @@ function pbChangeStepType(idx, type) {
   s.connector_type = '';
   s.connector_config = '';
   s.python_code = '';
+  s.scala_code = '';
   s.is_sink = false;
   SCD2_FIELDS.forEach(k => delete s[k]);
   if (type.startsWith('sink:')) {
@@ -1152,6 +1212,9 @@ function pbChangeStepType(idx, type) {
     if (s.sink_entity == null) s.sink_entity = '';
   } else if (type === 'python') {
     s.python_code = PY_STARTER;
+  } else if (type === 'scala') {
+    s.scala_code = SCALA_STARTER;
+    if (s.scala_timeout_sec == null) s.scala_timeout_sec = 600;
   } else if (CONNECTOR_TYPES.includes(type)) {
     s.connector_type = type;
     s.connector_config = '{}';
@@ -1226,6 +1289,7 @@ function makeScd2FieldsHTML(step, idx) {
       <div class="step-row-2">${f('Business key','scd2_business_key','customer_id','через запятую')}${f('Compare columns','scd2_compare_columns','name,email,city','пусто = все')}</div>
       <div class="step-row-2" style="margin-top:.4rem">${f('valid_from колонка','scd2_effective_from_col','valid_from')}${f('valid_to колонка','scd2_effective_to_col','valid_to')}</div>
       <div class="step-row-2" style="margin-top:.4rem">${f('transaction_time','scd2_transaction_time','updated_at','для ORDER BY окна')}${f('deleted_flag','scd2_deleted_flag','is_deleted','soft-delete в источнике')}</div>
+      <div class="step-row-2" style="margin-top:.4rem">${f('hash колонка','scd2_hash_col','_dfo_row_hash','MD5 по compare-колонкам; ускоряет детект изменений и ловит ""↔NULL')}</div>
     </div>`;
 }
 
@@ -1386,6 +1450,7 @@ function makeStepCard(step, idx) {
             <optgroup label="Трансформации">
               <option value="sql"    ${t==='sql'   ?'selected':''}>SQL-трансформация</option>
               <option value="python" ${t==='python'?'selected':''}>🐍 Python (pandas)</option>
+              <option value="scala"  ${t==='scala' ?'selected':''}>⚡ Scala (Spark)</option>
               <option value="scd2"   ${t==='scd2'  ?'selected':''}>🕒 SCD2 (историзация)</option>
               <option value="match"  ${t==='match' ?'selected':''}>🔗 Match (fuzzy)</option>
             </optgroup>
@@ -1394,6 +1459,8 @@ function makeStepCard(step, idx) {
               <option value="parquet"    ${t==='parquet'   ?'selected':''}>Parquet файл</option>
               <option value="json_http"  ${t==='json_http' ?'selected':''}>HTTP / REST API (JSON)</option>
               <option value="postgresql" ${t==='postgresql'?'selected':''}>🗄 PostgreSQL (БД)</option>
+              <option value="greenplum"  ${t==='greenplum' ?'selected':''}>🐘 Greenplum (MPP)</option>
+              <option value="oracle"     ${t==='oracle'    ?'selected':''}>🔶 Oracle (ODPI-C)</option>
               <option value="s3"         ${t==='s3'        ?'selected':''}>S3 / MinIO</option>
               <option value="kafka"      ${t==='kafka'     ?'selected':''}>📨 Kafka</option>
               <option value="airbyte"    ${t==='airbyte'   ?'selected':''}>🛬 Airbyte (любой источник)</option>
@@ -1480,6 +1547,35 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div style="font-size:.7rem;color:var(--muted);align-self:end">
           Требуется <code>python3</code> + <code>pandas</code> на сервере.
+          Один subprocess на запуск шага.
+        </div>
+      </div>`;
+  }
+
+  /* Scala step (no connector_type, but has scala_code) */
+  if (!type && step.scala_code) {
+    return `
+      <div class="form-group" style="margin:0">
+        <label style="display:flex;align-items:center;gap:.5rem">
+          Scala-код
+          <span class="label-hint">df = Spark DataFrame из transform_sql; результат — в target_table</span>
+          <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
+                  onclick="event.stopPropagation();runStepScala(${idx})"
+                  title="Выполнить только этот Scala (без upstream-шагов)">▶ Scala</button>
+        </label>
+        <textarea class="mono-textarea" rows="8"
+          oninput="pb.steps[${idx}].scala_code=this.value"
+          style="font-family:var(--mono);font-size:.78rem">${escHtml(step.scala_code)}</textarea>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0">
+          <label>Timeout (сек)</label>
+          <input type="number" min="1" max="3600"
+                 value="${step.scala_timeout_sec || 600}"
+                 oninput="pb.steps[${idx}].scala_timeout_sec=parseInt(this.value,10)||600">
+        </div>
+        <div style="font-size:.7rem;color:var(--muted);align-self:end">
+          Требуется <code>scala-cli</code> на сервере (Spark тянется при первом запуске).
           Один subprocess на запуск шага.
         </div>
       </div>`;
@@ -1613,6 +1709,113 @@ function makeConnectorConfigHTML(step, idx) {
       </div>` : ''}
     </div>`;
 
+  if (type === 'greenplum') return `
+    <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+      🐘 Greenplum (MPP PostgreSQL) через libpq. Таблицу-источник укажи в поле
+      <strong>«SQL-трансформация»</strong> ниже (имя таблицы или <code>SELECT …</code>).</div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Хост (мастер)</label>
+        <input type="text" value="${escAttr(cfg.host || '')}"
+               oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="gp-master.prod.internal">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Порт</label>
+        <input type="text" value="${escAttr(cfg.port || '5432')}"
+               oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="5432">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>База данных</label>
+        <input type="text" value="${escAttr(cfg.dbname || '')}"
+               oninput="pbUpdateConnConfig(${idx},'dbname',this.value)" placeholder="tsmdm">
+      </div>
+    </div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Схема <span class="label-hint">search_path + discovery</span></label>
+        <input type="text" value="${escAttr(cfg.schema || '')}"
+               oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="tsmdm_cdh">
+      </div>
+      <div class="form-group" style="margin:0;max-width:120px">
+        <label>GP версия <span class="label-hint">авто</span></label>
+        <input type="text" value="${escAttr(cfg.gp_version || '')}"
+               oninput="pbUpdateConnConfig(${idx},'gp_version',this.value)" placeholder="6">
+      </div>
+      <div class="form-group" style="margin:0;max-width:140px">
+        <label>sslmode</label>
+        <input type="text" value="${escAttr(cfg.sslmode || 'disable')}"
+               oninput="pbUpdateConnConfig(${idx},'sslmode',this.value)" placeholder="disable">
+      </div>
+    </div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Пользователь</label>
+        <input type="text" value="${escAttr(cfg.user || '')}"
+               oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="tsmdm_rw">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Пароль</label>
+        <input type="password" value="${escAttr(cfg.password || '')}"
+               oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
+      </div>
+      <div class="form-group" style="margin:0;flex:2">
+        <label>cursor_column <span class="label-hint">пусто = OFFSET (медленно на master); поле = инкремент</span></label>
+        <input type="text" value="${escAttr(cfg.cursor_column || '')}"
+               oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)" placeholder="last_upd_ts">
+      </div>
+    </div>`;
+
+  if (type === 'oracle') return `
+    <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+      🔶 Oracle через ODPI-C (нужен Instant Client на сервере). Таблицу-источник
+      укажи в поле <strong>«SQL-трансформация»</strong> ниже (имя таблицы или <code>SELECT …</code>).</div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Хост</label>
+        <input type="text" value="${escAttr(cfg.host || '')}"
+               oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="oracle.prod.internal">
+      </div>
+      <div class="form-group" style="margin:0;max-width:100px">
+        <label>Порт</label>
+        <input type="text" value="${escAttr(cfg.port || '1521')}"
+               oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="1521">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Service name <span class="label-hint">Easy Connect</span></label>
+        <input type="text" value="${escAttr(cfg.service_name || '')}"
+               oninput="pbUpdateConnConfig(${idx},'service_name',this.value)" placeholder="ORCL">
+      </div>
+    </div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Схема (OWNER)</label>
+        <input type="text" value="${escAttr(cfg.schema || '')}"
+               oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="TSMDM_IN">
+      </div>
+      <div class="form-group" style="margin:0;max-width:140px">
+        <label>Oracle версия <span class="label-hint">авто, дефолт 12</span></label>
+        <input type="text" value="${escAttr(cfg.oracle_version || '')}"
+               oninput="pbUpdateConnConfig(${idx},'oracle_version',this.value)" placeholder="19">
+      </div>
+    </div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Пользователь</label>
+        <input type="text" value="${escAttr(cfg.user || '')}"
+               oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="tsmdm_user">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Пароль</label>
+        <input type="password" value="${escAttr(cfg.password || '')}"
+               oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
+      </div>
+      <div class="form-group" style="margin:0;flex:2">
+        <label>cursor_column <span class="label-hint">пусто = OFFSET; поле = инкремент (напр. LAST_UPD)</span></label>
+        <input type="text" value="${escAttr(cfg.cursor_column || '')}"
+               oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)" placeholder="LAST_UPD">
+      </div>
+    </div>`;
+
   if (type === 'airbyte') {
     /* Step 2 (connector): pick from AIRBYTE_CATALOG, then a JSON pane for
      * the source-specific config (each Airbyte source has its own schema). */
@@ -1695,6 +1898,8 @@ async function persistBuilderPipeline() {
     target_table:     s.target_table     || '',
     python_code:      s.python_code      || '',
     python_timeout_sec: s.python_timeout_sec || 300,
+    scala_code:       s.scala_code       || '',
+    scala_timeout_sec: s.scala_timeout_sec || 600,
     max_retries:      s.max_retries != null ? s.max_retries : 3,
     retry_delay_sec:  s.retry_delay_sec != null ? s.retry_delay_sec : 30,
     deps:             s.deps             || [],

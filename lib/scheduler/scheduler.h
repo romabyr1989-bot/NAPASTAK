@@ -57,6 +57,17 @@ typedef struct {
     char        python_code[8192];
     int         python_timeout_sec;   /* default: 300 */
 
+    /* Scala step (subprocess `scala-cli run <script>`). On par with the
+     * Python step, but the user code operates on a Spark `DataFrame` named
+     * `df` (Spark runs embedded in local[*] mode — no separate cluster):
+     *   1. transform_sql (if set) is executed first → result fed as CSV
+     *      to the scala-cli subprocess on stdin
+     *   2. user code (Scala) operates on a `df` variable (Spark DataFrame)
+     *   3. final `df` is read from stdout as CSV and ingested into target_table
+     * Requires `scala-cli` on $PATH (it pulls Spark on first run). */
+    char        scala_code[8192];
+    int         scala_timeout_sec;    /* default: 600 (Spark cold-start is slow) */
+
     /* SCD2 (slowly-changing-dimension, type 2) step config. All optional —
      * empty strings mean "not an SCD2 step", preserving back-compat for
      * pipelines saved before these fields existed. Column names below refer

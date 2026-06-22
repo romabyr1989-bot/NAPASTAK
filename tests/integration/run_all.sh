@@ -10,7 +10,12 @@ TESTS=(
     "$SCRIPT_DIR/test_txn.sh"
     "$SCRIPT_DIR/test_replication.sh"
     "$SCRIPT_DIR/test_python_step.sh"
+    "$SCRIPT_DIR/test_scala_step.sh"
     "$SCRIPT_DIR/test_scd2.sh"
+    "$SCRIPT_DIR/test_scd2_hash.sh"
+    "$SCRIPT_DIR/test_gp_connector.sh"
+    "$SCRIPT_DIR/test_oracle_connector.sh"
+    "$SCRIPT_DIR/test_pipeline_template.sh"
 )
 
 TOTAL_PASS=0

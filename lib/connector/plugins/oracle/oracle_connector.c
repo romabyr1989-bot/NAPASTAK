@@ -1,0 +1,624 @@
+/* Oracle коннектор: реализует DfoConnector ABI через ODPI-C
+ * (Oracle Database Programming Interface for C — тонкая обёртка над OCI).
+ *
+ * Эталон — lib/connector/plugins/pg/pg_connector.c. Совпадает логика двух
+ * режимов read_batch (OFFSET-пагинация / инкрементальный high-watermark по
+ * cursor_column) и приём «эмитить все колонки как COL_TEXT» — у движка есть
+ * баг чтения нативных INT64/DOUBLE (типизированный источник роняет gateway).
+ * Типизацию по Oracle-типам делает describe() как метаданные.
+ *
+ * Версионная матрица (выбор синтаксиса по ctx->ora_major):
+ *   11g  → пагинация и инкремент через ROWNUM-subquery (нет OFFSET/FETCH)
+ *   12c+ → OFFSET ... FETCH NEXT ... ROWS ONLY
+ *   21c+ → тип JSON → COL_TEXT
+ *   23ai → тип BOOLEAN → COL_BOOL, VECTOR → COL_TEXT
+ * Версия определяется автоматически (dpiConn_getServerVersion); параметр
+ * oracle_version в конфиге перекрывает автодетект (нужен, если у пользователя
+ * нет прав на server version).
+ *
+ * write_batch = NULL: коннектор-источник, только чтение.
+ * cdc_start/cdc_stop = NULL: потоковый CDC через Oracle LogMiner — отдельная
+ * фаза (план — у объявления dfo_connector_entry ниже).
+ *
+ * ВНИМАНИЕ по сборке: требует ODPI-C в compile-time (dpi.h, -lodpic) и Oracle
+ * Instant Client в runtime (ODPI-C грузит его через dlopen). См. README.md.
+ * Собирать: `make oracle` (таргет включается, когда найден dpi.h). */
+#include "../../connector.h"
+#include "../../../core/log.h"
+#include <dpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <ctype.h>
+#include <pthread.h>
+
+/* ── Конфигурация по умолчанию ── */
+#define ORA_DEFAULT_BATCH 8192
+#define ORA_MAX_SQL       4096
+#define ORA_LOB_CHUNK     65536   /* чтение LOB порциями */
+
+/* Единый ODPI-C контекст на процесс — создаётся один раз (pthread_once). */
+static dpiContext  *gContext = NULL;
+static int          gContextOk = 0;
+static pthread_once_t gOnce = PTHREAD_ONCE_INIT;
+
+static void ora_context_init(void) {
+    dpiErrorInfo err;
+    if (dpiContext_createWithParams(DPI_MAJOR_VERSION, DPI_MINOR_VERSION,
+                                    NULL, &gContext, &err) == DPI_SUCCESS) {
+        gContextOk = 1;
+    } else {
+        LOG_ERROR("oracle: dpiContext init failed: %.*s",
+                  err.messageLength, err.message);
+        gContextOk = 0;
+    }
+}
+
+/* Контекст одного подключения. Живёт в арене, переданной в create(). */
+typedef struct {
+    dpiConn *conn;
+    char     schema[128];         /* = Oracle OWNER (UPPER) */
+    char     cursor_column[128];  /* if set → incremental high-watermark reads */
+    int      batch_size;
+    int      ora_major;           /* 11/12/19/21/23 */
+    Arena   *arena;
+} OraCtx;
+
+/* ── Ручной парсер JSON-поля (копия из pg_connector.c). ── */
+static void cfg_get(const char *json, const char *key, char *out, size_t outsz, const char *def) {
+    if (def) strncpy(out, def, outsz-1);
+    if (!json) return;
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) return;
+    p += strlen(search);
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    if (*p != ':') return;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    if (*p == '"') {
+        p++;
+        const char *e = strchr(p, '"');
+        if (!e) return;
+        size_t n = (size_t)(e - p);
+        if (n >= outsz) n = outsz - 1;
+        memcpy(out, p, n); out[n] = '\0';
+    } else {
+        const char *e = p;
+        while (*e && *e != ',' && *e != '}' && *e != ' ' && *e != '\n') e++;
+        size_t n = (size_t)(e - p);
+        if (n >= outsz) n = outsz - 1;
+        memcpy(out, p, n); out[n] = '\0';
+    }
+}
+
+/* In-place ASCII upper/lower. */
+static void str_upper(char *s) { for (; *s; s++) *s = (char)toupper((unsigned char)*s); }
+static void str_lower(char *s) { for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
+
+/* Последняя ошибка ODPI-C из глобального контекста → лог. */
+static void ora_log_err(const char *what) {
+    dpiErrorInfo err;
+    if (gContextOk) {
+        dpiContext_getError(gContext, &err);
+        LOG_ERROR("oracle %s: %.*s", what, err.messageLength, err.message);
+    } else {
+        LOG_ERROR("oracle %s: (no context)", what);
+    }
+}
+
+/* Маппинг Oracle data_type (строка из ALL_TAB_COLUMNS) + precision/scale в
+ * ColType. Используется только describe() как метаданные (read_batch → TEXT).
+ * ora_major нужен для версионных типов (BOOLEAN с 23ai). */
+static ColType ora_map_type(const char *dt, int prec, int scale,
+                            int has_prec, int has_scale, int ora_major) {
+    if (!dt) return COL_TEXT;
+    if (!strncmp(dt, "NUMBER", 6)) {
+        /* NUMBER(p,0) / INTEGER → int64; NUMBER(p,s>0) → double;
+         * NUMBER без точности → double (неопределённая → безопасно double). */
+        if (has_scale && scale == 0 && has_prec) return COL_INT64;
+        if (!has_prec && !has_scale)             return COL_DOUBLE;
+        return COL_DOUBLE;
+    }
+    if (!strcmp(dt, "INTEGER") || !strcmp(dt, "INT") ||
+        !strcmp(dt, "SMALLINT"))                          return COL_INT64;
+    if (!strcmp(dt, "FLOAT")  || !strcmp(dt, "BINARY_FLOAT") ||
+        !strcmp(dt, "BINARY_DOUBLE") || !strcmp(dt, "REAL")) return COL_DOUBLE;
+    /* DATE / TIMESTAMP* → unix seconds (int64), как в pg_connector */
+    if (!strcmp(dt, "DATE") || !strncmp(dt, "TIMESTAMP", 9)) return COL_INT64;
+    /* BOOLEAN в SQL-колонках — только Oracle 23ai+ */
+    if (!strcmp(dt, "BOOLEAN"))
+        return (ora_major >= 23) ? COL_BOOL : COL_TEXT;
+    /* строковые / LOB / спец-типы → TEXT */
+    /* VARCHAR2, NVARCHAR2, CHAR, NCHAR, CLOB, NCLOB, BLOB(hex),
+     * JSON(21c+), XMLTYPE, VECTOR(23ai), ROWID, RAW и пр. */
+    (void)prec;
+    return COL_TEXT;
+}
+
+/* dpiTimestamp → каноническая NLS-строка "YYYY-MM-DD HH:MI:SS[.FFF]".
+ * Совпадает с NLS_TIMESTAMP_FORMAT, который мы ставим в create() — поэтому
+ * значение годится и как cursor-bookmark (Oracle неявно конвертирует строку
+ * обратно в DATE/TIMESTAMP при сравнении WHERE col > :1). */
+static void fmt_ora_ts(const dpiTimestamp *ts, char *buf, size_t bufsz) {
+    int ms = (int)(ts->fsecond / 1000000);   /* наносекунды → миллисекунды */
+    if (ms > 0)
+        snprintf(buf, bufsz, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+                 ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second, ms);
+    else
+        snprintf(buf, bufsz, "%04d-%02d-%02d %02d:%02d:%02d",
+                 ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second);
+}
+
+/* Выполнить простой DML/DDL-стейтмент без результата (для ALTER SESSION). */
+static void ora_exec_simple(dpiConn *conn, const char *sql) {
+    dpiStmt *st;
+    uint32_t cols;
+    if (dpiConn_prepareStmt(conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS)
+        return;
+    dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &cols);
+    dpiStmt_release(st);
+}
+
+/* ── create(): config JSON → ODPI-C контекст, подключение, NLS, автодетект ── */
+static void *ora_create(const char *cfg, Arena *a) {
+    pthread_once(&gOnce, ora_context_init);
+
+    OraCtx *ctx = arena_calloc(a, sizeof(OraCtx));
+    ctx->arena      = a;
+    ctx->batch_size = ORA_DEFAULT_BATCH;
+    ctx->ora_major  = 12;   /* дефолт до автодетекта */
+
+    char host[128]="localhost", port[16]="1521", service[128]="ORCL";
+    char user[128]="", pass[128]="", bsz[16]="8192", oraver[16]="";
+
+    cfg_get(cfg, "host",          host,    sizeof(host),    "localhost");
+    cfg_get(cfg, "port",          port,    sizeof(port),    "1521");
+    cfg_get(cfg, "service_name",  service, sizeof(service), "ORCL");
+    cfg_get(cfg, "user",          user,    sizeof(user),    "");
+    cfg_get(cfg, "password",      pass,    sizeof(pass),    "");
+    cfg_get(cfg, "batch_size",    bsz,     sizeof(bsz),     "8192");
+    cfg_get(cfg, "schema",        ctx->schema, sizeof(ctx->schema), "");
+    cfg_get(cfg, "cursor_column", ctx->cursor_column, sizeof(ctx->cursor_column), "");
+    cfg_get(cfg, "oracle_version",oraver,  sizeof(oraver),  "");
+
+    ctx->batch_size = atoi(bsz);
+    if (ctx->batch_size <= 0 || ctx->batch_size > BATCH_SIZE)
+        ctx->batch_size = ORA_DEFAULT_BATCH;
+    if (oraver[0]) ctx->ora_major = atoi(oraver);
+    /* Oracle хранит unquoted-идентификаторы в UPPER — owner для ALL_* запросов
+     * и для квотирования "SCHEMA"."TABLE" в read_batch. */
+    str_upper(ctx->schema);
+
+    if (!gContextOk) {
+        LOG_ERROR("oracle: ODPI-C context unavailable — cannot connect");
+        return ctx;   /* conn == NULL */
+    }
+
+    /* Easy Connect: host:port/service_name */
+    char connstr[300];
+    snprintf(connstr, sizeof(connstr), "%s:%s/%s", host, port, service);
+
+    if (dpiConn_create(gContext,
+                       user, (uint32_t)strlen(user),
+                       pass, (uint32_t)strlen(pass),
+                       connstr, (uint32_t)strlen(connstr),
+                       NULL, NULL, &ctx->conn) != DPI_SUCCESS) {
+        ora_log_err("connect");
+        ctx->conn = NULL;
+        return ctx;
+    }
+
+    /* Автодетект версии сервера (если есть права). */
+    dpiVersionInfo srv_ver;
+    if (dpiConn_getServerVersion(ctx->conn, NULL, NULL, &srv_ver) == DPI_SUCCESS) {
+        ctx->ora_major = srv_ver.versionNum;
+        LOG_INFO("oracle: server version %d.%d (schema=%s)",
+                 srv_ver.versionNum, srv_ver.releaseNum, ctx->schema);
+    } else {
+        LOG_INFO("oracle: cannot detect version, using configured %d", ctx->ora_major);
+    }
+
+    /* NLS-форматы — критично: иначе DATE/TIMESTAMP приходят в формате сессии и
+     * наша строковая сериализация / cursor-bind не совпадут. */
+    static const char *nls_stmts[] = {
+        "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'",
+        "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3'",
+        "ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'",
+        NULL
+    };
+    for (int i = 0; nls_stmts[i]; i++)
+        ora_exec_simple(ctx->conn, nls_stmts[i]);
+
+    LOG_INFO("oracle: connected to %s as %s", connstr, user);
+    return ctx;
+}
+
+static void ora_destroy(void *vctx) {
+    OraCtx *ctx = vctx;
+    if (ctx && ctx->conn) { dpiConn_release(ctx->conn); ctx->conn = NULL; }
+}
+
+/* ── ping() ── */
+static int ora_ping(void *vctx) {
+    OraCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) return -1;
+    return (dpiConn_ping(ctx->conn) == DPI_SUCCESS) ? 0 : -1;
+}
+
+/* Прочитать одну колонку текущей строки как строку (в арену). nativeType из
+ * getQueryValue, oracleType из query info (для различения CLOB/BLOB). Возвращает
+ * arena-строку (или "" для NULL — NULL ловится у вызывающего по data->isNull). */
+static char *ora_cell_to_str(Arena *a, dpiConn *conn,
+                             dpiNativeTypeNum nt, dpiOracleTypeNum ot,
+                             dpiData *data) {
+    char buf[256];
+    switch (nt) {
+        case DPI_NATIVE_TYPE_INT64:
+            snprintf(buf, sizeof(buf), "%lld", (long long)data->value.asInt64);
+            return arena_strdup(a, buf);
+        case DPI_NATIVE_TYPE_UINT64:
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long)data->value.asUint64);
+            return arena_strdup(a, buf);
+        case DPI_NATIVE_TYPE_FLOAT:
+            snprintf(buf, sizeof(buf), "%.9g", (double)data->value.asFloat);
+            return arena_strdup(a, buf);
+        case DPI_NATIVE_TYPE_DOUBLE:
+            /* %.17g сохраняет round-trip double. NUMBER > 2^53 теряет точность —
+             * см. README (ограничение нативной читки NUMBER через double). */
+            snprintf(buf, sizeof(buf), "%.17g", data->value.asDouble);
+            return arena_strdup(a, buf);
+        case DPI_NATIVE_TYPE_BOOLEAN:
+            return arena_strdup(a, data->value.asBoolean ? "true" : "false");
+        case DPI_NATIVE_TYPE_TIMESTAMP:
+            fmt_ora_ts(&data->value.asTimestamp, buf, sizeof(buf));
+            return arena_strdup(a, buf);
+        case DPI_NATIVE_TYPE_BYTES: {
+            uint32_t len = data->value.asBytes.length;
+            char *s = arena_alloc(a, (size_t)len + 1);
+            memcpy(s, data->value.asBytes.ptr, len);
+            s[len] = '\0';
+            return s;
+        }
+        case DPI_NATIVE_TYPE_LOB: {
+            dpiLob *lob = data->value.asLOB;
+            uint64_t size = 0;
+            if (dpiLob_getSize(lob, &size) != DPI_SUCCESS) return arena_strdup(a, "");
+            int is_blob = (ot == DPI_ORACLE_TYPE_BLOB);
+            /* читаем порциями */
+            uint64_t cap = is_blob ? size * 2 + 1 : size + 1;   /* BLOB → hex: 2 симв/байт */
+            char *out = arena_alloc(a, (size_t)cap);
+            size_t off = 0;
+            uint64_t pos = 1;   /* ODPI-C: char/byte offset 1-based */
+            char chunk[ORA_LOB_CHUNK];
+            static const char hexd[] = "0123456789abcdef";
+            while (pos <= size) {
+                uint64_t want = ORA_LOB_CHUNK;
+                uint64_t got = want;
+                if (dpiLob_readBytes(lob, pos, want, chunk, &got) != DPI_SUCCESS) break;
+                if (got == 0) break;
+                if (is_blob) {
+                    for (uint64_t i = 0; i < got && off + 2 < cap; i++) {
+                        out[off++] = hexd[(unsigned char)chunk[i] >> 4];
+                        out[off++] = hexd[(unsigned char)chunk[i] & 0xF];
+                    }
+                } else {
+                    uint64_t n = got;
+                    if (off + n >= cap) n = cap - off - 1;
+                    memcpy(out + off, chunk, (size_t)n);
+                    off += n;
+                }
+                pos += got;
+            }
+            out[off] = '\0';
+            return out;
+        }
+        default:
+            (void)conn;
+            return arena_strdup(a, "");
+    }
+}
+
+/* ── list_entities(): таблицы и вьюхи схемы через ALL_TABLES/ALL_VIEWS ── */
+static int ora_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
+    OraCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) return -1;
+
+    const char *sql =
+        "SELECT table_name, 'table' AS etype FROM all_tables WHERE owner = :1 "
+        "UNION ALL "
+        "SELECT view_name,  'view'  AS etype FROM all_views  WHERE owner = :1 "
+        "ORDER BY 1";
+
+    dpiStmt *st;
+    uint32_t ncols;
+    if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
+        ora_log_err("list_entities prepare"); return -1;
+    }
+    dpiData bind; dpiData_setBytes(&bind, ctx->schema, (uint32_t)strlen(ctx->schema));
+    dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &bind);
+    if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols) != DPI_SUCCESS) {
+        ora_log_err("list_entities execute"); dpiStmt_release(st); return -1;
+    }
+
+    /* Соберём в динамический список (число строк заранее неизвестно). */
+    int cap = 64, n = 0;
+    DfoEntity *items = arena_alloc(a, (size_t)cap * sizeof(DfoEntity));
+    for (;;) {
+        int found = 0; uint32_t ri;
+        if (dpiStmt_fetch(st, &found, &ri) != DPI_SUCCESS || !found) break;
+        dpiNativeTypeNum nt; dpiData *d;
+        char *name = NULL; const char *etype = "table";
+        if (dpiStmt_getQueryValue(st, 1, &nt, &d) == DPI_SUCCESS && !d->isNull)
+            name = ora_cell_to_str(a, ctx->conn, nt, DPI_ORACLE_TYPE_VARCHAR, d);
+        if (dpiStmt_getQueryValue(st, 2, &nt, &d) == DPI_SUCCESS && !d->isNull) {
+            char *t = ora_cell_to_str(a, ctx->conn, nt, DPI_ORACLE_TYPE_VARCHAR, d);
+            etype = (t && !strcmp(t, "view")) ? "view" : "table";
+        }
+        if (!name) continue;
+        if (n == cap) {
+            int ncap = cap * 2;
+            DfoEntity *ni = arena_alloc(a, (size_t)ncap * sizeof(DfoEntity));
+            memcpy(ni, items, (size_t)n * sizeof(DfoEntity));
+            items = ni; cap = ncap;
+        }
+        items[n].entity = name;   /* Oracle identifier — оставляем UPPER */
+        items[n].type   = etype;
+        n++;
+    }
+    dpiStmt_release(st);
+    out->items = items;
+    out->count = n;
+    return 0;
+}
+
+/* ── describe(): схема через ALL_TAB_COLUMNS ── */
+static int ora_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
+    OraCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) return -1;
+
+    char ent[128];
+    strncpy(ent, entity ? entity : "", sizeof(ent)-1); ent[sizeof(ent)-1]='\0';
+    str_upper(ent);
+
+    const char *sql =
+        "SELECT column_name, data_type, nullable, data_precision, data_scale "
+        "FROM all_tab_columns WHERE owner = :1 AND table_name = :2 "
+        "ORDER BY column_id";
+
+    dpiStmt *st; uint32_t ncols;
+    if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
+        ora_log_err("describe prepare"); return -1;
+    }
+    dpiData b1, b2;
+    dpiData_setBytes(&b1, ctx->schema, (uint32_t)strlen(ctx->schema));
+    dpiData_setBytes(&b2, ent, (uint32_t)strlen(ent));
+    dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &b1);
+    dpiStmt_bindValueByPos(st, 2, DPI_NATIVE_TYPE_BYTES, &b2);
+    if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols) != DPI_SUCCESS) {
+        ora_log_err("describe execute"); dpiStmt_release(st); return -1;
+    }
+
+    int cap = 32, n = 0;
+    ColDef *cols = arena_alloc(a, (size_t)cap * sizeof(ColDef));
+    for (;;) {
+        int found = 0; uint32_t ri;
+        if (dpiStmt_fetch(st, &found, &ri) != DPI_SUCCESS || !found) break;
+        dpiNativeTypeNum nt; dpiData *d;
+        char *cname = NULL, *dtype = NULL, *nullable = NULL;
+        int prec = 0, scale = 0, has_prec = 0, has_scale = 0;
+        if (dpiStmt_getQueryValue(st, 1, &nt, &d) == DPI_SUCCESS && !d->isNull)
+            cname = ora_cell_to_str(a, ctx->conn, nt, DPI_ORACLE_TYPE_VARCHAR, d);
+        if (dpiStmt_getQueryValue(st, 2, &nt, &d) == DPI_SUCCESS && !d->isNull)
+            dtype = ora_cell_to_str(a, ctx->conn, nt, DPI_ORACLE_TYPE_VARCHAR, d);
+        if (dpiStmt_getQueryValue(st, 3, &nt, &d) == DPI_SUCCESS && !d->isNull)
+            nullable = ora_cell_to_str(a, ctx->conn, nt, DPI_ORACLE_TYPE_VARCHAR, d);
+        if (dpiStmt_getQueryValue(st, 4, &nt, &d) == DPI_SUCCESS && !d->isNull) {
+            has_prec = 1; prec = (int)d->value.asInt64;
+            if (nt == DPI_NATIVE_TYPE_DOUBLE) prec = (int)d->value.asDouble;
+        }
+        if (dpiStmt_getQueryValue(st, 5, &nt, &d) == DPI_SUCCESS && !d->isNull) {
+            has_scale = 1; scale = (int)d->value.asInt64;
+            if (nt == DPI_NATIVE_TYPE_DOUBLE) scale = (int)d->value.asDouble;
+        }
+        if (!cname) continue;
+        if (n == cap) {
+            int ncap = cap * 2;
+            ColDef *nc = arena_alloc(a, (size_t)ncap * sizeof(ColDef));
+            memcpy(nc, cols, (size_t)n * sizeof(ColDef));
+            cols = nc; cap = ncap;
+        }
+        str_lower(cname);   /* Oracle отдаёт UPPER — приводим к lower */
+        cols[n].name     = cname;
+        cols[n].type     = ora_map_type(dtype, prec, scale, has_prec, has_scale, ctx->ora_major);
+        cols[n].nullable = (nullable && nullable[0] == 'Y');
+        n++;
+    }
+    dpiStmt_release(st);
+
+    Schema *sc = arena_calloc(a, sizeof(Schema));
+    sc->ncols = n;
+    sc->cols  = cols;
+    *out = sc;
+    return 0;
+}
+
+/* ── read_batch(): один батч строк из Oracle ──
+ * Версионный SQL (11g ROWNUM-subquery / 12c+ OFFSET..FETCH), два режима
+ * (OFFSET-пагинация / инкрементальный по cursor_column). Все колонки → TEXT.
+ * 11g-пагинация добавляет служебную колонку DFO__RN — она отбрасывается. */
+static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
+                          const char *entity, ColBatch **out_batch) {
+    OraCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) return -1;
+
+    int64_t limit = (req && req->limit > 0) ? req->limit : (int64_t)ctx->batch_size;
+    if (limit > BATCH_SIZE) limit = BATCH_SIZE;
+
+    /* Источник: подзапрос (SELECT...) или "SCHEMA"."ENTITY". */
+    const char *raw = entity ? entity : "";
+    if (req && req->filter && req->filter[0]) raw = req->filter;
+    char ent[160];
+    int is_subquery = (strncasecmp(raw, "SELECT", 6) == 0);
+    char src[260];
+    if (is_subquery) {
+        snprintf(src, sizeof(src), "(%s)", raw);
+    } else {
+        strncpy(ent, raw, sizeof(ent)-1); ent[sizeof(ent)-1]='\0';
+        str_upper(ent);
+        snprintf(src, sizeof(src), "\"%s\".\"%s\"", ctx->schema, ent);
+    }
+
+    bool incremental = ctx->cursor_column[0] != '\0';
+    const char *cc = ctx->cursor_column;
+    const char *cursor = (req && req->cursor) ? req->cursor : "";
+    int has_cursor_val = incremental && cursor[0];
+    char sql[ORA_MAX_SQL];
+
+    if (incremental) {
+        if (ctx->ora_major >= 12) {
+            if (has_cursor_val)
+                snprintf(sql, sizeof(sql),
+                    "SELECT * FROM %s WHERE \"%s\" > :1 ORDER BY \"%s\" ASC "
+                    "FETCH NEXT %lld ROWS ONLY", src, cc, cc, (long long)limit);
+            else
+                snprintf(sql, sizeof(sql),
+                    "SELECT * FROM %s ORDER BY \"%s\" ASC "
+                    "FETCH NEXT %lld ROWS ONLY", src, cc, (long long)limit);
+        } else {
+            /* 11g: ROWNUM в WHERE применяется ДО ORDER BY → нужен subquery. */
+            if (has_cursor_val)
+                snprintf(sql, sizeof(sql),
+                    "SELECT * FROM (SELECT * FROM %s WHERE \"%s\" > :1 "
+                    "ORDER BY \"%s\" ASC) WHERE ROWNUM <= %lld",
+                    src, cc, cc, (long long)limit);
+            else
+                snprintf(sql, sizeof(sql),
+                    "SELECT * FROM (SELECT * FROM %s ORDER BY \"%s\" ASC) "
+                    "WHERE ROWNUM <= %lld", src, cc, (long long)limit);
+        }
+    } else {
+        int64_t offset = 0;
+        if (req && req->cursor && req->cursor[0])
+            offset = (int64_t)strtoll(req->cursor, NULL, 10);
+        if (ctx->ora_major >= 12) {
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM %s OFFSET %lld ROWS FETCH NEXT %lld ROWS ONLY",
+                src, (long long)offset, (long long)limit);
+        } else {
+            /* 11g: двойной subquery с ROWNUM. Внешняя колонка DFO__RN
+             * отбрасывается при сборке батча. */
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM (SELECT t.*, ROWNUM dfo__rn FROM %s t "
+                "WHERE ROWNUM <= %lld) WHERE dfo__rn > %lld",
+                src, (long long)(offset + limit), (long long)offset);
+        }
+    }
+
+    dpiStmt *st; uint32_t ncols_raw;
+    if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
+        ora_log_err("read_batch prepare"); return -1;
+    }
+    if (has_cursor_val) {
+        dpiData b; dpiData_setBytes(&b, (char *)cursor, (uint32_t)strlen(cursor));
+        dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &b);
+    }
+    if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols_raw) != DPI_SUCCESS) {
+        ora_log_err("read_batch execute"); dpiStmt_release(st); return -1;
+    }
+
+    /* Метаданные колонок. Отбрасываем служебную DFO__RN (11g offset). */
+    int ncols = (int)ncols_raw;
+    dpiOracleTypeNum *otype = arena_alloc(a, (size_t)ncols * sizeof(dpiOracleTypeNum));
+    Schema *sc = arena_calloc(a, sizeof(Schema));
+    sc->cols = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
+    int ncols_out = 0, cursor_out_idx = -1;
+    int *raw_to_out = arena_alloc(a, (size_t)ncols * sizeof(int));
+    for (int c = 0; c < ncols; c++) {
+        dpiQueryInfo qi;
+        if (dpiStmt_getQueryInfo(st, (uint32_t)(c+1), &qi) != DPI_SUCCESS) { raw_to_out[c] = -1; continue; }
+        char nm[160];
+        uint32_t nlen = qi.nameLength < sizeof(nm)-1 ? qi.nameLength : (uint32_t)sizeof(nm)-1;
+        memcpy(nm, qi.name, nlen); nm[nlen] = '\0';
+        if (!strcasecmp(nm, "DFO__RN")) { raw_to_out[c] = -1; continue; }   /* служебная */
+        otype[ncols_out] = qi.typeInfo.oracleTypeNum;
+        /* cursor bookmark column (сравнение без регистра) */
+        if (incremental && !strcasecmp(nm, cc)) cursor_out_idx = ncols_out;
+        str_lower(nm);
+        sc->cols[ncols_out].name     = arena_strdup(a, nm);
+        sc->cols[ncols_out].type     = COL_TEXT;   /* TEXT-форсинг, как в pg */
+        sc->cols[ncols_out].nullable = true;
+        raw_to_out[c] = ncols_out;
+        ncols_out++;
+    }
+    sc->ncols = ncols_out;
+
+    ColBatch *batch = arena_calloc(a, sizeof(ColBatch));
+    batch->schema = sc;
+    batch->ncols  = ncols_out;
+
+    /* Колонки фиксированного размера limit (реальное nrows ≤ limit). */
+    for (int c = 0; c < ncols_out; c++) {
+        batch->null_bitmap[c] = arena_calloc(a, ((size_t)limit + 7) / 8);
+        batch->values[c]      = arena_alloc(a, (size_t)limit * sizeof(char *));
+    }
+
+    int nrows = 0;
+    char *last_cursor_val = NULL;
+    while (nrows < (int)limit) {
+        int found = 0; uint32_t ri;
+        if (dpiStmt_fetch(st, &found, &ri) != DPI_SUCCESS || !found) break;
+        for (int c = 0; c < ncols; c++) {
+            int oc = raw_to_out[c];
+            if (oc < 0) continue;   /* DFO__RN или сбойная колонка */
+            dpiNativeTypeNum nt; dpiData *d;
+            if (dpiStmt_getQueryValue(st, (uint32_t)(c+1), &nt, &d) != DPI_SUCCESS || d->isNull) {
+                batch->null_bitmap[oc][nrows/8] |= (uint8_t)(1u << (nrows % 8));
+                ((char **)batch->values[oc])[nrows] = NULL;
+                continue;
+            }
+            char *s = ora_cell_to_str(a, ctx->conn, nt, otype[oc], d);
+            ((char **)batch->values[oc])[nrows] = s;
+            if (oc == cursor_out_idx) last_cursor_val = s;
+        }
+        nrows++;
+    }
+    batch->nrows = nrows;
+    dpiStmt_release(st);
+
+    /* Advance bookmark значением cursor_column последней строки. */
+    if (incremental && nrows > 0 && req && last_cursor_val)
+        req->cursor = arena_strdup(a, last_cursor_val);
+
+    *out_batch = batch;
+    return 0;
+}
+
+const DfoConnector dfo_connector_entry = {
+    .abi_version   = DFO_CONNECTOR_ABI_VERSION,
+    .name          = "oracle",
+    .version       = "0.1.0",
+    .description   = "Oracle Database connector via ODPI-C",
+    .create        = ora_create,
+    .destroy       = ora_destroy,
+    .list_entities = ora_list_entities,
+    .describe      = ora_describe,
+    .read_batch    = ora_read_batch,
+    /* CDC streaming — NULL. План (фаза 3) через Oracle LogMiner аналогичен
+     * kafka consumer_thread_fn (lib/connector/plugins/kafka/kafka_connector.c):
+     *   - cdc_start(handler, userdata): сохранить оба на OraCtx, atomic running
+     *     flag, pthread_create фонового потока. Поток через DBMS_LOGMNR
+     *     (ADD_LOGFILE/START_LOGMNR) или Continuous Mining читает V$LOGMNR_CONTENTS,
+     *     декодирует каждую DML-операцию в CdcEvent {op,before,after,lsn=SCN} и
+     *     вызывает handler(&ev, userdata).
+     *   - cdc_stop(): сбросить flag, pthread_join.
+     * До этого инкрементальный забор по cursor_column в ora_read_batch
+     * закрывает кейс «новые/изменённые строки с прошлого запуска». */
+    .cdc_start     = NULL,
+    .cdc_stop      = NULL,
+    .ping          = ora_ping,
+    /* Read-only source connector — no sink. */
+    .write_batch   = NULL,
+};

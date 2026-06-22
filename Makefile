@@ -33,7 +33,7 @@ STOR_SRCS = lib/storage/storage.c lib/storage/compress.c lib/storage/txn.c lib/i
 SQL_SRCS  = lib/sql_parser/sql.c
 QE_SRCS   = lib/qengine/qengine.c
 SCHED_SRCS= lib/scheduler/scheduler.c lib/scheduler/file_watcher.c
-YAML_SRCS = lib/yaml/yaml_loader.c
+YAML_SRCS = lib/yaml/yaml_loader.c lib/yaml/yaml_template.c
 PG_SRCS   = lib/pgwire/pgwire.c
 OBS_SRCS  = lib/observ/observ.c
 CONN_SRCS = lib/connector/connector.c
@@ -63,6 +63,8 @@ JSONHTTP_PLUGIN= $(LIBDIR)/json_http_connector.so
 S3_PLUGIN      = $(LIBDIR)/s3_connector.so
 KAFKA_PLUGIN   = $(LIBDIR)/kafka_connector.so
 AIRBYTE_PLUGIN = $(LIBDIR)/airbyte_connector.so
+GP_PLUGIN      = $(LIBDIR)/gp_connector.so
+ORACLE_PLUGIN  = $(LIBDIR)/oracle_connector.so
 
 # Detect librdkafka
 _RDKAFKA_LOCAL := $(shell test -d /usr/local/opt/librdkafka/include && echo /usr/local/opt/librdkafka)
@@ -92,17 +94,43 @@ else
   HAS_PQ    := $(if $(PGLDFLAGS),yes,no)
 endif
 
+# Detect ODPI-C (Oracle Database Programming Interface for C). Header is dpi.h;
+# library is libodpic. Compile-time needs only ODPI-C — Oracle Instant Client
+# is a RUNTIME dependency loaded by ODPI-C via dlopen.
+_ODPI_LOCAL := $(shell test -f /usr/local/include/dpi.h && echo /usr/local)
+_ODPI_BREW  := $(shell test -f /opt/homebrew/include/dpi.h && echo /opt/homebrew)
+_ODPI_SYS   := $(shell test -f /usr/include/dpi.h && echo /usr)
+ODPI_PREFIX := $(or $(_ODPI_LOCAL),$(_ODPI_BREW),$(_ODPI_SYS))
+ifneq ($(ODPI_PREFIX),)
+  ORACLECFLAGS  = -I$(ODPI_PREFIX)/include
+  ORACLELDFLAGS = -L$(ODPI_PREFIX)/lib -lodpic
+  HAS_ODPI      = yes
+else
+  ORACLECFLAGS  := $(shell pkg-config --cflags odpi 2>/dev/null)
+  ORACLELDFLAGS := $(shell pkg-config --libs odpi 2>/dev/null)
+  HAS_ODPI      := $(if $(ORACLELDFLAGS),yes,no)
+endif
+
 .PHONY: all clean run test dirs release debug \
-        test-integration test-sql test-all bench flight
+        test-integration test-sql test-all bench flight gp oracle
 
 # Base targets always built
 _ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN) $(AIRBYTE_PLUGIN)
 ifeq ($(HAS_PQ),yes)
-  _ALL_TARGETS += $(PG_PLUGIN)
+  _ALL_TARGETS += $(PG_PLUGIN) $(GP_PLUGIN)   # Greenplum reuses libpq
 endif
 ifeq ($(HAS_RDKAFKA),yes)
   _ALL_TARGETS += $(KAFKA_PLUGIN)
 endif
+ifeq ($(HAS_ODPI),yes)
+  _ALL_TARGETS += $(ORACLE_PLUGIN)
+endif
+
+# Convenience targets to build a single new connector explicitly:
+#   make gp       — Greenplum plugin (needs libpq)
+#   make oracle   — Oracle plugin    (needs ODPI-C; runtime Instant Client)
+gp:     dirs $(GP_PLUGIN)
+oracle: dirs $(ORACLE_PLUGIN)
 
 all: $(_ALL_TARGETS)
 
@@ -212,6 +240,26 @@ $(KAFKA_PLUGIN): lib/connector/plugins/kafka/kafka_connector.c \
                  $(OUTDIR)/lib/core/json.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) $(KAFKACFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(KAFKALDFLAGS) \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# Greenplum connector (reuses libpq — same transport as the pg plugin)
+$(GP_PLUGIN): lib/connector/plugins/greenplum/gp_connector.c \
+              $(OUTDIR)/lib/core/arena.o \
+              $(OUTDIR)/lib/storage/storage.o \
+              $(OUTDIR)/lib/core/log.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) $(PGCFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(PGLDFLAGS) \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# Oracle connector (requires ODPI-C at compile time; Oracle Instant Client at
+# runtime — ODPI-C dlopen()s it). Build explicitly with `make oracle` once
+# ODPI-C is installed (apt install libodpi-dev / dnf install odpi-c-devel).
+$(ORACLE_PLUGIN): lib/connector/plugins/oracle/oracle_connector.c \
+                  $(OUTDIR)/lib/core/arena.o \
+                  $(OUTDIR)/lib/storage/storage.o \
+                  $(OUTDIR)/lib/core/log.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) $(ORACLECFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(ORACLELDFLAGS) \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # Airbyte runner — universal connector that shells out to docker/podman

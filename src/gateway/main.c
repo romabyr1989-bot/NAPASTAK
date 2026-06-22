@@ -4,6 +4,7 @@
 #include "../../lib/core/json.h"
 #include "../../lib/net/tls.h"
 #include "../../lib/yaml/yaml_loader.h"
+#include "../../lib/yaml/yaml_template.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -451,9 +452,17 @@ void app_init(App *app, const char *config_json) {
                 fclose(f);
 
                 Arena *ya = arena_create(64 * 1024);
+                /* Expand {{ var }} placeholders + strip the vars: section so
+                 * the YAML parser never sees it. NULL keys → only the file's
+                 * own vars: block resolves. */
+                char *expanded = yaml_expand_vars(ya, src, (size_t)sz, NULL, NULL, 0);
+                if (!expanded) {
+                    LOG_WARN("pipelines_dir: %s template expansion failed", de->d_name);
+                    arena_destroy(ya); free(src); yaml_failed++; continue;
+                }
                 YamlError yerr = {0};
                 char *json = NULL;
-                if (yaml_to_json(src, (size_t)sz, ya, &json, &yerr) < 0) {
+                if (yaml_to_json(expanded, strlen(expanded), ya, &json, &yerr) < 0) {
                     LOG_WARN("pipelines_dir: %s parse error line %d: %s",
                              de->d_name, yerr.line, yerr.buf);
                     arena_destroy(ya); free(src); yaml_failed++; continue;
