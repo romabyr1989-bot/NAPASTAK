@@ -1546,6 +1546,16 @@ function makeStepCard(step, idx) {
                   placeholder="SELECT * FROM source_table WHERE ..."
                   oninput="pbUpdateStep(${idx},'transform_sql',this.value)">${escHtml(step.transform_sql || '')}</textarea>
       </div>
+      <div class="form-group" style="margin:.5rem 0 0">
+        <label>SQL-шаблон из файла <span class="label-hint">.sql под sql_templates_dir; перекрывает SQL выше (см. docs/SQL_TEMPLATES.md)</span></label>
+        <input type="text" value="${escAttr(step.sql_template || '')}" placeholder="merge_scd2.sql"
+               oninput="pbUpdateStep(${idx},'sql_template',this.value)">
+      </div>
+      <div class="form-group" style="margin:.4rem 0 0">
+        <label>Параметры шаблона (JSON) <span class="label-hint">{"name":"Bob"} → 'Bob'; число → как есть; имя_raw → идентификатор; {@now}/{@last_run}/{@step:&lt;id&gt;:&lt;col&gt;}</span></label>
+        <textarea class="mono-textarea" rows="2" placeholder='{"table_raw":"scores","min_score":50}'
+                  oninput="pbUpdateStep(${idx},'sql_params',this.value)">${escHtml(step.sql_params || '')}</textarea>
+      </div>
       <div style="display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap;align-items:center">
         <button class="btn btn-sm" onclick="event.stopPropagation();runStepPreview(${idx},{save:true})"
                 title="Запустить шаг и записать результат в target_table">💾 Сохранить в target_table</button>
@@ -1894,6 +1904,54 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="4" placeholder='{"start_date":"...", "api_token":"..."}'
                   oninput="pbUpdateAirbyteConfig(${idx}, this.value)">${escHtml(innerCfg)}</textarea>
       </div>`;
+  }
+
+  if (type === 'kafka') {
+    const fmt = cfg.data_format || 'json';
+    return `
+    <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+      📨 Kafka. Топик-источник + формат сообщений. Для Avro укажи Schema Registry
+      (см. docs/KAFKA_AVRO.md).</div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0;flex:2">
+        <label>Brokers</label>
+        <input type="text" value="${escAttr(cfg.brokers || '')}" placeholder="localhost:9092"
+               oninput="pbUpdateConnConfig(${idx},'brokers',this.value)">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Топик</label>
+        <input type="text" value="${escAttr(cfg.topic || '')}" placeholder="cdi_physical_party"
+               oninput="pbUpdateConnConfig(${idx},'topic',this.value)">
+      </div>
+    </div>
+    <div class="step-row-2" style="margin-top:.4rem">
+      <div class="form-group" style="margin:0">
+        <label>group_id</label>
+        <input type="text" value="${escAttr(cfg.group_id || '')}" placeholder="dfo_consumer"
+               oninput="pbUpdateConnConfig(${idx},'group_id',this.value)">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Формат сообщений</label>
+        <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <option value="json" ${fmt==='json'?'selected':''}>JSON</option>
+          <option value="csv"  ${fmt==='csv' ?'selected':''}>CSV</option>
+          <option value="avro" ${fmt==='avro'?'selected':''}>Avro (Schema Registry)</option>
+        </select>
+      </div>
+    </div>
+    ${fmt==='avro' ? `
+    <div class="step-row-2" style="margin-top:.4rem">
+      <div class="form-group" style="margin:0;flex:2">
+        <label>Schema Registry URL <span class="label-hint">обязательно для Avro</span></label>
+        <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="http://registry:8081"
+               oninput="pbUpdateConnConfig(${idx},'schema_registry_url',this.value)">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Registry auth <span class="label-hint">опц. user:pass</span></label>
+        <input type="text" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="user:pass"
+               oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
+      </div>
+    </div>` : ''}`;
   }
 
   /* fallback: raw JSON */
