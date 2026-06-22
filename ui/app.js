@@ -342,8 +342,8 @@ async function runStepPython(idx) {
   const panel = document.getElementById(`step-preview-${idx}`);
   if (!panel) return;
   panel.style.display = '';
-  if (!step?.python_code) {
-    panel.innerHTML = '<div style="padding:.6rem;color:var(--amber)">Python-код пустой</div>';
+  if (!step?.python_code && !step?.python_file) {
+    panel.innerHTML = '<div style="padding:.6rem;color:var(--amber)">Python-код / python_file пустые</div>';
     return;
   }
   panel.innerHTML = '<div style="padding:.6rem;color:var(--muted)">Выполняется Python…</div>';
@@ -357,7 +357,9 @@ async function runStepPython(idx) {
       connector_type:     '',
       connector_config:   '',
       transform_sql:      step.transform_sql || '',
-      python_code:        step.python_code,
+      python_code:        step.python_code || '',
+      python_file:        step.python_file || '',
+      python_context_dir: step.python_context_dir || '',
       python_timeout_sec: step.python_timeout_sec || 300,
       target_table:       '',
       max_retries:        0,
@@ -466,8 +468,9 @@ async function runStepPreview(idx, opts = {}) {
   };
 
   if (!step) { setStatus(`step #${idx} не найден в pb.steps (length=${pb.steps.length})`, 'var(--red)'); return; }
-  if (!step.transform_sql && !step.python_code && !step.scala_code && !step.connector_type && !step.scd2_business_key) {
-    setStatus('Шаг пустой — заполни SQL, Python, Scala, коннектор или SCD2', 'var(--amber)');
+  if (!step.transform_sql && !step.python_code && !step.python_file && !step.scala_code &&
+      !step.connector_type && !step.scd2_business_key && !step.match_rules) {
+    setStatus('Шаг пустой — заполни SQL, Python, Scala, коннектор, SCD2 или Match-rules', 'var(--amber)');
     return;
   }
   if (save && !step.target_table) {
@@ -1169,6 +1172,12 @@ const SCALA_STARTER =
   'import org.apache.spark.sql.functions._\n' +
   'df = df.withColumn("score", col("score").cast("int") * 2)\n' +
   'df = df.filter(col("score") > 50)';
+const MATCH_RULES_STARTER =
+  JSON.stringify([
+    { rule_name: '1.1 DUL→FIO', id_column: 'party_id',
+      scan_columns: ['dul_number'], test_columns: ['last_name', 'first_name'],
+      metric_function: 'word_similarity', operator: '>=', threshold: 0.80, normalize: 'name' }
+  ], null, 2);
 
 const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','s3','kafka','airbyte'];
 
@@ -1178,8 +1187,9 @@ const SINK_TYPES = ['csv','json_http','postgresql','s3','kafka'];
 function stepType(step) {
   if (step._ui_type) return step._ui_type;
   if (step.is_sink && step.connector_type) return 'sink:' + step.connector_type;
+  if (step.match_rules)       return 'matchrules';
   if (step.scd2_business_key) return 'scd2';
-  if (step.python_code)       return 'python';
+  if (step.python_code || step.python_file) return 'python';
   if (step.scala_code)        return 'scala';
   if (step.connector_type)    return step.connector_type;  /* the specific connector */
   return 'sql';
@@ -1200,7 +1210,11 @@ function pbChangeStepType(idx, type) {
   s.connector_type = '';
   s.connector_config = '';
   s.python_code = '';
+  s.python_file = '';
+  s.python_context_dir = '';
   s.scala_code = '';
+  s.match_rules = '';
+  s.match_input_table = '';
   s.is_sink = false;
   SCD2_FIELDS.forEach(k => delete s[k]);
   if (type.startsWith('sink:')) {
@@ -1222,6 +1236,8 @@ function pbChangeStepType(idx, type) {
     s.scd2_business_key       = s.scd2_business_key       || '';
     s.scd2_effective_from_col = s.scd2_effective_from_col || 'valid_from';
     s.scd2_effective_to_col   = s.scd2_effective_to_col   || 'valid_to';
+  } else if (type === 'matchrules') {
+    s.match_rules = s.match_rules || MATCH_RULES_STARTER;
   }
   renderBuilderSteps();
 }
@@ -1317,6 +1333,25 @@ function makeMatchFieldsHTML(step, idx) {
       </div>
       <button type="button" class="btn btn-sm btn-primary" style="margin-top:.5rem"
               onclick="event.stopPropagation();pbGenerateMatchSQL(${idx})">⚙ Сгенерировать SQL</button>
+    </div>`;
+}
+
+/* Match-rules: declarative entity-resolution engine (run_match_step). The
+ * candidate set comes from the SQL-трансформация field below; match_rules is a
+ * JSON array of rules. See docs/MATCH_RULES.md. */
+function makeMatchRulesFieldsHTML(step, idx) {
+  return `
+    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
+        🧬 Match-rules (движок). Кандидаты — из поля <strong>SQL-трансформация</strong> ниже;
+        результат (<code>id_a,id_b,rule_name,metric_value</code>) — в <strong>target_table</strong>.
+        Метрики: <code>word_similarity</code> · <code>jaro_winkler</code> · <code>levenshtein</code>.</div>
+      <div class="form-group" style="margin:0">
+        <label>Правила (JSON-массив) <span class="label-hint">scan_columns = точная группа; test_columns = similarity</span></label>
+        <textarea class="mono-textarea" rows="12"
+          oninput="pb.steps[${idx}].match_rules=this.value"
+          style="font-family:var(--mono);font-size:.74rem">${escHtml(step.match_rules || '')}</textarea>
+      </div>
     </div>`;
 }
 
@@ -1452,7 +1487,8 @@ function makeStepCard(step, idx) {
               <option value="python" ${t==='python'?'selected':''}>🐍 Python (pandas)</option>
               <option value="scala"  ${t==='scala' ?'selected':''}>⚡ Scala (Spark)</option>
               <option value="scd2"   ${t==='scd2'  ?'selected':''}>🕒 SCD2 (историзация)</option>
-              <option value="match"  ${t==='match' ?'selected':''}>🔗 Match (fuzzy)</option>
+              <option value="match"  ${t==='match' ?'selected':''}>🔗 Match (fuzzy SQL)</option>
+              <option value="matchrules" ${t==='matchrules'?'selected':''}>🧬 Match-rules (движок)</option>
             </optgroup>
             <optgroup label="Источники (коннекторы)">
               <option value="csv"        ${t==='csv'       ?'selected':''}>CSV файл</option>
@@ -1485,6 +1521,7 @@ function makeStepCard(step, idx) {
       ${t.startsWith('sink:') ? makeSinkFieldsHTML(step, idx) : ''}
       ${t === 'scd2'  ? makeScd2FieldsHTML(step, idx)  : ''}
       ${t === 'match' ? makeMatchFieldsHTML(step, idx) : ''}
+      ${t === 'matchrules' ? makeMatchRulesFieldsHTML(step, idx) : ''}
       <div class="step-row-2" style="margin-top:0.75rem">
         <div class="form-group" style="margin:0">
           <label>Max retries</label>
@@ -1523,32 +1560,41 @@ function makeConnectorConfigHTML(step, idx) {
   const type = step.connector_type;
   const cfg  = safeParse(step.connector_config, {});
 
-  /* Python step (no connector_type, but has python_code) */
-  if (!type && step.python_code) {
+  /* Python step (no connector_type, but has python_code or python_file) */
+  if (!type && (step.python_code || step.python_file)) {
     return `
       <div class="form-group" style="margin:0">
         <label style="display:flex;align-items:center;gap:.5rem">
           Python-код
-          <span class="label-hint">df = pandas DataFrame из transform_sql; результат — в target_table</span>
+          <span class="label-hint">df = pandas DataFrame из transform_sql; результат — в target_table${step.python_file ? '; игнорируется если задан python_file' : ''}</span>
           <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
                   onclick="event.stopPropagation();runStepPython(${idx})"
                   title="Выполнить только этот Python (без upstream-шагов)">▶ Python</button>
         </label>
         <textarea class="mono-textarea" rows="8"
           oninput="pb.steps[${idx}].python_code=this.value"
-          style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code)}</textarea>
+          style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code || '')}</textarea>
       </div>
       <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0;flex:2">
+          <label>python_file <span class="label-hint">путь .py на хосте gateway (≤512КБ; перекрывает код выше)</span></label>
+          <input type="text" value="${escAttr(step.python_file || '')}" placeholder="/opt/tsmdm/scripts/connector.py"
+                 oninput="pbUpdateStep(${idx},'python_file',this.value)">
+        </div>
         <div class="form-group" style="margin:0">
           <label>Timeout (сек)</label>
           <input type="number" min="1" max="3600"
                  value="${step.python_timeout_sec || 300}"
                  oninput="pb.steps[${idx}].python_timeout_sec=parseInt(this.value,10)||300">
         </div>
-        <div style="font-size:.7rem;color:var(--muted);align-self:end">
-          Требуется <code>python3</code> + <code>pandas</code> на сервере.
-          Один subprocess на запуск шага.
-        </div>
+      </div>
+      <div class="form-group" style="margin:.4rem 0 0">
+        <label>python_context_dir <span class="label-hint">опц.: общая папка для state между шагами → DFO_CONTEXT_DIR в subprocess</span></label>
+        <input type="text" value="${escAttr(step.python_context_dir || '')}" placeholder="/tmp/dfo_run_{{ pipeline_id }}"
+               oninput="pbUpdateStep(${idx},'python_context_dir',this.value)">
+      </div>
+      <div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">
+        Требуется <code>python3</code> + <code>pandas</code> на сервере. Один subprocess на запуск шага.
       </div>`;
   }
 

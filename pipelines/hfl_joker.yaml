@@ -1,0 +1,42 @@
+# hfl_joker — read the CDI Kafka topic, transform by XML mappings, write CDI.
+# Analog of tsmdm_hfl_cdi/naive.py + joker_lekton2cdi.py.
+#
+# The Kafka connector reads JSON messages into a buffer table; the XML-mapping
+# transform runs as a python_file step (tools/cdi/joker_transform.py).
+# DFO note: FLAT namespace → `cdi_` table-name prefix.
+
+name: hfl_joker
+enabled: true
+
+vars:
+  kafka_brokers: "kafka.prod.internal:9092"
+  cdi_topic: "cdi.physical_party"
+  cdi_prefix: cdi
+  mappings_file: "/opt/tsmdm/data/joker/equalized_ruleset.xml"
+  renamings_file: "/opt/tsmdm/data/joker/cdi2sbl_renamings.xml"
+
+triggers:
+  - type: cron
+    cron_expr: "*/15 * * * *"   # every 15 minutes
+
+steps:
+
+  # 1. Read the CDI Kafka topic (JSON) into a buffer table.
+  - id: read_kafka
+    connector_type: kafka
+    connector_config:
+      brokers: "{{ kafka_brokers }}"
+      topic: "{{ cdi_topic }}"
+      group_id: "dfo_hfl_joker"
+      data_format: "json"
+      batch_size: "1000"
+    target_table: "{{ cdi_prefix }}_joker_incoming_buf"
+
+  # 2. Transform messages by the XML mappings → physical_party.
+  - id: transform_joker
+    transform_sql: "SELECT * FROM {{ cdi_prefix }}_joker_incoming_buf"
+    python_file: "/opt/tsmdm/scripts/cdi/joker_transform.py"
+    python_context_dir: "/tmp/dfo_joker_{{ pipeline_id }}"
+    python_timeout_sec: 300
+    target_table: "{{ cdi_prefix }}_physical_party"
+    deps: [0]

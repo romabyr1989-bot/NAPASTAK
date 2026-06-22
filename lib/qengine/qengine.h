@@ -80,3 +80,11 @@ typedef struct {
 
 Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a);
 bool   eval_bool(Expr *e, EvalCtx *ctx, Arena *a);   /* for predicates */
+
+/* ── Fuzzy-match / normalisation scalars (also exposed as SQL functions) ──
+ * Shared with the gateway's match-rule engine (run_match_step). */
+int         qe_levenshtein    (const char *x, const char *y, Arena *a);   /* edit distance */
+double      qe_jaro_winkler   (const char *s1, const char *s2, Arena *a); /* [0,1] */
+double      qe_word_similarity(const char *query, const char *doc, Arena *a); /* trigram overlap [0,1] */
+const char *qe_normalize_inn  (const char *s, Arena *a);   /* digits only */
+const char *qe_normalize_name (const char *s, Arena *a);   /* lower+trim+collapse spaces */

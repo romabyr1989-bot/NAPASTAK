@@ -5,6 +5,7 @@
 #include "../../lib/core/json.h"
 #include "../../lib/core/log.h"
 #include "../../lib/sql_parser/sql.h"
+#include "../../lib/qengine/qengine.h"   /* qe_word_similarity / qe_normalize_* (also SQL fns) */
 #include "../../lib/yaml/yaml_loader.h"
 #include "../../lib/yaml/yaml_template.h"
 #include "../../lib/pgwire/pgwire.h"
@@ -531,6 +532,14 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
             for(char*p=out;*p;p++) if(*p>='A'&&*p<='Z') *p+=32;
             return vstr_s(out);
         }
+        if (!strcasecmp(fn,"normalize_inn")) {
+            if (a0.is_null) return vnull();
+            return vstr_s((char *)qe_normalize_inn(s0, a));
+        }
+        if (!strcasecmp(fn,"normalize_name")) {
+            if (a0.is_null) return vnull();
+            return vstr_s((char *)qe_normalize_name(s0, a));
+        }
         if (!strcasecmp(fn,"length") || !strcasecmp(fn,"len") || !strcasecmp(fn,"char_length")) {
             if (a0.is_null) return vnull(); return vnum((double)strlen(s0));
         }
@@ -661,6 +670,10 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
             if (!strcasecmp(fn,"jaro_winkler")) {
                 if (a0.is_null||a1.is_null) return vnull();
                 return vnum(api_jaro_winkler(s0, s1, a));
+            }
+            if (!strcasecmp(fn,"word_similarity")) {
+                if (a0.is_null||a1.is_null) return vnull();
+                return vnum(qe_word_similarity(s0, s1, a));
             }
 
             if (nargs >= 3) {
@@ -2665,6 +2678,128 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     /* arena 'a' kept alive: body lives in it until response is sent */
 }
 
+/* Replace :name tokens in `sql` with escaped literal values from the `params`
+ * JSON object. `::` (Postgres cast) is passed through untouched. String values
+ * become single-quoted literals with internal quotes doubled; JSON numbers are
+ * substituted bare; JSON null → the SQL NULL literal. Returns NULL on an
+ * unknown :param (so the caller can 400). */
+static char *named_params_expand(Arena *a, const char *sql, JVal *params) {
+    size_t cap = strlen(sql) * 2 + 256;
+    char *out = arena_alloc(a, cap);
+    size_t off = 0;
+    #define NP_RESERVE(n) do { \
+        while (off + (n) + 1 >= cap) { \
+            cap *= 2; char *nb = arena_alloc(a, cap); memcpy(nb, out, off); out = nb; } \
+    } while (0)
+
+    for (const char *p = sql; *p; ) {
+        /* Not a placeholder, or a "::" cast → copy verbatim. */
+        if (*p != ':' || *(p+1) == ':') {
+            NP_RESERVE(2);
+            out[off++] = *p++;
+            if (*(p-1) == ':' && *p == ':') out[off++] = *p++;  /* copy the 2nd ':' too */
+            continue;
+        }
+        /* ':' followed by an identifier → a named parameter. */
+        p++;  /* skip ':' */
+        char name[128]; size_t nlen = 0;
+        while (*p && nlen < sizeof(name)-1 &&
+               ((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'))
+            name[nlen++] = *p++;
+        name[nlen] = '\0';
+        if (nlen == 0) { NP_RESERVE(1); out[off++] = ':'; continue; }  /* lone ':' */
+
+        JVal *val = params ? json_get(params, name) : NULL;
+        if (!val) { LOG_WARN("named_params: unknown param ':%s'", name); return NULL; }
+
+        if (val->type == JV_NULL) {
+            NP_RESERVE(4); memcpy(out+off, "NULL", 4); off += 4;
+        } else if (val->type == JV_NUMBER) {
+            char num[64]; double d = json_dbl(val, 0);
+            if (d == (double)(long long)d) snprintf(num, sizeof(num), "%lld", (long long)d);
+            else                           snprintf(num, sizeof(num), "%.10g", d);
+            size_t nl = strlen(num); NP_RESERVE(nl); memcpy(out+off, num, nl); off += nl;
+        } else if (val->type == JV_BOOL) {
+            const char *b = val->b ? "true" : "false"; size_t bl = strlen(b);
+            NP_RESERVE(bl); memcpy(out+off, b, bl); off += bl;
+        } else {
+            /* String literal: wrap in quotes, double internal single-quotes. */
+            const char *sv = json_str(val, "");
+            NP_RESERVE(2); out[off++] = '\'';
+            for (const char *s = sv; *s; s++) {
+                NP_RESERVE(2);
+                if (*s == '\'') out[off++] = '\'';
+                out[off++] = *s;
+            }
+            NP_RESERVE(1); out[off++] = '\'';
+        }
+    }
+    out[off] = '\0';
+    #undef NP_RESERVE
+    return out;
+}
+
+/* ── POST /api/query/named ──
+ * Body: {"sql": "SELECT ... WHERE col = :name", "params": {"name": "value", ...}}
+ * Substitutes :name placeholders with escaped literal values, then executes
+ * through the same sql_parse + exec_stmt path as /api/tables/query. SELECT-only.
+ * Escaping is defensive (quotes doubled) but NOT a bind-parameter protocol —
+ * RBAC (check_select_access) still applies, same as h_query. */
+static void h_query_named(HttpReq *req, HttpResp *resp) {
+    if (!req->body || req->body_len == 0) { http_resp_error(resp,400,"empty body"); return; }
+    Arena *a = req->arena;
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root) { http_resp_error(resp,400,"invalid JSON"); return; }
+
+    const char *sql_tmpl = json_str(json_get(root,"sql"),"");
+    if (!sql_tmpl[0]) { http_resp_error(resp,400,"sql is required"); return; }
+
+    JVal *params = json_get(root,"params");
+    char *sql = named_params_expand(a, sql_tmpl, params);
+    if (!sql) { http_resp_error(resp,400,"unknown named parameter in sql"); return; }
+
+    Stmt *stmt = sql_parse(a, sql, strlen(sql));
+    if (!stmt || stmt->error) {
+        http_resp_error(resp, 400, arena_sprintf(a, "sql error: %s", stmt && stmt->error ? stmt->error : "null"));
+        return;
+    }
+    if (stmt->type != STMT_SELECT) { http_resp_error(resp, 400, "only SELECT is allowed"); return; }
+
+    /* RBAC — identical to h_query's SELECT path. */
+    if (g_app.rbac_enabled && g_app.rbac) {
+        if (!check_select_access(req, resp, &stmt->select)) return;
+    }
+
+    /* Apply the same request-level limit cap as h_query. */
+    int64_t cap = 10000;
+    if (stmt->select.limit < 0 || stmt->select.limit > cap) stmt->select.limit = cap;
+
+    g_txn_current = req->txn_id;
+    RS *rs = exec_stmt(a, stmt, NULL);
+    g_txn_current = 0;
+
+    JBuf jb; jb_init(&jb, a, 65536);
+    jb_obj_begin(&jb);
+    jb_key(&jb,"columns"); jb_arr_begin(&jb);
+    if (rs) for(int i=0;i<rs->ncols;i++) jb_str(&jb, rs->col_names[i]?rs->col_names[i]:"");
+    jb_arr_end(&jb);
+    jb_key(&jb,"rows"); jb_arr_begin(&jb);
+    if (rs) {
+        for(int r=0;r<rs->nrows;r++){
+            jb_arr_begin(&jb);
+            for(int c=0;c<rs->ncols;c++){
+                const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:"";
+                jb_str(&jb, v?v:"");
+            }
+            jb_arr_end(&jb);
+        }
+    }
+    jb_arr_end(&jb);
+    jb_key(&jb,"row_count"); jb_int(&jb, rs?rs->nrows:0);
+    jb_obj_end(&jb);
+    http_resp_json(resp, 200, jb_done(&jb));
+}
+
 /* ── Step 3 Week 2/3: bridge SQL execution to the PostgreSQL wire-protocol ──
  *
  * Reuses sql_parse + exec_stmt — the same path the JSON /api/tables/query
@@ -3970,7 +4105,8 @@ static int run_csv_subprocess(Arena *a, char *const argv[],
                               const char *input_csv, size_t input_len,
                               int timeout_sec, const char *label,
                               char **out_buf_p, size_t *out_len_p,
-                              char *errbuf, size_t errsz) {
+                              char *errbuf, size_t errsz,
+                              char *const envextra[]) {
     int in_pipe[2], out_pipe[2], err_pipe[2];
     if (pipe(in_pipe) || pipe(out_pipe) || pipe(err_pipe)) {
         snprintf(errbuf, errsz, "%s: pipe() failed", label);
@@ -3989,6 +4125,10 @@ static int run_csv_subprocess(Arena *a, char *const argv[],
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
+        /* Extra env vars ("KEY=VALUE", NULL-terminated) — added to the inherited
+         * environment before exec. Strings are arena-allocated and live until the
+         * exec replaces the image, which is when putenv's pointers are read. */
+        for (int i = 0; envextra && envextra[i]; i++) putenv(envextra[i]);
         execvp(argv[0], argv);
         _exit(127);
     }
@@ -4146,7 +4286,39 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
     if (script_step_input_csv(a, st, label, &input_csv, &input_len, errbuf, errsz) < 0)
         return -1;
 
-    const char *user_code = st->python_code;
+    /* Source of the user code: a .py file on disk (no size limit beyond 512 KB)
+     * or the inline python_code field (≤ 8 KB). python_file wins when both set. */
+    const char *user_code = NULL;
+    if (st->python_file[0]) {
+        FILE *f = fopen(st->python_file, "r");
+        if (!f) {
+            snprintf(errbuf, errsz, "python step %s: cannot open python_file '%s': %s",
+                     st->id, st->python_file, strerror(errno));
+            return -1;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsz = ftell(f);
+        rewind(f);
+        if (fsz < 0 || fsz > 524288) {   /* 512 KB hard limit */
+            fclose(f);
+            snprintf(errbuf, errsz, "python step %s: python_file too large (%ld bytes, max 524288)",
+                     st->id, fsz);
+            return -1;
+        }
+        char *file_buf = arena_alloc(a, (size_t)fsz + 1);
+        size_t nread = fread(file_buf, 1, (size_t)fsz, f);
+        fclose(f);
+        file_buf[nread] = '\0';
+        user_code = file_buf;
+        LOG_INFO("python step '%s': loaded %zu bytes from %s", st->id, nread, st->python_file);
+    } else {
+        user_code = st->python_code;
+        if (!user_code[0]) {
+            snprintf(errbuf, errsz, "python step %s: neither python_code nor python_file set", st->id);
+            return -1;
+        }
+    }
+
     size_t wrap_cap = strlen(user_code) + 1024;
     char *wrapper = arena_alloc(a, wrap_cap);
     snprintf(wrapper, wrap_cap,
@@ -4165,11 +4337,27 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
         "df.to_csv(sys.stdout, index=False)\n",
         user_code);
 
+    /* Optional shared context directory for stateful multi-step pipelines:
+     * mkdirp it and expose DFO_CONTEXT_DIR + DFO_STEP_ID to the subprocess. */
+    char *envextra[3]; int nenv = 0;
+    if (st->python_context_dir[0]) {
+        char tmp[512];
+        strncpy(tmp, st->python_context_dir, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+        for (char *p = tmp + 1; *p; p++) {
+            if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+        }
+        mkdir(st->python_context_dir, 0755);   /* ignore EEXIST */
+        envextra[nenv++] = arena_sprintf(a, "DFO_CONTEXT_DIR=%s", st->python_context_dir);
+    }
+    envextra[nenv++] = arena_sprintf(a, "DFO_STEP_ID=%s", st->id);
+    envextra[nenv] = NULL;
+
     char *argv[] = { (char *)"python3", (char *)"-c", wrapper, NULL };
     int timeout = st->python_timeout_sec > 0 ? st->python_timeout_sec : 300;
     char *out_buf; size_t out_len;
     if (run_csv_subprocess(a, argv, input_csv, input_len, timeout, label,
-                           &out_buf, &out_len, errbuf, errsz) < 0)
+                           &out_buf, &out_len, errbuf, errsz, envextra) < 0)
         return -1;
 
     return script_step_ingest_output(app, a, st, label, out_buf, out_len, errbuf, errsz);
@@ -4310,7 +4498,7 @@ static int run_scala_step(App *app, Arena *a, PipelineStep *st,
     int timeout = st->scala_timeout_sec > 0 ? st->scala_timeout_sec : 600;
     char *out_buf; size_t out_len;
     int rc = run_csv_subprocess(a, argv, input_csv, input_len, timeout, label,
-                                &out_buf, &out_len, errbuf, errsz);
+                                &out_buf, &out_len, errbuf, errsz, NULL);
     rmrf_path(tmpdir);
     if (rc < 0) return -1;
 
@@ -4683,6 +4871,160 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     return n_new;
 }
 
+/* ── Match step — declarative rule-chain entity resolution ──────────────
+ *
+ * Runs a sequence of match rules against the candidate set from transform_sql.
+ * Each rule: group candidates by an exact-match scan key, then within each group
+ * score every unordered pair with metric_function(test_key_a, test_key_b) and
+ * keep the pairs passing `metric operator threshold`. Output rows:
+ *   [id_a, id_b, rule_name, metric_value]   → written to target_table.
+ * Rules don't deduplicate across each other (a pair matching two rules appears
+ * twice with different rule_name). See docs/MATCH_RULES.md for the JSON format. */
+static int run_match_step(App *app, Arena *a, PipelineStep *st,
+                          char *errbuf, size_t errsz) {
+    if (!st->transform_sql[0]) {
+        snprintf(errbuf, errsz, "match step %s: transform_sql (candidate set) is required", st->id);
+        return -1;
+    }
+    if (!st->match_rules[0]) {
+        snprintf(errbuf, errsz, "match step %s: match_rules is required", st->id);
+        return -1;
+    }
+    if (!st->target_table[0]) {
+        snprintf(errbuf, errsz, "match step %s: target_table is required", st->id);
+        return -1;
+    }
+
+    /* 1. Materialise the candidate set. */
+    Stmt *sstmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+    if (!sstmt || sstmt->error) {
+        snprintf(errbuf, errsz, "match step %s: SQL parse error: %s",
+                 st->id, sstmt && sstmt->error ? sstmt->error : "null");
+        return -1;
+    }
+    RS *cand = exec_stmt(a, sstmt, NULL);
+    if (!cand) { snprintf(errbuf, errsz, "match step %s: SQL exec failed", st->id); return -1; }
+
+    /* Output RS — always created (empty candidate set → empty result table). */
+    const char *out_cols[] = {"id_a", "id_b", "rule_name", "metric_value"};
+    RS *out = rs_new(a, 4, (char **)out_cols, 0);
+
+    if (cand->nrows == 0) {
+        LOG_INFO("match step '%s': empty candidate set", st->id);
+        write_rs_to_table(app, a, st->target_table, out);
+        return 0;
+    }
+
+    /* 2. Parse the rules array. */
+    JVal *rules = json_parse(a, st->match_rules, strlen(st->match_rules));
+    if (!rules || rules->type != JV_ARRAY) {
+        snprintf(errbuf, errsz, "match step %s: match_rules must be a JSON array", st->id);
+        return -1;
+    }
+
+    /* 3. Execute each rule. */
+    for (int ri = 0; ri < (int)rules->nitems; ri++) {
+        JVal *rule = rules->items[ri];
+        const char *rule_name = json_str(json_get(rule, "rule_name"), "");
+        const char *id_col    = json_str(json_get(rule, "id_column"), "");
+        const char *metric_fn = json_str(json_get(rule, "metric_function"), "word_similarity");
+        const char *op_str    = json_str(json_get(rule, "operator"), ">=");
+        double      threshold = json_dbl(json_get(rule, "threshold"), 0.8);
+        const char *normalize = json_str(json_get(rule, "normalize"), "none");
+        JVal *scan_arr = json_get(rule, "scan_columns");
+        JVal *test_arr = json_get(rule, "test_columns");
+
+        if (!scan_arr || scan_arr->type != JV_ARRAY ||
+            !test_arr || test_arr->type != JV_ARRAY || !id_col[0]) {
+            LOG_WARN("match step '%s': rule %d missing required fields, skipping", st->id, ri);
+            continue;
+        }
+        int id_idx = scd2_rs_col_index(cand, id_col);
+        if (id_idx < 0) {
+            snprintf(errbuf, errsz, "match step %s rule %d: id_column '%s' not found",
+                     st->id, ri, id_col);
+            return -1;
+        }
+
+        /* Pre-resolve scan/test column indices. */
+        int nscan = (int)scan_arr->nitems, ntest = (int)test_arr->nitems;
+        int scan_idx[32], test_idx[32];
+        if (nscan > 32) nscan = 32;
+        if (ntest > 32) ntest = 32;
+        for (int k = 0; k < nscan; k++)
+            scan_idx[k] = scd2_rs_col_index(cand, json_str(scan_arr->items[k], ""));
+        for (int k = 0; k < ntest; k++)
+            test_idx[k] = scd2_rs_col_index(cand, json_str(test_arr->items[k], ""));
+
+        int use_name = !strcasecmp(normalize, "name");
+        int use_inn  = !strcasecmp(normalize, "inn");
+
+        /* Build the scan key + normalised test string for every row once. */
+        char **scan_key = arena_alloc(a, (size_t)cand->nrows * sizeof(char *));
+        char **test_str = arena_alloc(a, (size_t)cand->nrows * sizeof(char *));
+        for (int r = 0; r < cand->nrows; r++) {
+            char sbuf[1024] = {0}, tbuf[1024] = {0};
+            for (int k = 0; k < nscan; k++) {
+                const char *v = (scan_idx[k] >= 0 && cand->rows[r].cells[scan_idx[k]])
+                                ? cand->rows[r].cells[scan_idx[k]] : "";
+                if (k) strncat(sbuf, "\x1f", sizeof(sbuf) - strlen(sbuf) - 1);
+                strncat(sbuf, v, sizeof(sbuf) - strlen(sbuf) - 1);
+            }
+            for (int k = 0; k < ntest; k++) {
+                const char *v = (test_idx[k] >= 0 && cand->rows[r].cells[test_idx[k]])
+                                ? cand->rows[r].cells[test_idx[k]] : "";
+                if (use_name)      v = qe_normalize_name(v, a);
+                else if (use_inn)  v = qe_normalize_inn(v, a);
+                if (k) strncat(tbuf, " ", sizeof(tbuf) - strlen(tbuf) - 1);
+                strncat(tbuf, v, sizeof(tbuf) - strlen(tbuf) - 1);
+            }
+            scan_key[r] = arena_strdup(a, sbuf);
+            test_str[r] = arena_strdup(a, tbuf);
+        }
+
+        int n_matched = 0;
+        for (int i = 0; i < cand->nrows; i++) {
+            if (!scan_key[i][0]) continue;   /* skip empty scan keys */
+            for (int j = i + 1; j < cand->nrows; j++) {
+                if (strcmp(scan_key[i], scan_key[j]) != 0) continue;   /* exact group match */
+
+                double metric;
+                if (!strcasecmp(metric_fn, "jaro_winkler"))
+                    metric = qe_jaro_winkler(test_str[i], test_str[j], a);
+                else if (!strcasecmp(metric_fn, "levenshtein"))
+                    metric = (double)qe_levenshtein(test_str[i], test_str[j], a);
+                else
+                    metric = qe_word_similarity(test_str[i], test_str[j], a);
+
+                bool pass = false;
+                if      (!strcmp(op_str, ">=")) pass = metric >= threshold;
+                else if (!strcmp(op_str, "<=")) pass = metric <= threshold;
+                else if (!strcmp(op_str, ">"))  pass = metric >  threshold;
+                else if (!strcmp(op_str, "<"))  pass = metric <  threshold;
+
+                if (pass) {
+                    const char *id_i = cand->rows[i].cells[id_idx];
+                    const char *id_j = cand->rows[j].cells[id_idx];
+                    char mbuf[32];
+                    snprintf(mbuf, sizeof(mbuf), "%.6f", metric);
+                    char **cells = arena_alloc(a, 4 * sizeof(char *));
+                    cells[0] = arena_strdup(a, id_i ? id_i : "");
+                    cells[1] = arena_strdup(a, id_j ? id_j : "");
+                    cells[2] = arena_strdup(a, rule_name);
+                    cells[3] = arena_strdup(a, mbuf);
+                    rs_add(out, a, cells, NULL);
+                    n_matched++;
+                }
+            }
+        }
+        LOG_INFO("match step '%s' rule '%s': %d pair(s) matched", st->id, rule_name, n_matched);
+    }
+
+    write_rs_to_table(app, a, st->target_table, out);
+    LOG_INFO("match step '%s' → %s: %d total matched pairs", st->id, st->target_table, out->nrows);
+    return out->nrows;
+}
+
 /* ── Execute all steps of a pipeline ── */
 /* Internal: execute pipeline steps with optional run-logging/broadcast.
  * `report=false` is used by the preview-step endpoint so transient one-shot
@@ -4715,8 +5057,9 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     total_rows += n;
                     st->status = STEP_SUCCESS;
                 }
-            } else if (st->python_code[0]) {
+            } else if (st->python_code[0] || st->python_file[0]) {
                 /* Python step takes precedence over connector / transform_sql.
+                 * Code source is python_file (disk) or python_code (inline).
                  * If transform_sql is set, it provides input data; otherwise
                  * the user's script starts with an empty DataFrame. */
                 int n = run_python_step(app, a, st, p->error_msg, sizeof(p->error_msg));
@@ -4739,6 +5082,17 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                 }
             } else if (st->connector_type[0]) {
                 int n = run_connector_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                if (n < 0) {
+                    st->status = STEP_FAILED;
+                } else {
+                    total_rows += n;
+                    st->status = STEP_SUCCESS;
+                }
+            } else if (st->match_rules[0]) {
+                /* Match step (declarative entity resolution) — uses transform_sql
+                 * as the candidate set, so it must be caught before the generic
+                 * transform_sql branch. */
+                int n = run_match_step(app, a, st, p->error_msg, sizeof(p->error_msg));
                 if (n < 0) {
                     st->status = STEP_FAILED;
                 } else {
@@ -5607,6 +5961,7 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",  "/health",                  h_health);
     router_add(r,"GET",  "/api/tables",              h_tables_list);
     router_add(r,"POST", "/api/tables/query",        h_query);
+    router_add(r,"POST", "/api/query/named",         h_query_named);
     router_add(r,"GET",  "/api/tables/:name/schema",      h_table_schema);
     router_add(r,"GET",  "/api/tables/:name/compression", h_table_compression);
     router_add(r,"DELETE","/api/tables/:name",       h_table_delete);

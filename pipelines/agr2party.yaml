@@ -1,0 +1,43 @@
+# agr2party — link consents to master clients.
+# Analog of tsmdm_agr2party/agreement_connector.py. ~60–100K agreements/hour.
+#
+# DFO adaptations:
+#   • FLAT namespace → underscore table names.
+#   • Owner attributes are fetched by the transform_sql JOIN (cdi_physical_party),
+#     NOT by a callback from the python_file — a python_file step cannot call the
+#     DFO API while the gateway is blocked running it (it dead-locks). The
+#     connector then only calls the EXTERNAL CDI proxy (MASTER_API_URL) for the
+#     master id; an unreachable proxy yields crm_id='UNDEFINED'.
+#   • The delta is a full scan (DFO MAX() over an empty table can't seed a
+#     watermark); the connector dedups by agreement_id and rewrites the target.
+#   • resync.py / rescore.py issue DFO UPDATEs, so they run as STANDALONE tools
+#     (cron / CLI) when the gateway is NOT busy — not as in-pipeline steps.
+
+name: agr2party
+enabled: true
+
+vars:
+  master_api_url: "http://cdi-service:8444"
+  master_batch_size: "64"
+  check_recheckable: "true"
+
+triggers:
+  - type: cron
+    cron_expr: "*/30 * * * *"   # every 30 minutes
+
+steps:
+  # Process the agreement delta (with owner attrs via JOIN) → agreement2party.
+  - id: process_delta
+    transform_sql: |
+      SELECT
+        a.agreement_id, a.abs_cd, a.owner_id, a.agreement_type_cd,
+        a.created_ts, a.expired_ts, a.last_upd_ts, a.deleted_ts,
+        a.scopes_ls, a.agreement_file_link,
+        c.party_id, c.last_name, c.first_name, c.middle_name, c.birth_date, c.inn
+      FROM consents_agreements a
+      LEFT JOIN cdi_physical_party c ON c.owner_id = a.owner_id
+      WHERE a.deleted_ts IS NULL OR a.deleted_ts = ''
+    python_file: "/opt/tsmdm/scripts/agr2party/connector.py"
+    python_context_dir: "/tmp/dfo_agr2party"
+    python_timeout_sec: 3600
+    target_table: "agreements_agreement2party"

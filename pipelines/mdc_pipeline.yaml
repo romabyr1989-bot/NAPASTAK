@@ -1,0 +1,142 @@
+# mdc_pipeline — full MDC cycle: load → clean → upload → rescore → match → accept → merge.
+# Analog of tsmdm_as_mdm/minimal.py MDC.__call__().
+#
+# DFO adaptations:
+#   • FLAT namespace → underscore table names.
+#   • DUL aggregation is a python_file step (SQL LEFT JOIN → pandas '~'.join):
+#     DFO's GROUP_CONCAT returns empty.
+#   • MERGE uses a correlated NOT EXISTS ("latest per master_id"), NOT
+#     ROW_NUMBER()/MAX() (both unreliable on the DFO window/aggregate engine).
+#   • ACCEPT writes master_id back via DFO UPDATE (side effect) and emits an
+#     empty frame into a throwaway table.
+#   • Scripts that call back into DFO inherit DFO_REST_URL/DFO_TOKEN from the
+#     gateway environment.
+
+name: mdc_pipeline
+enabled: true
+
+triggers:
+  - type: cron
+    cron_expr: "0 5 * * *"   # after master_assembly (04:00) and agr2party (*/30)
+
+steps:
+
+  # ═══ LOAD + CLEAN + UPLOAD: person ═══
+  - id: load_clean_person
+    transform_sql: |
+      SELECT source_id, system_name, last_upd,
+             src_last_name, src_first_name, src_middle_name, src_fullname,
+             src_inn, birth_date
+      FROM cdi_physical_party
+      WHERE source_id IS NOT NULL AND source_id != ''
+    python_file: "/opt/tsmdm/scripts/mdc/clean_person.py"
+    python_context_dir: "/tmp/dfo_mdc"
+    python_timeout_sec: 600
+    target_table: "mdc_person_clean"
+
+  # ═══ LOAD + CLEAN + UPLOAD: id_doc ═══
+  - id: load_clean_id_doc
+    transform_sql: |
+      SELECT source_id, person_source_id, category, src_number
+      FROM cdi_id_doc WHERE source_id IS NOT NULL AND source_id != ''
+    python_file: "/opt/tsmdm/scripts/mdc/clean_id_doc.py"
+    python_context_dir: "/tmp/dfo_mdc"
+    python_timeout_sec: 300
+    target_table: "mdc_id_doc_clean"
+    deps: [0]
+
+  # ═══ RESCORE: aggregate DULs onto each person (LEFT JOIN → python_file) ═══
+  - id: aggregate_dul_to_person
+    transform_sql: |
+      SELECT p.source_id, p.system_name, p.last_upd, p.master_id,
+             p.cio_last_name, p.cio_first_name, p.cio_middle_name,
+             p.cio_inn, p.birth_date, d.cio_number
+      FROM mdc_person_clean p
+      LEFT JOIN mdc_id_doc_clean d ON d.person_source_id = p.source_id
+    python_file: "/opt/tsmdm/scripts/mdc/aggregate_docs.py"
+    python_context_dir: "/tmp/dfo_mdc"
+    python_timeout_sec: 300
+    target_table: "mdc_person_with_docs"
+    deps: [1]
+
+  # ═══ RESCORE: generate match keys ═══
+  - id: generate_match_keys
+    transform_sql: "SELECT * FROM mdc_person_with_docs"
+    python_file: "/opt/tsmdm/scripts/mdc/generate_keys.py"
+    python_context_dir: "/tmp/dfo_mdc"
+    python_timeout_sec: 300
+    target_table: "mdc_match_keys"
+    deps: [2]
+
+  # ═══ MATCH: rules_configuration['person'] (matching_declararion.py) ═══
+  - id: match_person
+    transform_sql: "SELECT * FROM mdc_person_with_docs"
+    target_table: "mdc_person_matches"
+    deps: [3]
+    match_rules: |
+      [
+        {"rule_name": "1.1 DUL->FIO+BD", "id_column": "source_id",
+         "scan_columns": ["mat_id_doc_set"],
+         "test_columns": ["cio_last_name", "cio_first_name", "birth_date"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 0.80, "normalize": "name"},
+        {"rule_name": "1.2 INN->FIO+BD", "id_column": "source_id",
+         "scan_columns": ["cio_inn"],
+         "test_columns": ["cio_last_name", "cio_first_name", "birth_date"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 0.80, "normalize": "name"},
+        {"rule_name": "2.1 FIO+BD->DUL", "id_column": "source_id",
+         "scan_columns": ["cio_last_name", "birth_date"],
+         "test_columns": ["mat_id_doc_set"],
+         "metric_function": "jaro_winkler", "operator": ">=", "threshold": 0.66},
+        {"rule_name": "2.2 FIO+BD->INN", "id_column": "source_id",
+         "scan_columns": ["cio_last_name", "birth_date"],
+         "test_columns": ["cio_inn"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 0.50, "normalize": "inn"},
+        {"rule_name": "3.1 INN+KPP->NAME (party)", "id_column": "source_id",
+         "scan_columns": ["cio_inn", "cio_kpp"],
+         "test_columns": ["cio_fullname"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 1.00}
+      ]
+
+  # ═══ ACCEPT: emit a (source_id -> master_id) map (no DFO UPDATE callback) ═══
+  - id: accept_matches
+    transform_sql: "SELECT * FROM mdc_person_matches"
+    python_file: "/opt/tsmdm/scripts/mdc/accept_matches.py"
+    python_context_dir: "/tmp/dfo_mdc"
+    python_timeout_sec: 300
+    target_table: "mdc_master_map"
+    deps: [4]
+
+  # ═══ APPLY: attach master_id to each person via JOIN ═══
+  - id: apply_master
+    transform_sql: |
+      SELECT pc.source_id, pc.system_name, pc.last_upd, m.master_id,
+             pc.cio_inn, pc.cio_last_name, pc.cio_first_name,
+             pc.cio_middle_name, pc.birth_date
+      FROM mdc_person_clean pc
+      JOIN mdc_master_map m ON m.source_id = pc.source_id
+    target_table: "mdc_person_mastered"
+    deps: [5]
+
+  # ═══ MERGE: golden person via SCD2 (latest row per master_id) ═══
+  - id: merge_master_person
+    transform_sql: |
+      SELECT
+        pm.master_id,
+        pm.cio_inn AS inn,
+        pm.cio_last_name AS last_name,
+        pm.cio_first_name AS first_name,
+        pm.cio_middle_name AS middle_name,
+        pm.birth_date
+      FROM mdc_person_mastered pm
+      WHERE pm.master_id IS NOT NULL AND pm.master_id != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM mdc_person_mastered p2
+          WHERE p2.master_id = pm.master_id AND p2.last_upd > pm.last_upd
+        )
+    target_table: master_person
+    scd2_business_key: master_id
+    scd2_effective_from_col: valid_from
+    scd2_effective_to_col:   valid_to
+    scd2_hash_col: _master_hash
+    scd2_compare_columns: inn,last_name,first_name,middle_name,birth_date
+    deps: [6]

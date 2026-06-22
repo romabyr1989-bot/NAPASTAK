@@ -10,12 +10,22 @@ TESTS=(
     "$SCRIPT_DIR/test_txn.sh"
     "$SCRIPT_DIR/test_replication.sh"
     "$SCRIPT_DIR/test_python_step.sh"
+    "$SCRIPT_DIR/test_python_file.sh"
+    "$SCRIPT_DIR/test_match_step.sh"
     "$SCRIPT_DIR/test_scala_step.sh"
     "$SCRIPT_DIR/test_scd2.sh"
     "$SCRIPT_DIR/test_scd2_hash.sh"
     "$SCRIPT_DIR/test_gp_connector.sh"
     "$SCRIPT_DIR/test_oracle_connector.sh"
     "$SCRIPT_DIR/test_pipeline_template.sh"
+    "$SCRIPT_DIR/test_query_named.sh"
+    "$SCRIPT_DIR/test_proxy_rest.sh"
+    "$SCRIPT_DIR/test_proxy_cdi.sh"
+    "$SCRIPT_DIR/test_proxy_soap.sh"
+    "$SCRIPT_DIR/test_cdi_pipeline.sh"
+    "$SCRIPT_DIR/test_tools.sh"
+    "$SCRIPT_DIR/test_agr2party.sh"
+    "$SCRIPT_DIR/test_mdc_pipeline.sh"
 )
 
 TOTAL_PASS=0

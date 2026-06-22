@@ -57,6 +57,19 @@ typedef struct {
     char        python_code[8192];
     int         python_timeout_sec;   /* default: 300 */
 
+    /* Path to a .py file on the gateway host (alternative to python_code).
+     * Mutually exclusive: if python_file is set, python_code is ignored.
+     * File is read at step execution time (not at pipeline load time) so
+     * edits take effect on the next run without gateway restart.
+     * Max file size: 512 KB. */
+    char        python_file[512];
+
+    /* Shared context directory for stateful multi-step Python pipelines.
+     * If set, the gateway creates it (mkdirp) and sets DFO_CONTEXT_DIR in the
+     * subprocess env. Scripts can read/write files there to pass state between
+     * steps within the same pipeline run. NOT cleaned up automatically. */
+    char        python_context_dir[512];
+
     /* Scala step (subprocess `scala-cli run <script>`). On par with the
      * Python step, but the user code operates on a Spark `DataFrame` named
      * `df` (Spark runs embedded in local[*] mode — no separate cluster):
@@ -91,6 +104,13 @@ typedef struct {
     bool        is_sink;
     char        sink_entity[256];   /* destination: table / object key / topic / file path */
     char        sink_mode[16];      /* "append" (default) | "overwrite" */
+
+    /* Match step: JSON array of declarative match rules (see docs/MATCH_RULES.md).
+     * If non-empty, this step runs the rule-chain entity-resolution engine
+     * instead of SQL/Python/SCD2. transform_sql provides the candidate set
+     * (required); target_table receives the matched pairs with scores. */
+    char        match_rules[4096];       /* JSON array, serialized */
+    char        match_input_table[128];  /* reserved: table to match against (defaults to candidate set) */
 } PipelineStep;
 
 typedef struct {

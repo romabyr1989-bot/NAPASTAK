@@ -87,6 +87,9 @@ for r in d['rows']:
 run() { curl -sf -X POST "http://localhost:$PORT/api/pipelines/$PID/run" "${AUTH[@]}" >/dev/null; }
 
 # SCD2 pipeline WITH scd2_hash_col; compare only name,city (notes excluded).
+# scd2_transaction_time=updated_at (monotonic) makes current-version detection
+# deterministic — without it, same-second runs share valid_from and the window
+# ORDER BY ties arbitrarily (see test_scd2.sh).
 PIPELINE=$(cat <<'JSON'
 {"name":"scd2_hash","enabled":true,
  "steps":[{"id":"s1","name":"historise",
@@ -95,6 +98,7 @@ PIPELINE=$(cat <<'JSON'
            "scd2_business_key":"customer_id",
            "scd2_effective_from_col":"valid_from",
            "scd2_effective_to_col":"valid_to",
+           "scd2_transaction_time":"updated_at",
            "scd2_hash_col":"_dfo_row_hash",
            "scd2_compare_columns":"name,city"}]}
 JSON
@@ -105,7 +109,7 @@ PID=$(curl -sf -X POST "http://localhost:$PORT/api/pipelines" \
 check "hash pipeline created" "[[ -n '$PID' ]]"
 
 # ── H1: initial load — 3 records, hash column populated ──────────────────────
-ingest cust_src $'customer_id,name,city,notes\nC1,Alice,NYC,a\nC2,Bob,LA,b\nC3,Carol,SF,c'
+ingest cust_src $'customer_id,name,city,notes,updated_at\nC1,Alice,NYC,a,100\nC2,Bob,LA,b,100\nC3,Carol,SF,c,100'
 run
 eval "$(dim | python3 "$DATA/m.py")"
 check "H1: 3 rows in dim_cust_hash"               "[[ '$total' == 3 ]]"
@@ -121,7 +125,7 @@ check "H2: 0 closed"                              "[[ '$closed' == 0 ]]"
 check "H2: C1 hash unchanged"                     "[[ \"$(hash_of C1)\" == '$H1' ]]"
 
 # ── H3: change a COMPARE column (city) on C1 → 1 new version ─────────────────
-ingest cust_src $'customer_id,name,city,notes\nC1,Alice,BOSTON,a\nC2,Bob,LA,b\nC3,Carol,SF,c'
+ingest cust_src $'customer_id,name,city,notes,updated_at\nC1,Alice,BOSTON,a,200\nC2,Bob,LA,b,100\nC3,Carol,SF,c,100'
 run
 eval "$(dim | python3 "$DATA/m.py")"
 check "H3: 4 rows (new version of C1)"            "[[ '$total' == 4 ]]"
@@ -131,7 +135,7 @@ check "H3: C2 and C3 not duplicated"              "[[ '$cnt_C2' == 1 && '$cnt_C3
 check "H3: C1 open hash differs from H1"          "[[ \"$(hash_of C1)\" != '$H1' ]]"
 
 # ── H4: change a NON-compare column (notes) on C2 → 0 new versions ───────────
-ingest cust_src $'customer_id,name,city,notes\nC1,Alice,BOSTON,a\nC2,Bob,LA,CHANGED\nC3,Carol,SF,c'
+ingest cust_src $'customer_id,name,city,notes,updated_at\nC1,Alice,BOSTON,a,200\nC2,Bob,LA,CHANGED,300\nC3,Carol,SF,c,100'
 run
 eval "$(dim | python3 "$DATA/m.py")"
 check "H4: still 4 rows (notes not compared)"     "[[ '$total' == 4 ]]"

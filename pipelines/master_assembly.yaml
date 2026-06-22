@@ -1,0 +1,111 @@
+# master_assembly — assemble golden records from CDI entities into master tables.
+# Analog of tsmdm_as_mdm/masters_declararion.py (SourceEntity + MasterEntity).
+#
+# Per attribute group, pick the latest source row per master_id and project that
+# group's columns, then merge the groups and historise with SCD2.
+#
+# DFO engine constraints honoured here (verified empirically):
+#   • FLAT table namespace (no schemas): the TSMDM "cdi" schema is the `cdi_`
+#     table-name prefix; steps run in array order (deps is DAG metadata).
+#   • "latest per master_id" is expressed with a correlated NOT EXISTS
+#     ("no later row exists"), NOT ROW_NUMBER()/MAX(): DFO's window PARTITION BY
+#     numbers multi-row partitions globally (drops rows under WHERE rn=1), and
+#     MAX() is numeric-only (returns 0 for text timestamps). NOT EXISTS with a
+#     lexical `>` on ISO `last_upd` strings is reliable.
+#   • last_upd must be an ISO-8601 string (YYYY-MM-DD…) so the lexical compare
+#     orders chronologically.
+
+name: master_assembly
+enabled: true
+
+triggers:
+  - type: cron
+    cron_expr: "0 4 * * *"   # daily 04:00, after hfl_collector
+
+steps:
+
+  # ── 1. master_person INN (latest row per master_id) ──
+  - id: assemble_person_inn
+    transform_sql: |
+      SELECT p.master_id, p.src_inn AS inn
+      FROM cdi_physical_party p
+      WHERE p.master_id IS NOT NULL AND p.master_id != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM cdi_physical_party p2
+          WHERE p2.master_id = p.master_id AND p2.last_upd > p.last_upd
+        )
+    target_table: master_person_inn
+
+  # ── 2. master_person FIO ──
+  - id: assemble_person_fio
+    transform_sql: |
+      SELECT
+        p.master_id,
+        p.src_last_name   AS last_name,
+        p.src_first_name  AS first_name,
+        p.src_middle_name AS middle_name
+      FROM cdi_physical_party p
+      WHERE p.master_id IS NOT NULL AND p.master_id != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM cdi_physical_party p2
+          WHERE p2.master_id = p.master_id AND p2.last_upd > p.last_upd
+        )
+    target_table: master_person_fio
+    deps: [0]
+
+  # ── 3. master_person birth ──
+  - id: assemble_person_birth
+    transform_sql: |
+      SELECT p.master_id, p.birth_date, p.birth_place
+      FROM cdi_physical_party p
+      WHERE p.master_id IS NOT NULL AND p.master_id != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM cdi_physical_party p2
+          WHERE p2.master_id = p.master_id AND p2.last_upd > p.last_upd
+        )
+    target_table: master_person_birth
+    deps: [0]
+
+  # ── 4. merge attribute groups → master_person (SCD2 historised) ──
+  - id: merge_master_person
+    transform_sql: |
+      SELECT
+        i.master_id,
+        i.inn,
+        f.last_name,
+        f.first_name,
+        f.middle_name,
+        b.birth_date,
+        b.birth_place
+      FROM master_person_inn i
+      LEFT JOIN master_person_fio   f ON f.master_id = i.master_id
+      LEFT JOIN master_person_birth b ON b.master_id = i.master_id
+    target_table: master_person
+    scd2_business_key: master_id
+    scd2_effective_from_col: valid_from
+    scd2_effective_to_col:   valid_to
+    scd2_hash_col: _master_hash
+    scd2_compare_columns: inn,last_name,first_name,middle_name,birth_date
+    deps: [1, 2]
+
+  # ── 5. master_party (legal entities), SCD2 historised ──
+  - id: assemble_party
+    transform_sql: |
+      SELECT
+        p.master_id,
+        p.cio_inn      AS inn,
+        p.cio_kpp      AS kpp,
+        p.cio_ogrn     AS ogrn,
+        p.cio_org_name AS org_name
+      FROM cdi_party p
+      WHERE p.master_id IS NOT NULL AND p.master_id != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM cdi_party p2
+          WHERE p2.master_id = p.master_id AND p2.last_upd > p.last_upd
+        )
+    target_table: master_party
+    scd2_business_key: master_id
+    scd2_effective_from_col: valid_from
+    scd2_effective_to_col:   valid_to
+    scd2_hash_col: _master_hash
+    deps: [3]

@@ -253,6 +253,12 @@ int pipeline_from_json(Pipeline *p, const char *json) {
                     json_str(json_get(s, "python_code"), ""),
                     sizeof(st->python_code) - 1);
             st->python_timeout_sec = (int)json_int(json_get(s, "python_timeout_sec"), 300);
+            strncpy(st->python_file,
+                    json_str(json_get(s, "python_file"), ""),
+                    sizeof(st->python_file) - 1);
+            strncpy(st->python_context_dir,
+                    json_str(json_get(s, "python_context_dir"), ""),
+                    sizeof(st->python_context_dir) - 1);
             /* Scala step (optional) */
             strncpy(st->scala_code,
                     json_str(json_get(s, "scala_code"), ""),
@@ -273,6 +279,9 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             st->is_sink = json_bool(json_get(s,"is_sink"), false);
             strncpy(st->sink_entity, json_str(json_get(s,"sink_entity"),""), sizeof(st->sink_entity)-1);
             strncpy(st->sink_mode,   json_str(json_get(s,"sink_mode"),"append"), sizeof(st->sink_mode)-1);
+            /* Match step (optional) */
+            strncpy(st->match_rules,       json_str(json_get(s,"match_rules"),""),       sizeof(st->match_rules)-1);
+            strncpy(st->match_input_table, json_str(json_get(s,"match_input_table"),""), sizeof(st->match_input_table)-1);
             st->max_retries = (int)json_int(json_get(s,"max_retries"), 3);
             st->retry_delay_sec = (int)json_int(json_get(s,"retry_delay_sec"), 30);
             st->retry_count = 0;
@@ -314,6 +323,8 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
             jb_key(&jb,"python_code");        jb_str(&jb, st->python_code);
             jb_key(&jb,"python_timeout_sec"); jb_int(&jb, st->python_timeout_sec);
         }
+        if (st->python_file[0])        { jb_key(&jb,"python_file");        jb_str(&jb, st->python_file); }
+        if (st->python_context_dir[0]) { jb_key(&jb,"python_context_dir"); jb_str(&jb, st->python_context_dir); }
         if (st->scala_code[0]) {
             jb_key(&jb,"scala_code");        jb_str(&jb, st->scala_code);
             jb_key(&jb,"scala_timeout_sec"); jb_int(&jb, st->scala_timeout_sec);
@@ -335,6 +346,9 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
             jb_key(&jb,"sink_entity"); jb_str(&jb, st->sink_entity);
             jb_key(&jb,"sink_mode");   jb_str(&jb, st->sink_mode[0] ? st->sink_mode : "append");
         }
+        /* Match fields — emitted only when set, so non-match pipelines round-trip unchanged */
+        if (st->match_rules[0])       { jb_key(&jb,"match_rules");       jb_str(&jb, st->match_rules); }
+        if (st->match_input_table[0]) { jb_key(&jb,"match_input_table"); jb_str(&jb, st->match_input_table); }
         jb_key(&jb,"max_retries");      jb_int(&jb,st->max_retries);
         jb_key(&jb,"retry_delay_sec");  jb_int(&jb,st->retry_delay_sec);
         jb_key(&jb,"status");           jb_int(&jb,(int)st->status);

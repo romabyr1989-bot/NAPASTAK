@@ -1,0 +1,68 @@
+# hfl_collector — read OLTP sources (SBL, Way4, …) into CDI buffer + entities.
+# Analog of tsmdm_hfl_cdi/collector_main.py + Collector.
+#
+# DFO notes:
+#   • FLAT namespace: target tables use the `cdi_` prefix (no schemas).
+#   • A connector step reads the source table named in `transform_sql` (DFO uses
+#     transform_sql as the entity; connector_config holds connection params only).
+#   • `{{ var }}` placeholders resolve from the vars: block (and any external
+#     overrides) when loaded from pipelines_dir / POST /from-template.
+
+name: hfl_collector
+enabled: true
+
+vars:
+  sbl_schema: SIEBEL
+  cdi_prefix: cdi
+
+triggers:
+  - type: cron
+    cron_expr: "0 2 * * *"   # daily 02:00
+
+steps:
+
+  # 1. Pull physical persons (S_CONTACT) from SBL Oracle into a buffer table.
+  - id: collect_sbl_person
+    connector_type: oracle
+    connector_config:
+      host: "{{ sbl_host }}"
+      port: "1521"
+      service_name: "{{ sbl_service }}"
+      user: "{{ sbl_user }}"
+      password: "{{ sbl_password }}"
+      schema: "{{ sbl_schema }}"
+      cursor_column: "LAST_UPD"
+      batch_size: "50000"
+    transform_sql: "S_CONTACT"
+    target_table: "{{ cdi_prefix }}_sbl_person_buf"
+
+  # 2. Transform SBL person rows → CDI physical_party (python_file).
+  - id: transform_sbl_person
+    transform_sql: "SELECT * FROM {{ cdi_prefix }}_sbl_person_buf"
+    python_file: "/opt/tsmdm/scripts/cdi/transform_person.py"
+    python_context_dir: "/tmp/dfo_hfl_{{ pipeline_id }}"
+    python_timeout_sec: 600
+    target_table: "{{ cdi_prefix }}_physical_party"
+    deps: [0]
+
+  # 3. Pull identity documents (S_DOC_AGREE) from SBL.
+  - id: collect_sbl_doc
+    connector_type: oracle
+    connector_config:
+      host: "{{ sbl_host }}"
+      port: "1521"
+      service_name: "{{ sbl_service }}"
+      user: "{{ sbl_user }}"
+      password: "{{ sbl_password }}"
+      schema: "{{ sbl_schema }}"
+      cursor_column: "LAST_UPD"
+    transform_sql: "S_DOC_AGREE"
+    target_table: "{{ cdi_prefix }}_sbl_doc_buf"
+
+  # 4. Transform documents → CDI id_doc.
+  - id: transform_sbl_doc
+    transform_sql: "SELECT * FROM {{ cdi_prefix }}_sbl_doc_buf"
+    python_file: "/opt/tsmdm/scripts/cdi/transform_document.py"
+    python_context_dir: "/tmp/dfo_hfl_{{ pipeline_id }}"
+    target_table: "{{ cdi_prefix }}_id_doc"
+    deps: [2]

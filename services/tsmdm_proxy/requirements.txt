@@ -1,0 +1,7 @@
+spyne>=2.14.0
+lxml>=4.9.0
+flask>=3.0.0
+flask-cors>=4.0.0
+fastapi>=0.110.0
+uvicorn>=0.27.0
+psycopg2-binary>=2.9.9

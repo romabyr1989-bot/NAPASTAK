@@ -28,7 +28,7 @@ static const char *qe_text(Scalar s, Arena *a) {
 }
 
 /* Levenshtein edit distance (two-row DP, arena-backed). */
-static int qe_levenshtein(const char *x, const char *y, Arena *a) {
+int qe_levenshtein(const char *x, const char *y, Arena *a) {
     size_t lx = strlen(x), ly = strlen(y);
     if (lx == 0) return (int)ly;
     if (ly == 0) return (int)lx;
@@ -49,7 +49,7 @@ static int qe_levenshtein(const char *x, const char *y, Arena *a) {
 }
 
 /* Jaro-Winkler similarity in [0,1] (prefix weight p=0.1, max prefix 4). */
-static double qe_jaro_winkler(const char *s1, const char *s2, Arena *a) {
+double qe_jaro_winkler(const char *s1, const char *s2, Arena *a) {
     size_t l1 = strlen(s1), l2 = strlen(s2);
     if (l1 == 0 || l2 == 0) return (l1 == l2) ? 1.0 : 0.0;
     size_t maxl = l1 > l2 ? l1 : l2;
@@ -78,6 +78,67 @@ static double qe_jaro_winkler(const char *s1, const char *s2, Arena *a) {
         if (s1[i] == s2[i]) pref++; else break;
     }
     return jaro + (double)pref * 0.1 * (1.0 - jaro);
+}
+
+/* Trigram word similarity: fraction of query trigrams found in document.
+ * Mirrors pg_trgm word_similarity(query, document). Returns [0.0, 1.0].
+ * Byte-level (works for UTF-8 as long as both sides share the encoding). */
+double qe_word_similarity(const char *query, const char *doc, Arena *a) {
+    (void)a;
+    if (!query || !doc) return 0.0;
+    size_t qlen = strlen(query), dlen = strlen(doc);
+    if (qlen < 3 && dlen < 3) return (strcasecmp(query, doc) == 0) ? 1.0 : 0.0;
+    if (qlen < 3) return 0.0;
+
+    int q_ntri = (int)qlen - 2;
+    int d_ntri = (int)dlen > 2 ? (int)dlen - 2 : 0;
+    if (q_ntri <= 0) return 0.0;
+
+    int matches = 0;
+    for (int i = 0; i < q_ntri; i++) {
+        const char *qt = query + i;   /* 3-char trigram at position i */
+        for (int j = 0; j < d_ntri; j++) {
+            if (doc[j] == qt[0] && doc[j+1] == qt[1] && doc[j+2] == qt[2]) {
+                matches++;
+                break;   /* count each query trigram at most once */
+            }
+        }
+    }
+    return (double)matches / (double)q_ntri;
+}
+
+/* normalize_inn(s): keep digits only (drops spaces, dashes, letters). */
+const char *qe_normalize_inn(const char *s, Arena *a) {
+    if (!s) return "";
+    size_t len = strlen(s);
+    char *out = arena_alloc(a, len + 1);
+    size_t n = 0;
+    for (size_t i = 0; i < len; i++)
+        if (s[i] >= '0' && s[i] <= '9') out[n++] = s[i];
+    out[n] = '\0';
+    return out;
+}
+
+/* normalize_name(s): ASCII-lowercase, trim, collapse internal whitespace runs
+ * to a single space. (ASCII case-fold only — Cyrillic passes through unchanged.) */
+const char *qe_normalize_name(const char *s, Arena *a) {
+    if (!s) return "";
+    size_t len = strlen(s);
+    char *out = arena_alloc(a, len + 1);
+    size_t n = 0;
+    bool prev_space = true;   /* trim leading */
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (!prev_space && n > 0) { out[n++] = ' '; prev_space = true; }
+        } else {
+            out[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;   /* ASCII lower */
+            prev_space = false;
+        }
+    }
+    while (n > 0 && out[n-1] == ' ') n--;   /* trim trailing */
+    out[n] = '\0';
+    return out;
 }
 
 Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
@@ -211,6 +272,22 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
                 const char *y = qe_text(eval_expr(e->args[1], ctx, a), a);
                 if (!x || !y) return s;
                 s.type=SV_DOUBLE; s.val.fval = qe_jaro_winkler(x, y, a); return s;
+            }
+            if (!strcasecmp(fn,"word_similarity") && e->nargs >= 2) {
+                const char *x = qe_text(arg0, a);
+                const char *y = qe_text(eval_expr(e->args[1], ctx, a), a);
+                if (!x || !y) return s;
+                s.type=SV_DOUBLE; s.val.fval = qe_word_similarity(x, y, a); return s;
+            }
+            if (!strcasecmp(fn,"normalize_inn") && e->nargs >= 1) {
+                const char *x = qe_text(arg0, a);
+                if (!x) return s;
+                s.type=SV_TEXT; s.val.sval = qe_normalize_inn(x, a); return s;
+            }
+            if (!strcasecmp(fn,"normalize_name") && e->nargs >= 1) {
+                const char *x = qe_text(arg0, a);
+                if (!x) return s;
+                s.type=SV_TEXT; s.val.sval = qe_normalize_name(x, a); return s;
             }
         }
         return s;
