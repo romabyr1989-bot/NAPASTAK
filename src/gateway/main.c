@@ -246,6 +246,7 @@ void app_init(App *app, const char *config_json) {
     strncpy(app->data_dir,    DATA_DIR_DEFAULT,    sizeof(app->data_dir)-1);
     strncpy(app->db_path,     DB_PATH_DEFAULT,     sizeof(app->db_path)-1);
     strncpy(app->plugins_dir, "./build/release/lib", sizeof(app->plugins_dir)-1);
+    strncpy(app->sql_templates_dir, "./sql", sizeof(app->sql_templates_dir)-1);
     app->port = DEFAULT_PORT;
 
     /* parse config */
@@ -303,6 +304,12 @@ void app_init(App *app, const char *config_json) {
             if (pld) {
                 char *expanded = expand_env_vars(pld);
                 if (expanded) { strncpy(app->pipelines_dir, expanded, sizeof(app->pipelines_dir)-1); free(expanded); }
+            }
+            /* SQL templates base directory */
+            const char *std_ = json_str(json_get(cfg,"sql_templates_dir"), NULL);
+            if (std_) {
+                char *expanded = expand_env_vars(std_);
+                if (expanded) { strncpy(app->sql_templates_dir, expanded, sizeof(app->sql_templates_dir)-1); free(expanded); }
             }
             /* Step 3 Week 1: PostgreSQL wire-protocol server */
             app->pgwire_port    = (int)json_int(json_get(cfg, "pgwire_port"), 0);

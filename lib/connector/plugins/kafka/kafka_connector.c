@@ -1,19 +1,32 @@
-/* Kafka streaming connector — ABI v1 */
+/* Kafka streaming connector — ABI v2 (JSON/CSV/Avro + Schema Registry) */
 #include "../../../connector/connector.h"
 #include "../../../core/arena.h"
 #include "../../../core/json.h"
 #include "../../../core/log.h"
+#include "avro_record.h"   /* AvroType/AvroField/AvroSchemaNode + parse/decode */
 #include <librdkafka/rdkafka.h>
+#include <curl/curl.h>
 #include <pthread.h>
 #include <string.h>
 #include <strings.h>   /* strcasecmp */
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 
 /* ── Context ── */
 
 #define KAFKA_BUF_SIZE 256
+
+/* ── Avro / Confluent Schema Registry ──
+ * The schema model (AvroType/AvroField/AvroSchemaNode) and the parse/decode
+ * logic live in avro_record.h (unit-tested without librdkafka/curl). Only the
+ * Registry HTTP client + the id→schema cache are connector-local. */
+typedef struct AvroSchemaCache {
+    AvroSchemaNode *head;
+    Arena          *arena;
+    pthread_mutex_t mu;
+} AvroSchemaCache;
 
 typedef struct {
     rd_kafka_t                        *rk;
@@ -21,7 +34,12 @@ typedef struct {
     char  brokers[512];
     char  group_id[128];
     char  topic_name[128];
-    char  data_format[16];   /* "json" or "csv" */
+    char  data_format[16];   /* "json" | "csv" | "avro" */
+
+    /* Avro / Schema Registry (data_format == "avro") */
+    char  schema_registry_url[512];  /* e.g. "http://registry:8081" */
+    char  sr_auth[256];              /* optional "user:pass" basic auth */
+    AvroSchemaCache *schema_cache;   /* id → parsed Avro schema (lazy) */
 
     DfoCdcHandler   cdc_handler;
     void           *cdc_userdata;
@@ -33,6 +51,10 @@ typedef struct {
     pthread_mutex_t buf_mu;
     Arena          *arena;
 } KafkaCtx;
+
+/* libcurl global init exactly once across all connector instances. */
+static pthread_once_t kafka_curl_once = PTHREAD_ONCE_INIT;
+static void kafka_curl_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
 
 /* ── JSON config parser helpers ── */
 
@@ -192,6 +214,171 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
     return batch;
 }
 
+/* ── Avro: Confluent Schema Registry client ── */
+
+struct curl_buf { char *data; size_t len, cap; };
+
+static size_t sr_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    struct curl_buf *buf = (struct curl_buf *)userdata;
+    size_t add = size * nmemb;
+    if (buf->len + add + 1 > buf->cap) {
+        size_t ncap = (buf->len + add + 1) * 2;
+        char  *nd   = realloc(buf->data, ncap);
+        if (!nd) return 0;   /* signal error to curl */
+        buf->data = nd; buf->cap = ncap;
+    }
+    memcpy(buf->data + buf->len, ptr, add);
+    buf->len += add;
+    buf->data[buf->len] = '\0';
+    return add;
+}
+
+/* GET {registry}/schemas/ids/{id} → returns the unescaped Avro schema JSON
+ * (malloc'd, caller frees) or NULL on any error. */
+static char *sr_fetch_schema(KafkaCtx *ctx, int32_t schema_id)
+{
+    if (!ctx->schema_registry_url[0]) {
+        LOG_ERROR("kafka: data_format=avro but schema_registry_url is unset");
+        return NULL;
+    }
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+
+    char url[768];
+    snprintf(url, sizeof(url), "%s/schemas/ids/%d", ctx->schema_registry_url, schema_id);
+
+    struct curl_buf buf = { malloc(4096), 0, 4096 };
+    if (!buf.data) { curl_easy_cleanup(curl); return NULL; }
+    buf.data[0] = '\0';
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sr_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    if (ctx->sr_auth[0]) {
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERPWD, ctx->sr_auth);
+    }
+
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK || http_code != 200) {
+        LOG_ERROR("kafka: schema fetch failed (id=%d http=%ld): %s",
+                  schema_id, http_code, curl_easy_strerror(rc));
+        free(buf.data);
+        return NULL;
+    }
+
+    /* Response: {"schema":"<json-escaped avro schema>"} — the parser unescapes. */
+    JVal *root = json_parse(ctx->arena, buf.data, buf.len);
+    free(buf.data);
+    if (!root || root->type != JV_OBJECT) return NULL;
+    JVal *schema_val = json_get(root, "schema");
+    if (!schema_val || schema_val->type != JV_STRING) return NULL;
+
+    const char *s = json_str(schema_val, "");
+    char *result = malloc(strlen(s) + 1);
+    if (result) memcpy(result, s, strlen(s) + 1);
+    return result;
+}
+
+/* Return the cached node for schema_id, fetching + parsing on a miss. */
+static AvroSchemaNode *schema_cache_get(KafkaCtx *ctx, int32_t schema_id)
+{
+    AvroSchemaCache *cache = ctx->schema_cache;
+    pthread_mutex_lock(&cache->mu);
+    for (AvroSchemaNode *n = cache->head; n; n = n->next) {
+        if (n->schema_id == schema_id) { pthread_mutex_unlock(&cache->mu); return n; }
+    }
+    pthread_mutex_unlock(&cache->mu);
+
+    char *schema_json = sr_fetch_schema(ctx, schema_id);
+    if (!schema_json) return NULL;
+
+    AvroSchemaNode *node = arena_calloc(cache->arena, sizeof(AvroSchemaNode));
+    node->schema_id   = schema_id;
+    node->schema_json = arena_strdup(cache->arena, schema_json);
+    free(schema_json);
+    node->nfields = avro_parse_schema(cache->arena, node->schema_json, &node->fields);
+    if (node->nfields < 0) {
+        LOG_ERROR("kafka: failed to parse avro schema id=%d", schema_id);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&cache->mu);
+    node->next  = cache->head;
+    cache->head = node;
+    pthread_mutex_unlock(&cache->mu);
+
+    LOG_INFO("kafka: cached avro schema id=%d (%d fields)", schema_id, node->nfields);
+    return node;
+}
+
+/* Build a ColBatch from a Confluent Avro message:
+ *   [0x00][schema_id:4 BE][avro binary payload]
+ * On any problem (bad magic, missing schema, decode error) we fall back to the
+ * raw two-column batch so a bad message never crashes the read loop. */
+static ColBatch *batch_from_avro(KafkaCtx *ctx, Arena *a,
+                                 const uint8_t *msg, size_t mlen, int64_t offset_val)
+{
+    if (mlen < 5 || msg[0] != 0x00) {
+        LOG_WARN("kafka: not a Confluent Avro message (bad magic byte)");
+        return batch_from_raw(a, (const char *)msg, mlen, offset_val);
+    }
+
+    int32_t schema_id = ((int32_t)msg[1] << 24) | ((int32_t)msg[2] << 16) |
+                        ((int32_t)msg[3] << 8)  |  (int32_t)msg[4];
+
+    AvroSchemaNode *schema = schema_cache_get(ctx, schema_id);
+    if (!schema) {
+        LOG_ERROR("kafka: no schema for id=%d, falling back to raw", schema_id);
+        return batch_from_raw(a, (const char *)msg, mlen, offset_val);
+    }
+    if (schema->nfields + 1 > MAX_COLS) {
+        LOG_ERROR("kafka: avro schema id=%d has too many fields (%d > %d)",
+                  schema_id, schema->nfields, MAX_COLS - 1);
+        return batch_from_raw(a, (const char *)msg, mlen, offset_val);
+    }
+
+    char **values; uint8_t *nulls;
+    if (avro_decode_record(a, schema->fields, schema->nfields,
+                           msg + 5, mlen - 5, &values, &nulls) != 0)
+        return batch_from_raw(a, (const char *)msg, mlen, offset_val);
+
+    int ncols = schema->nfields + 1;
+    Schema *sc = arena_calloc(a, sizeof(Schema));
+    sc->ncols  = ncols;
+    sc->cols   = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
+    sc->cols[0].name = "kafka_offset"; sc->cols[0].type = COL_INT64; sc->cols[0].nullable = false;
+    for (int f = 0; f < schema->nfields; f++) {
+        sc->cols[f + 1].name     = arena_strdup(a, schema->fields[f].name);
+        sc->cols[f + 1].type     = COL_TEXT;   /* every value rendered as text */
+        sc->cols[f + 1].nullable = true;
+    }
+
+    ColBatch *batch = arena_calloc(a, sizeof(ColBatch));
+    batch->schema = sc; batch->ncols = ncols; batch->nrows = 1;
+
+    int64_t *offs = arena_alloc(a, sizeof(int64_t));
+    offs[0] = offset_val;
+    batch->values[0]      = offs;
+    batch->null_bitmap[0] = arena_calloc(a, 1);
+
+    for (int f = 0; f < schema->nfields; f++) {
+        char **col = arena_alloc(a, sizeof(char *));
+        col[0] = values[f];                 /* NULL for union-null (mirrors JSON path) */
+        batch->values[f + 1]      = col;
+        batch->null_bitmap[f + 1] = arena_calloc(a, 1);
+        if (nulls[f]) batch->null_bitmap[f + 1][0] = 0x01;  /* row 0 is null */
+    }
+
+    return batch;
+}
+
 /* ── CDC consumer thread ── */
 
 static void *consumer_thread_fn(void *arg)
@@ -236,22 +423,37 @@ static void *consumer_thread_fn(void *arg)
 
 static void *kafka_create(const char *config_json, Arena *arena)
 {
+    pthread_once(&kafka_curl_once, kafka_curl_global_init);
+
     KafkaCtx *ctx = arena_calloc(arena, sizeof(KafkaCtx));
     ctx->arena = arena;
     pthread_mutex_init(&ctx->buf_mu, NULL);
     atomic_store(&ctx->consumer_running, 0);
 
+    /* Schema cache for avro (shares the host arena's lifetime). */
+    ctx->schema_cache = arena_calloc(arena, sizeof(AvroSchemaCache));
+    ctx->schema_cache->arena = arena;
+    pthread_mutex_init(&ctx->schema_cache->mu, NULL);
+
     /* defaults */
     snprintf(ctx->brokers,     sizeof(ctx->brokers),     "localhost:9092");
     snprintf(ctx->group_id,    sizeof(ctx->group_id),    "dfo-consumer");
     snprintf(ctx->data_format, sizeof(ctx->data_format), "json");
+    ctx->schema_registry_url[0] = '\0';
+    ctx->sr_auth[0]             = '\0';
 
     if (config_json) {
         cfg_str(config_json, "\"brokers\"",     ctx->brokers,     sizeof(ctx->brokers));
         cfg_str(config_json, "\"group_id\"",    ctx->group_id,    sizeof(ctx->group_id));
         cfg_str(config_json, "\"topic\"",       ctx->topic_name,  sizeof(ctx->topic_name));
         cfg_str(config_json, "\"data_format\"", ctx->data_format, sizeof(ctx->data_format));
+        cfg_str(config_json, "\"schema_registry_url\"",  ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
+        cfg_str(config_json, "\"schema_registry_auth\"", ctx->sr_auth,             sizeof(ctx->sr_auth));
     }
+
+    if (strcasecmp(ctx->data_format, "avro") == 0 && !ctx->schema_registry_url[0])
+        LOG_ERROR("kafka: data_format=avro requires schema_registry_url "
+                  "(messages will fall back to raw)");
 
     char errstr[512];
     ctx->rk = make_consumer(ctx->brokers, ctx->group_id, errstr, sizeof(errstr));
@@ -292,6 +494,8 @@ static void kafka_destroy(void *vctx)
     if (ctx->tplist)
         rd_kafka_topic_partition_list_destroy(ctx->tplist);
 
+    if (ctx->schema_cache)
+        pthread_mutex_destroy(&ctx->schema_cache->mu);
     pthread_mutex_destroy(&ctx->buf_mu);
     /* NB: ctx (and ctx->arena) are owned by the HOST — ctx was allocated with
      * arena_calloc(host_arena, ...). Do NOT arena_destroy() the host's arena or
@@ -362,6 +566,10 @@ static int kafka_describe(void *vctx, Arena *a, const char *entity, Schema **out
                 schema->cols[i].nullable = true;
                 if (*p == ',') p++;
             }
+        } else if (strcasecmp(ctx->data_format, "avro") == 0) {
+            /* Avro: decode one message via its Registry schema → schema */
+            ColBatch *b = batch_from_avro(ctx, a, (const uint8_t *)payload, plen, offset);
+            if (b) schema = b->schema;
         } else {
             /* JSON: parse and extract keys → schema */
             ColBatch *b = batch_from_json(a, payload, plen, offset);
@@ -420,7 +628,9 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         last_offset         = (int64_t)msg->offset;
 
         ColBatch *b;
-        if (strcasecmp(ctx->data_format, "json") == 0)
+        if (strcasecmp(ctx->data_format, "avro") == 0)
+            b = batch_from_avro(ctx, a, (const uint8_t *)payload, plen, last_offset);
+        else if (strcasecmp(ctx->data_format, "json") == 0)
             b = batch_from_json(a, payload, plen, last_offset);
         else
             b = batch_from_raw(a, payload, plen, last_offset);
@@ -641,8 +851,8 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
 const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "kafka",
-    .version       = "1.0.0",
-    .description   = "Apache Kafka streaming connector",
+    .version       = "1.1.0",
+    .description   = "Kafka connector (JSON/CSV/Avro+SchemaRegistry)",
     .create        = kafka_create,
     .destroy       = kafka_destroy,
     .list_entities = kafka_list_entities,

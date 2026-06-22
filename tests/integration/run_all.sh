@@ -26,6 +26,8 @@ TESTS=(
     "$SCRIPT_DIR/test_tools.sh"
     "$SCRIPT_DIR/test_agr2party.sh"
     "$SCRIPT_DIR/test_mdc_pipeline.sh"
+    "$SCRIPT_DIR/test_kafka_avro.sh"
+    "$SCRIPT_DIR/test_sql_templates.sh"
 )
 
 TOTAL_PASS=0

@@ -30,7 +30,7 @@ CORE_SRCS = lib/core/arena.c lib/core/log.c lib/core/hashmap.c \
             lib/auth/rbac.c lib/auth/audit.c
 NET_SRCS  = lib/net/http.c lib/net/tls.c
 STOR_SRCS = lib/storage/storage.c lib/storage/compress.c lib/storage/txn.c lib/index/btree.c
-SQL_SRCS  = lib/sql_parser/sql.c
+SQL_SRCS  = lib/sql_parser/sql.c lib/sql_template/sql_template.c
 QE_SRCS   = lib/qengine/qengine.c
 SCHED_SRCS= lib/scheduler/scheduler.c lib/scheduler/file_watcher.c
 YAML_SRCS = lib/yaml/yaml_loader.c lib/yaml/yaml_template.c
@@ -143,7 +143,7 @@ debug:
 dirs:
 	@mkdir -p $(BINDIR) $(LIBDIR)
 	@mkdir -p $(OUTDIR)/lib/core $(OUTDIR)/lib/net $(OUTDIR)/lib/storage \
-	           $(OUTDIR)/lib/sql_parser $(OUTDIR)/lib/qengine \
+	           $(OUTDIR)/lib/sql_parser $(OUTDIR)/lib/sql_template $(OUTDIR)/lib/qengine \
 	           $(OUTDIR)/lib/scheduler $(OUTDIR)/lib/observ \
 	           $(OUTDIR)/lib/connector $(OUTDIR)/lib/index \
 	           $(OUTDIR)/lib/auth $(OUTDIR)/lib/matview $(OUTDIR)/lib/cluster \
@@ -232,14 +232,17 @@ $(S3_PLUGIN): lib/connector/plugins/s3/s3_connector.c \
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl -lcrypto \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
-# Kafka connector (requires librdkafka)
+# Kafka connector (requires librdkafka; libcurl for Schema Registry — Avro)
 $(KAFKA_PLUGIN): lib/connector/plugins/kafka/kafka_connector.c \
+                 lib/connector/plugins/kafka/avro_decode.h \
+                 lib/connector/plugins/kafka/avro_record.h \
                  $(OUTDIR)/lib/core/arena.o \
                  $(OUTDIR)/lib/storage/storage.o \
                  $(OUTDIR)/lib/core/log.o \
                  $(OUTDIR)/lib/core/json.o
 	@echo "  SO  $@"
-	@$(CC) $(CFLAGS) $(KAFKACFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(KAFKALDFLAGS) \
+	@$(CC) $(CFLAGS) $(KAFKACFLAGS) -shared -fPIC \
+	    $(filter %.c %.o,$^) -o $@ $(LDFLAGS) $(KAFKALDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # Greenplum connector (reuses libpq — same transport as the pg plugin)

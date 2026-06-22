@@ -17,6 +17,7 @@
 #include "../../lib/auth/rbac.h"
 #include "../../lib/auth/audit.h"
 #include "../../lib/matview/matview.h"
+#include "../../lib/sql_template/sql_template.h"
 #include <sqlite3.h>
 #include <string.h>
 #include <strings.h>
@@ -3839,6 +3840,146 @@ static const char *connector_so_name(const char *conn) {
     return conn;
 }
 
+/* ── SQL templates (see docs/SQL_TEMPLATES.md) ── */
+
+/* The effective SQL of a step: the resolved template/substituted SQL if present,
+ * else the inline transform_sql. Never NULL. */
+static const char *step_sql(const PipelineStep *st) {
+    return (st->resolved_sql && st->resolved_sql[0]) ? st->resolved_sql : st->transform_sql;
+}
+
+/* Cache a step's RS result for later {@step:<id>:<col>} references. */
+static void pipeline_set_step_result(Pipeline *p, const char *step_id, RS *rs) {
+    if (!p || p->nstep_results >= MAX_STEPS) return;
+    StepResultCache *c = &p->step_results[p->nstep_results++];
+    snprintf(c->step_id, sizeof(c->step_id), "%s", step_id);
+    c->result_rs = rs;
+}
+
+/* Retrieve a prior step's RS by id (NULL if it has not run / was not cached). */
+static RS *pipeline_get_step_result(Pipeline *p, const char *step_id) {
+    if (!p) return NULL;
+    for (int i = 0; i < p->nstep_results; i++)
+        if (!strcmp(p->step_results[i].step_id, step_id))
+            return (RS *)p->step_results[i].result_rs;
+    return NULL;
+}
+
+/* Load a .sql template from sql_templates_dir (max 64 KB). Arena-allocated text,
+ * or NULL on error (errbuf set). Path traversal ('..') is rejected. */
+static char *load_sql_template(App *app, Arena *a, const char *rel_path,
+                               char *errbuf, size_t errsz) {
+    if (strstr(rel_path, "..")) {
+        snprintf(errbuf, errsz, "sql_template path must not contain '..'");
+        return NULL;
+    }
+    const char *base = (app && app->sql_templates_dir[0]) ? app->sql_templates_dir : "./sql";
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s/%s", base, rel_path);
+
+    FILE *f = fopen(full_path, "rb");
+    if (!f) {
+        snprintf(errbuf, errsz, "cannot open sql_template '%s': %s", full_path, strerror(errno));
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz < 0 || sz > 65536) {
+        fclose(f);
+        snprintf(errbuf, errsz, "sql_template too large (%ld bytes, max 65536)", sz);
+        return NULL;
+    }
+    char *buf = arena_alloc(a, (size_t)sz + 1);
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Runtime context for the @computed-param resolver. */
+typedef struct { App *app; Pipeline *p; } ComputedCtx;
+
+/* SqlComputedFn: resolve @now / @last_run / @step:<id>:<col> to a quoted value. */
+static char *api_computed_param(void *vctx, Arena *a, const char *expr,
+                                char *errbuf, size_t errsz) {
+    ComputedCtx *cc = (ComputedCtx *)vctx;
+    Pipeline *p = cc ? cc->p : NULL;
+
+    if (!strcmp(expr, "now") || !strcmp(expr, "last_run")) {
+        time_t t;
+        if (!strcmp(expr, "now")) t = time(NULL);
+        else t = (p && p->last_run > 0) ? (time_t)p->last_run : 0;
+        struct tm tm; localtime_r(&t, &tm);
+        char buf[40];
+        strftime(buf, sizeof(buf), "'%Y-%m-%d %H:%M:%S'", &tm);
+        return arena_strdup(a, buf);
+    }
+    if (!strncmp(expr, "step:", 5)) {
+        char step_id[64] = {0}, col[64] = {0};
+        if (sscanf(expr + 5, "%63[^:]:%63s", step_id, col) != 2) {
+            snprintf(errbuf, errsz, "bad @step param: %s", expr);
+            return NULL;
+        }
+        RS *prior = pipeline_get_step_result(p, step_id);
+        if (!prior) {
+            snprintf(errbuf, errsz, "@step:%s: no cached result (must run earlier)", step_id);
+            return NULL;
+        }
+        int ci = -1;
+        for (int c = 0; c < prior->ncols; c++)
+            if (prior->col_names[c] && !strcasecmp(prior->col_names[c], col)) { ci = c; break; }
+        if (ci < 0) {
+            snprintf(errbuf, errsz, "@step:%s:%s: column not found", step_id, col);
+            return NULL;
+        }
+        if (prior->nrows == 0) return arena_strdup(a, "NULL");  /* empty IN list */
+
+        size_t cap = 256, off = 0;
+        char  *out = arena_alloc(a, cap);
+        for (int r = 0; r < prior->nrows; r++) {
+            const char *v = prior->rows[r].cells ? prior->rows[r].cells[ci] : NULL;
+            char *qv = v ? sql_quote_literal(a, v) : arena_strdup(a, "NULL");
+            size_t ql = strlen(qv);
+            while (off + ql + 2 >= cap) {
+                cap *= 2; char *nb = arena_alloc(a, cap); memcpy(nb, out, off); out = nb;
+            }
+            if (r) out[off++] = ',';
+            memcpy(out + off, qv, ql); off += ql;
+        }
+        out[off] = '\0';
+        return out;
+    }
+    snprintf(errbuf, errsz, "unknown computed param @%s", expr);
+    return NULL;
+}
+
+/* Resolve the effective SQL for a step: load sql_template (or use transform_sql),
+ * then substitute {params}. Returns arena SQL, or NULL. NULL with errbuf[0]==0
+ * means "the step has no SQL" (not an error); NULL with errbuf set is an error. */
+static char *resolve_step_sql(App *app, Arena *a, Pipeline *p, PipelineStep *st,
+                              char *errbuf, size_t errsz) {
+    errbuf[0] = '\0';
+    const char *raw_sql = NULL;
+    if (st->sql_template[0]) {
+        raw_sql = load_sql_template(app, a, st->sql_template, errbuf, errsz);
+        if (!raw_sql) return NULL;
+    } else if (st->transform_sql[0]) {
+        raw_sql = st->transform_sql;
+    } else {
+        return NULL;  /* no SQL — not all step types need it */
+    }
+
+    if (!strchr(raw_sql, '{'))
+        return arena_strdup(a, raw_sql);  /* no placeholders → as-is */
+
+    JVal *params = NULL;
+    if (st->sql_params[0])
+        params = json_parse(a, st->sql_params, strlen(st->sql_params));
+    ComputedCtx cc = { app, p };
+    return sql_substitute_params(a, raw_sql, params, api_computed_param, &cc, errbuf, errsz);
+}
+
 /* ── Run one connector step: pull all batches into target_table ── */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
     char so_path[1024];
@@ -3854,9 +3995,9 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     const DfoConnector *api = connector_api(inst);
     void *ctx = connector_ctx(inst);
 
-    /* Determine entity name: if transform_sql is a table name (no spaces), use it;
+    /* Determine entity name: if the SQL is a table name (no spaces), use it;
      * otherwise pass the full SQL as the filter for the connector to execute */
-    const char *entity = st->transform_sql[0] ? st->transform_sql : "";
+    const char *entity = step_sql(st)[0] ? step_sql(st) : "";
     const char *filter = NULL;
     /* If the SQL contains spaces it's a query, not a bare table name */
     if (strchr(entity, ' ')) { filter = entity; entity = ""; }
@@ -3922,12 +4063,13 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
  * write_batch. The first batch applies sink_mode (append/overwrite); later
  * batches always append. Returns rows written or <0 on error. */
 static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
-    if (!st->transform_sql[0]) {
+    const char *src_sql = step_sql(st);
+    if (!src_sql[0]) {
         snprintf(errbuf, errsz, "sink step %s: transform_sql (SELECT источника) обязателен", st->id);
         return -1;
     }
     /* 1. Materialize the source rows */
-    Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+    Stmt *stmt = sql_parse(a, src_sql, strlen(src_sql));
     if (stmt->error) {
         snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
         return -1;
@@ -4033,8 +4175,9 @@ static int script_step_input_csv(Arena *a, PipelineStep *st, const char *label,
                                  char *errbuf, size_t errsz) {
     char *input_csv = NULL;
     size_t input_len = 0;
-    if (st->transform_sql[0]) {
-        Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+    if (step_sql(st)[0]) {
+        const char *isql = step_sql(st);
+        Stmt *stmt = sql_parse(a, isql, strlen(isql));
         if (!stmt || stmt->error) {
             snprintf(errbuf, errsz, "%s: input SQL parse error: %s",
                      label, stmt && stmt->error ? stmt->error : "null");
@@ -4625,7 +4768,7 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
 
     if (!bk_spec[0]) { snprintf(errbuf, errsz, "scd2 step %s: scd2_business_key is required", st->id); return -1; }
     if (!vf[0] || !vt[0]) { snprintf(errbuf, errsz, "scd2 step %s: effective_from/effective_to cols are required", st->id); return -1; }
-    if (!st->transform_sql[0]) { snprintf(errbuf, errsz, "scd2 step %s: transform_sql (source slice) is required", st->id); return -1; }
+    if (!step_sql(st)[0]) { snprintf(errbuf, errsz, "scd2 step %s: transform_sql (source slice) is required", st->id); return -1; }
     if (!st->target_table[0]) { snprintf(errbuf, errsz, "scd2 step %s: target_table is required", st->id); return -1; }
 
     char *bk_cols[SCD2_MAX_COLS];
@@ -4635,13 +4778,14 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     /* 1. Materialise the source slice into a per-step temp table. */
     char src_tbl[160];
     snprintf(src_tbl, sizeof(src_tbl), "__scd2_src_%s", st->id);
-    Stmt *sstmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+    const char *scd2_sql = step_sql(st);
+    Stmt *sstmt = sql_parse(a, scd2_sql, strlen(scd2_sql));
     if (!sstmt || sstmt->error) {
         snprintf(errbuf, errsz, "scd2 step %s: source SQL parse error: %s", st->id,
                  sstmt && sstmt->error ? sstmt->error : "null");
         return -1;
     }
-    LOG_INFO("scd2 step '%s': source SQL → %s: %s", st->id, src_tbl, st->transform_sql);
+    LOG_INFO("scd2 step '%s': source SQL → %s: %s", st->id, src_tbl, scd2_sql);
     RS *src = exec_stmt(a, sstmt, NULL);
     if (!src) { snprintf(errbuf, errsz, "scd2 step %s: source SQL exec failed", st->id); return -1; }
     write_rs_to_table(app, a, src_tbl, src);
@@ -4882,7 +5026,7 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
  * twice with different rule_name). See docs/MATCH_RULES.md for the JSON format. */
 static int run_match_step(App *app, Arena *a, PipelineStep *st,
                           char *errbuf, size_t errsz) {
-    if (!st->transform_sql[0]) {
+    if (!step_sql(st)[0]) {
         snprintf(errbuf, errsz, "match step %s: transform_sql (candidate set) is required", st->id);
         return -1;
     }
@@ -4896,7 +5040,8 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
     }
 
     /* 1. Materialise the candidate set. */
-    Stmt *sstmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+    const char *cand_sql = step_sql(st);
+    Stmt *sstmt = sql_parse(a, cand_sql, strlen(cand_sql));
     if (!sstmt || sstmt->error) {
         snprintf(errbuf, errsz, "match step %s: SQL parse error: %s",
                  st->id, sstmt && sstmt->error ? sstmt->error : "null");
@@ -5038,10 +5183,27 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
     const char *run_error = NULL;
     int total_retries = 0;
 
+    p->nstep_results = 0;   /* fresh {@step:...} cache for this run */
+
     for (int si = 0; si < p->nsteps; si++) {
         PipelineStep *st = &p->steps[si];
         st->retry_count = 0;
         st->retry_after = 0;
+        st->resolved_sql = NULL;
+
+        /* Resolve sql_template / {param} substitution once, before dispatch.
+         * A deterministic resolve error fails the run immediately (no retries). */
+        char sql_err[256];
+        char *eff_sql = resolve_step_sql(app, a, p, st, sql_err, sizeof(sql_err));
+        if (!eff_sql && sql_err[0]) {
+            snprintf(p->error_msg, sizeof(p->error_msg), "step %s: %s", st->id, sql_err);
+            LOG_ERROR("pipeline %s: %s", p->id, p->error_msg);
+            st->status = STEP_FAILED;
+            p->run_status = RUN_FAILED;
+            run_error = p->error_msg;
+            goto done;
+        }
+        st->resolved_sql = eff_sql;  /* NULL when the step has no SQL */
 
         while (true) {
             st->status = STEP_RUNNING;
@@ -5110,10 +5272,11 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     total_rows += n;
                     st->status = STEP_SUCCESS;
                 }
-            } else if (!st->transform_sql[0]) {
+            } else if (!step_sql(st)[0]) {
                 st->status = STEP_SUCCESS;
             } else {
-                Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+                const char *gsql = step_sql(st);
+                Stmt *stmt = sql_parse(a, gsql, strlen(gsql));
                 if (stmt->error) {
                     st->status = STEP_FAILED;
                     snprintf(p->error_msg, sizeof(p->error_msg), "step[%d] parse: %s", si, stmt->error);
@@ -5123,6 +5286,8 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                         st->status = STEP_FAILED;
                         snprintf(p->error_msg, sizeof(p->error_msg), "step[%d]: execution returned null", si);
                     } else {
+                        /* Cache for {@step:<id>:<col>} references by later steps. */
+                        pipeline_set_step_result(p, st->id, rs);
                         if (st->target_table[0])
                             total_rows += write_rs_to_table(app, a, st->target_table, rs);
                         st->status = STEP_SUCCESS;

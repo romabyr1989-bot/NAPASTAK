@@ -111,7 +111,27 @@ typedef struct {
      * (required); target_table receives the matched pairs with scores. */
     char        match_rules[4096];       /* JSON array, serialized */
     char        match_input_table[128];  /* reserved: table to match against (defaults to candidate set) */
+
+    /* SQL templates (see docs/SQL_TEMPLATES.md). Path to a .sql file under
+     * sql_templates_dir; if set, its content (after {param} substitution) is
+     * the step's SQL, taking precedence over transform_sql. Read at execution
+     * time (edits apply next run, no restart). */
+    char        sql_template[256];
+    /* {placeholder} substitution params: a JSON object string {"k":"v",...}.
+     * Values are literals; @-prefixed names are computed (see resolver). */
+    char        sql_params[2048];
+    /* Run-scoped: effective SQL after template load + substitution. Points into
+     * the run arena; reset each step. NOT serialized. */
+    const char *resolved_sql;
 } PipelineStep;
+
+/* Per-run cache of a step's result set, for {@step:<id>:<col>} resolution.
+ * result_rs is an opaque RS* living in the run arena; the table is cleared at
+ * the start of each run. NOT serialized. */
+typedef struct {
+    char  step_id[64];
+    void *result_rs;
+} StepResultCache;
 
 typedef struct {
     char          id[64];
@@ -137,6 +157,11 @@ typedef struct {
      * field existed. */
     PipelineTrigger triggers[MAX_TRIGGERS];
     int             ntriggers;
+
+    /* Run-scoped step-result cache for {@step:<id>:<col>} params. Reset to 0 at
+     * the start of each run; entries point into the run arena. NOT serialized. */
+    StepResultCache step_results[MAX_STEPS];
+    int             nstep_results;
 } Pipeline;
 
 /* Callback invoked in scheduler thread when a pipeline should run */

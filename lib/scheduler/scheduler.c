@@ -248,6 +248,9 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             copy_jval_str(json_get(s,"connector_config"), st->connector_config, sizeof(st->connector_config), a);
             strncpy(st->transform_sql,   json_str(json_get(s,"transform_sql"),""),   sizeof(st->transform_sql)-1);
             strncpy(st->target_table,    json_str(json_get(s,"target_table"),""),    sizeof(st->target_table)-1);
+            /* SQL templates (optional) */
+            strncpy(st->sql_template,    json_str(json_get(s,"sql_template"),""),    sizeof(st->sql_template)-1);
+            copy_jval_str(json_get(s,"sql_params"), st->sql_params, sizeof(st->sql_params), a);
             /* Python step (optional) */
             strncpy(st->python_code,
                     json_str(json_get(s, "python_code"), ""),
@@ -319,6 +322,8 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
         jb_key(&jb,"connector_config"); jb_str(&jb,st->connector_config);
         jb_key(&jb,"transform_sql");    jb_str(&jb,st->transform_sql);
         jb_key(&jb,"target_table");     jb_str(&jb,st->target_table);
+        if (st->sql_template[0])       { jb_key(&jb,"sql_template");       jb_str(&jb, st->sql_template); }
+        if (st->sql_params[0])         { jb_key(&jb,"sql_params");         jb_str(&jb, st->sql_params); }
         if (st->python_code[0]) {
             jb_key(&jb,"python_code");        jb_str(&jb, st->python_code);
             jb_key(&jb,"python_timeout_sec"); jb_int(&jb, st->python_timeout_sec);

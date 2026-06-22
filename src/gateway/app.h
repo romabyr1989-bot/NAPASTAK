@@ -72,6 +72,10 @@ typedef struct {
      * startup and registers each as a pipeline. Empty = feature off. */
     char         pipelines_dir[512];
 
+    /* Base directory for `sql_template` step paths (see docs/SQL_TEMPLATES.md).
+     * Default "./sql". Templates are read at step execution time. */
+    char         sql_templates_dir[512];
+
     /* Step 3 Week 1: PostgreSQL wire-protocol server (opt-in).
      * Enabled when pgwire_port > 0 in the config. Auth is cleartext —
      * fine for loopback or VPN; future weeks add SCRAM + TLS. */
