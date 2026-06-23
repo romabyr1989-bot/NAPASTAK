@@ -193,6 +193,33 @@ h2 { font-size: 1rem; font-weight: 600; margin: 1.25rem 0 .75rem; color: var(--t
 .btn-primary  { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn-primary:hover { background: var(--accent2); border-color: var(--accent2); }
 .btn-danger   { background: transparent; border-color: var(--red); color: var(--red); }
+
+/* Круглый «+» для добавления следующего шага (FAB) */
+.fab-add {
+  width: 46px; height: 46px;
+  border-radius: 50%;
+  background: var(--accent); color: #fff;
+  border: none; cursor: pointer;
+  font-size: 1.7rem; line-height: 1; font-weight: 400;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 3px 10px rgba(91,110,245,.4);
+  transition: background .15s, transform .1s, box-shadow .15s;
+}
+.fab-add:hover  { background: var(--accent2); transform: scale(1.06); box-shadow: 0 4px 14px rgba(91,110,245,.5); }
+.fab-add:active { transform: scale(.94); }
+
+/* Красный крестик удаления шага */
+.step-del {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: transparent; border: none;
+  color: var(--red); cursor: pointer;
+  font-size: 1.35rem; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s, transform .1s;
+}
+.step-del:hover  { background: rgba(248,113,113,.16); transform: scale(1.12); }
+.step-del:active { transform: scale(.9); }
 .btn-danger:hover  { background: rgba(248,113,113,.1); }
 .btn-sm  { padding: .3rem .6rem; font-size: .75rem; }
 kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; padding: .1rem .3rem; font-family: var(--mono); }
@@ -277,39 +304,66 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 /* ── Pipeline Builder ── */
 /* ── Pipeline builder ── */
 .builder-topbar {
-  display: flex; align-items: center; gap: 1rem;
-  margin-bottom: 1rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: .5rem;
+  margin-bottom: 1.4rem;   /* same gap as the h1 on the Конвейеры page */
 }
 
 /* Settings row below the graph */
-.builder-settings-row {
+/* One settings card holding all rows */
+.builder-settings {
   display: flex;
-  gap: 1rem;
-  align-items: flex-start;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: .7rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1rem 1.25rem;
+  /* full width of the builder container → symmetric left/right margins,
+     aligned with the graph and step cards above/below */
 }
+
+.builder-settings-row {
+  display: flex;
+  gap: .6rem 1rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+/* spacing between sections inside the single card (no divider line) */
+.bsr-sep { padding-top: .7rem; }
 
 .bsr-field {
   display: flex;
   flex-direction: column;
-  gap: .35rem;
-  min-width: 160px;
+  gap: .3rem;
+  flex: 1 1 200px;       /* grow to share the row → less empty space */
+  min-width: 170px;
+  max-width: 460px;      /* …but never a single gigantic input */
 }
+/* inputs/selects fill their field */
+.bsr-field input,
+.bsr-field select { width: 100%; box-sizing: border-box; height: 38px; }
 .bsr-field label {
   font-size: .72rem;
   font-weight: 600;
   letter-spacing: .05em;
   text-transform: uppercase;
   color: var(--muted);
+  white-space: nowrap;   /* keep every label on one line → fields align */
 }
-.bsr-name { flex: 1; min-width: 200px; }
-.bsr-toggle { justify-content: flex-end; align-items: flex-start; }
+/* labels centered over their inputs (Запуск section) */
+.launch-fields .bsr-field label { text-align: center; }
+
+/* grouped DB-connection fields inside a step's connector config */
+.conn-group {
+  padding: .25rem 0 0;
+}
+.conn-group-title {
+  font-size: .72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--muted); margin-bottom: .6rem;
+}
+
+.bsr-name { flex: 2 1 240px; max-width: 680px; }
+.bsr-toggle { flex: 0 0 auto; min-width: 180px; align-items: center; margin-left: auto; align-self: center; }
 
 /* Flow graph */
 .pb-flow-wrap {
@@ -335,19 +389,17 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 .step-card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
   border-radius: var(--radius);
   margin-bottom: .75rem;
   overflow: hidden;
   transition: border-color .15s;
 }
-.step-card:hover { border-color: var(--accent); }
+.step-card:hover { border-color: var(--border); }
 
 .step-header {
   display: flex; align-items: center; gap: .65rem;
   padding: .6rem 1rem;
-  background: var(--surface2);
-  border-bottom: 1px solid var(--border);
+  background: transparent;
 }
 .step-num {
   width: 24px; height: 24px;
@@ -456,13 +508,13 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 .required { color: var(--red); }
 .label-hint { font-size: .75rem; color: var(--muted); text-transform: none; letter-spacing: 0; }
 
-input[type=text], input[type=number], select, textarea {
+input[type=text], input[type=number], input[type=password], select, textarea {
   width: 100%; background: var(--surface2);
   border: 1px solid var(--border); border-radius: var(--radius);
   color: var(--text); font-family: var(--font); font-size: .875rem;
   padding: .5rem .75rem; outline: none; transition: border-color .15s;
 }
-input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus {
+input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, select:focus, textarea:focus {
   border-color: var(--accent);
 }
 select { cursor: pointer; }
@@ -574,7 +626,7 @@ textarea { font-family: var(--mono); resize: vertical; }
 /* ── Runs modal ── */
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal.hidden { display: none; }
-.modal-box { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.75rem; width: min(600px,95vw); max-height: 90vh; overflow-y: auto; }
+.modal-box { background-color: var(--bg); background-image: linear-gradient(var(--surface), var(--surface)); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.75rem; width: min(600px,95vw); max-height: 90vh; overflow-y: auto; }
 .modal-box h2 { margin-bottom: 1rem; }
 .modal-actions { display: flex; gap: .5rem; margin-top: 1rem; justify-content: flex-end; }
 
@@ -693,15 +745,12 @@ h2 {
 .stat-card,
 .query-panel,
 .settings-card,
-.modal-box,
 .help-banner,
 .pipeline-card,
 .builder-topbar {
-  background: var(--surface);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.05);
+  background: transparent;
+  border: none;
+  box-shadow: none;
 }
 
 .stat-grid { gap: .95rem; }

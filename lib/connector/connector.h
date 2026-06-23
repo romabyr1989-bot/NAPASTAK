@@ -3,7 +3,7 @@
 #include "../storage/storage.h"
 #include <stdint.h>
 
-#define DFO_CONNECTOR_ABI_VERSION 2
+#define DFO_CONNECTOR_ABI_VERSION 3
 
 typedef struct {
     const char *entity;  /* table / endpoint name */
@@ -70,6 +70,12 @@ typedef struct {
      * read-only. */
     int (*write_batch)(void *ctx, Arena *a, const char *entity,
                        const Schema *schema, const ColBatch *batch, int mode);
+
+    /* ── Last error (optional, ABI v3) ──
+     * Human-readable reason for the most recent failure (e.g. a libpq connect
+     * error). NULL or empty when there's none. Used by the connection-probe UI
+     * to show why a test failed. May be NULL if the connector doesn't track it. */
+    const char *(*last_error)(void *ctx);
 } DfoConnector;
 
 /* write_batch mode */

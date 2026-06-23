@@ -123,6 +123,10 @@ typedef struct {
     /* Run-scoped: effective SQL after template load + substitution. Points into
      * the run arena; reset each step. NOT serialized. */
     const char *resolved_sql;
+    /* Run-scoped: the table this step writes to — target_table if set, else an
+     * auto-generated hidden "__dfo_*" intermediate. Drives the implicit pipe
+     * ({@prev} = previous step's output_table). NOT serialized. */
+    const char *output_table;
 } PipelineStep;
 
 /* Per-run cache of a step's result set, for {@step:<id>:<col>} resolution.
@@ -145,11 +149,10 @@ typedef struct {
     RunStatus     run_status;
     char          error_msg[512];
 
-    /* NEW: alerting */
+    /* NEW: alerting — edge-triggered (notify only on status change). */
     char          webhook_url[512];  /* Slack/Telegram/custom webhook */
     char          webhook_on[32];    /* "failure", "success", "all" */
-    int           alert_cooldown;    /* seconds between alerts */
-    int64_t       last_alert_at;
+    int           last_run_failed;   /* 0 = healthy baseline, 1 = last finished run failed */
 
     /* NEW: event-driven triggers (Step 4)
      * If empty AND `cron` is set, scheduler treats it as a single CRON

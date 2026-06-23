@@ -3803,31 +3803,29 @@ static int write_rs_to_table(App *app, Arena *a, const char *tname, RS *rs) {
     return total;
 }
 
+/* Edge-triggered alerting: notify only when the run status CHANGES (healthy →
+ * failed, or failed → recovered), so the same alert is never sent repeatedly. */
 static void send_pipeline_alert(Pipeline *p, const char *message, bool success) {
-    if (!p || !p->webhook_url[0]) return;
-    if (p->alert_cooldown > 0 && time(NULL) - p->last_alert_at < p->alert_cooldown) return;
+    if (!p) return;
+    bool now_failed = !success;
+    bool changed = (now_failed != (p->last_run_failed != 0));
+    p->last_run_failed = now_failed ? 1 : 0;   /* remember for the next run's edge check */
 
-    bool should_send = false;
-    if (strcmp(p->webhook_on, "all") == 0) should_send = true;
-    else if (strcmp(p->webhook_on, "success") == 0) should_send = success;
-    else should_send = !success;
-    if (!should_send) return;
+    /* Notify on ANY status change (broke OR recovered); no per-event filter —
+       edge-triggering already prevents repeats, so every change is worth sending. */
+    if (!p->webhook_url[0] || !changed) return;  /* no webhook, or no status change → silent */
 
     char body[1024];
     if (success) {
-        snprintf(body, sizeof(body), "{\"text\":\"Pipeline *%s* succeeded\"}", p->name[0] ? p->name : p->id);
+        snprintf(body, sizeof(body), "{\"text\":\"✅ Конвейер *%s* восстановлен\"}",
+                 p->name[0] ? p->name : p->id);
     } else {
-        snprintf(body, sizeof(body), "{\"text\":\"Pipeline *%s* failed: %s\"}",
-                 p->name[0] ? p->name : p->id,
-                 message ? message : "unknown error");
+        snprintf(body, sizeof(body), "{\"text\":\"❌ Конвейер *%s* сломался: %s\"}",
+                 p->name[0] ? p->name : p->id, message ? message : "неизвестная ошибка");
     }
 
-    bool sent = http_post_json(p->webhook_url, body, 5000) == 0;
-    if (!sent) {
+    if (http_post_json(p->webhook_url, body, 5000) != 0)
         LOG_WARN("alert webhook failed for pipeline %s", p->id);
-    } else {
-        p->last_alert_at = time(NULL);
-    }
 }
 
 /* Map UI/YAML connector_type names to the built .so basename. Most names map
@@ -3846,6 +3844,26 @@ static const char *connector_so_name(const char *conn) {
  * else the inline transform_sql. Never NULL. */
 static const char *step_sql(const PipelineStep *st) {
     return (st->resolved_sql && st->resolved_sql[0]) ? st->resolved_sql : st->transform_sql;
+}
+
+/* The table this step writes to: run-scoped output_table (auto "__dfo_*" when the
+ * user left target_table empty) if set, else the explicit target_table. */
+static const char *step_output(const PipelineStep *st) {
+    return (st->output_table && st->output_table[0]) ? st->output_table : st->target_table;
+}
+
+/* A valid table name (keep [A-Za-z0-9_], drop the rest) from a pipeline name —
+ * used to name the final result table when no target_table is given. */
+static const char *sanitize_table_name(Arena *a, const char *name) {
+    char *out = arena_alloc(a, strlen(name ? name : "") + 1);
+    size_t o = 0;
+    for (const char *p = name ? name : ""; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '_')
+            out[o++] = *p;
+    }
+    out[o] = '\0';
+    return o ? out : "result";
 }
 
 /* Cache a step's RS result for later {@step:<id>:<col>} references. */
@@ -3898,13 +3916,23 @@ static char *load_sql_template(App *app, Arena *a, const char *rel_path,
 }
 
 /* Runtime context for the @computed-param resolver. */
-typedef struct { App *app; Pipeline *p; } ComputedCtx;
+typedef struct { App *app; Pipeline *p; const char *prev_table; } ComputedCtx;
 
-/* SqlComputedFn: resolve @now / @last_run / @step:<id>:<col> to a quoted value. */
+/* SqlComputedFn: resolve @now / @last_run / @step:<id>:<col> / @prev to a value. */
 static char *api_computed_param(void *vctx, Arena *a, const char *expr,
                                 char *errbuf, size_t errsz) {
     ComputedCtx *cc = (ComputedCtx *)vctx;
     Pipeline *p = cc ? cc->p : NULL;
+
+    /* {@prev} / {@input} → previous step's output table name (raw identifier),
+     * the implicit pipe. NULL on the first step (nothing precedes it). */
+    if (!strcmp(expr, "prev") || !strcmp(expr, "input")) {
+        if (!cc || !cc->prev_table || !cc->prev_table[0]) {
+            snprintf(errbuf, errsz, "{@%s}: первый шаг — нет предыдущего вывода", expr);
+            return NULL;
+        }
+        return arena_strdup(a, cc->prev_table);   /* raw table name, unquoted */
+    }
 
     if (!strcmp(expr, "now") || !strcmp(expr, "last_run")) {
         time_t t;
@@ -3958,7 +3986,7 @@ static char *api_computed_param(void *vctx, Arena *a, const char *expr,
  * then substitute {params}. Returns arena SQL, or NULL. NULL with errbuf[0]==0
  * means "the step has no SQL" (not an error); NULL with errbuf set is an error. */
 static char *resolve_step_sql(App *app, Arena *a, Pipeline *p, PipelineStep *st,
-                              char *errbuf, size_t errsz) {
+                              const char *prev_table, char *errbuf, size_t errsz) {
     errbuf[0] = '\0';
     const char *raw_sql = NULL;
     if (st->sql_template[0]) {
@@ -3976,7 +4004,7 @@ static char *resolve_step_sql(App *app, Arena *a, Pipeline *p, PipelineStep *st,
     JVal *params = NULL;
     if (st->sql_params[0])
         params = json_parse(a, st->sql_params, strlen(st->sql_params));
-    ComputedCtx cc = { app, p };
+    ComputedCtx cc = { app, p, prev_table };
     return sql_substitute_params(a, raw_sql, params, api_computed_param, &cc, errbuf, errsz);
 }
 
@@ -3995,11 +4023,21 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     const DfoConnector *api = connector_api(inst);
     void *ctx = connector_ctx(inst);
 
-    /* Determine entity name: if the SQL is a table name (no spaces), use it;
-     * otherwise pass the full SQL as the filter for the connector to execute */
-    const char *entity = step_sql(st)[0] ? step_sql(st) : "";
+    /* Source: prefer the connector config's "query"/"table" (the «Запрос к
+     * источнику»); fall back to the step's transform_sql for older pipelines. */
+    const char *src = step_sql(st);
+    if (st->connector_config[0]) {
+        JVal *cc = json_parse(a, st->connector_config, strlen(st->connector_config));
+        if (cc && cc->type == JV_OBJECT) {
+            const char *q = json_str(json_get(cc, "query"), "");
+            const char *t = json_str(json_get(cc, "table"), "");
+            if (q[0])      src = q;
+            else if (t[0]) src = t;
+        }
+    }
+    /* If the source has spaces it's a query, not a bare table name → pass as filter */
+    const char *entity = src[0] ? src : "";
     const char *filter = NULL;
-    /* If the SQL contains spaces it's a query, not a bare table name */
     if (strchr(entity, ' ')) { filter = entity; entity = ""; }
 
     /* Describe schema to create the target table correctly */
@@ -4035,7 +4073,7 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
                     sc->cols[c].nullable = true;
                 }
             }
-            t = recreate_table(app, a, st->target_table, sc);
+            t = recreate_table(app, a, step_output(st), sc);
             table_created = true;
         }
 
@@ -4050,10 +4088,10 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     }
 
     if (table_created)
-        catalog_update_table_meta(app->catalog, st->target_table, st->connector_type, (int64_t)total_rows);
+        catalog_update_table_meta(app->catalog, step_output(st), st->connector_type, (int64_t)total_rows);
 
     connector_unload(inst);
-    LOG_INFO("connector step '%s' → %s: %d rows", st->connector_type, st->target_table, total_rows);
+    LOG_INFO("connector step '%s' → %s: %d rows", st->connector_type, step_output(st), total_rows);
     return total_rows;
 }
 
@@ -4372,7 +4410,7 @@ static int script_step_ingest_output(App *app, Arena *a, PipelineStep *st,
                                       char *errbuf, size_t errsz) {
     /* Reuse the same code path as POST /api/ingest/csv: parse the CSV
      * ourselves into a Schema+rows and call write_rs_to_table. */
-    if (!st->target_table[0] || out_len == 0) {
+    if (!step_output(st)[0] || out_len == 0) {
         return 0;
     }
     /* Tokenize header line */
@@ -4413,8 +4451,8 @@ static int script_step_ingest_output(App *app, Arena *a, PipelineStep *st,
         cursor = line_end ? line_end + 1 : NULL;
     }
 
-    int rows_written = write_rs_to_table(app, a, st->target_table, rs);
-    LOG_INFO("%s → %s: %d rows", label, st->target_table, rows_written);
+    int rows_written = write_rs_to_table(app, a, step_output(st), rs);
+    LOG_INFO("%s → %s: %d rows", label, step_output(st), rows_written);
     return rows_written;
 }
 
@@ -5034,7 +5072,7 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
         snprintf(errbuf, errsz, "match step %s: match_rules is required", st->id);
         return -1;
     }
-    if (!st->target_table[0]) {
+    if (!step_output(st)[0]) {
         snprintf(errbuf, errsz, "match step %s: target_table is required", st->id);
         return -1;
     }
@@ -5056,7 +5094,7 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
 
     if (cand->nrows == 0) {
         LOG_INFO("match step '%s': empty candidate set", st->id);
-        write_rs_to_table(app, a, st->target_table, out);
+        write_rs_to_table(app, a, step_output(st), out);
         return 0;
     }
 
@@ -5165,8 +5203,8 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
         LOG_INFO("match step '%s' rule '%s': %d pair(s) matched", st->id, rule_name, n_matched);
     }
 
-    write_rs_to_table(app, a, st->target_table, out);
-    LOG_INFO("match step '%s' → %s: %d total matched pairs", st->id, st->target_table, out->nrows);
+    write_rs_to_table(app, a, step_output(st), out);
+    LOG_INFO("match step '%s' → %s: %d total matched pairs", st->id, step_output(st), out->nrows);
     return out->nrows;
 }
 
@@ -5184,6 +5222,7 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
     int total_retries = 0;
 
     p->nstep_results = 0;   /* fresh {@step:...} cache for this run */
+    const char *prev_output = NULL;   /* previous step's output table → {@prev} */
 
     for (int si = 0; si < p->nsteps; si++) {
         PipelineStep *st = &p->steps[si];
@@ -5191,10 +5230,20 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
         st->retry_after = 0;
         st->resolved_sql = NULL;
 
-        /* Resolve sql_template / {param} substitution once, before dispatch.
-         * A deterministic resolve error fails the run immediately (no retries). */
+        /* Implicit pipe: this step writes to target_table if the user named one;
+         * else the LAST step's output is the pipeline's visible result table
+         * (named after the pipeline), and intermediate steps go to hidden
+         * "__dfo_*" tables. {@prev} = previous step's output. */
+        st->output_table = st->target_table[0]
+            ? st->target_table
+            : (si == p->nsteps - 1
+                ? sanitize_table_name(a, p->name[0] ? p->name : p->id)
+                : arena_sprintf(a, "__dfo_%s_s%d", p->id, si));
+
+        /* Resolve sql_template / {param} / {@prev} substitution once, before
+         * dispatch. A deterministic resolve error fails the run immediately. */
         char sql_err[256];
-        char *eff_sql = resolve_step_sql(app, a, p, st, sql_err, sizeof(sql_err));
+        char *eff_sql = resolve_step_sql(app, a, p, st, prev_output, sql_err, sizeof(sql_err));
         if (!eff_sql && sql_err[0]) {
             snprintf(p->error_msg, sizeof(p->error_msg), "step %s: %s", st->id, sql_err);
             LOG_ERROR("pipeline %s: %s", p->id, p->error_msg);
@@ -5288,8 +5337,7 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     } else {
                         /* Cache for {@step:<id>:<col>} references by later steps. */
                         pipeline_set_step_result(p, st->id, rs);
-                        if (st->target_table[0])
-                            total_rows += write_rs_to_table(app, a, st->target_table, rs);
+                        total_rows += write_rs_to_table(app, a, step_output(st), rs);
                         st->status = STEP_SUCCESS;
                     }
                 }
@@ -5298,6 +5346,7 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
             if (st->status == STEP_SUCCESS) {
                 st->retry_count = 0;
                 st->retry_after = 0;
+                prev_output = step_output(st);   /* feed this output to {@prev} of the next step */
                 break;
             }
 
@@ -5387,18 +5436,8 @@ static void h_webhook_trigger(HttpReq *req, HttpResp *resp) {
         http_resp_error(resp, 409, "pipeline already running"); return;
     }
 
-    /* Verify HTTP method matches the configured webhook_method (default POST) */
-    int method_ok = 0;
-    for (int i = 0; i < p->ntriggers; i++) {
-        if (p->triggers[i].type != TRIGGER_WEBHOOK) continue;
-        if (strcmp(p->triggers[i].webhook_token, token) != 0) continue;
-        const char *m = p->triggers[i].webhook_method[0]
-                        ? p->triggers[i].webhook_method : "POST";
-        if (strcasecmp(req->method, m) == 0) method_ok = 1;
-        break;
-    }
-    if (!method_ok) { http_resp_error(resp, 405, "method not allowed"); return; }
-
+    /* The webhook fires on any HTTP method (both GET and POST routes registered);
+       the token is the auth, the verb is irrelevant. */
     g_app.metrics->total_pipelines_run++;
     Arena *ba = arena_create(256);
     app_ws_broadcast(&g_app, arena_sprintf(ba,
@@ -5758,6 +5797,144 @@ static void h_connector_probe_entities(HttpReq *req, HttpResp *resp) {
 
     connector_unload(inst);
     http_resp_json(resp, 200, (char *)jb_done(&jb));
+    arena_destroy(a);
+}
+
+/* POST /api/connector/probe/ping  {"type":"postgresql","config":{...}}
+ * Loads the connector with the config and calls ping(). 200 {"ok":true} on
+ * success, else {"ok":false,"error":...}. Used by the "Подключиться" button. */
+static void h_connector_probe_ping(HttpReq *req, HttpResp *resp) {
+    Arena *a = arena_create(16384);
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
+    const char *type = json_str(json_get(root,"type"), "");
+    if (!type[0]) { http_resp_error(resp,400,"missing type"); arena_destroy(a); return; }
+
+    /* config may be object or string */
+    JVal *cfg_v = json_get(root,"config");
+    const char *cfg_json = "{}";
+    if (cfg_v && cfg_v->type == JV_STRING) {
+        cfg_json = json_str(cfg_v, "{}");
+    } else if (cfg_v && cfg_v->type == JV_OBJECT) {
+        JBuf jb; jb_init(&jb, a, 512); jb_obj_begin(&jb);
+        for (size_t i = 0; i < cfg_v->nkeys; i++) {
+            jb_key(&jb, cfg_v->keys[i]);
+            JVal *vv = cfg_v->vals[i];
+            if (vv->type == JV_STRING)      jb_strn(&jb, vv->s, vv->len);
+            else if (vv->type == JV_NUMBER) jb_double(&jb, vv->n);
+            else if (vv->type == JV_BOOL)   jb_bool(&jb, vv->b);
+            else                            jb_null(&jb);
+        }
+        jb_obj_end(&jb); cfg_json = jb_done(&jb);
+    }
+
+    ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
+    if (!inst) {
+        http_resp_json(resp, 200, "{\"ok\":false,\"error\":\"не удалось загрузить коннектор\"}");
+        arena_destroy(a); return;
+    }
+    const DfoConnector *api = connector_api(inst);
+    void *ctx = connector_ctx(inst);
+    int rc = api->ping ? api->ping(ctx) : -1;
+
+    if (rc == 0) {
+        connector_unload(inst);
+        http_resp_json(resp, 200, "{\"ok\":true}");
+        arena_destroy(a); return;
+    }
+    /* Failure → include a human-readable reason if the connector reports one. */
+    const char *reason = api->last_error ? api->last_error(ctx) : NULL;
+    JBuf jb; jb_init(&jb, a, 256);
+    jb_obj_begin(&jb);
+    jb_key(&jb,"ok"); jb_bool(&jb, false);
+    jb_key(&jb,"error"); jb_str(&jb, (reason && reason[0]) ? reason : "подключение не удалось");
+    jb_obj_end(&jb);
+    char *out = (char *)jb_done(&jb);
+    connector_unload(inst);
+    http_resp_json(resp, 200, out);
+    arena_destroy(a);
+}
+
+/* POST /api/connector/probe/preview  {"type","config","query","limit"}
+ * Reads one batch from the source via the connector and returns it as
+ * {"columns":[...], "rows":[[...]]} — used to preview the source query. */
+static void h_connector_probe_preview(HttpReq *req, HttpResp *resp) {
+    Arena *a = arena_create(1<<20);
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
+    const char *type  = json_str(json_get(root,"type"), "");
+    const char *query = json_str(json_get(root,"query"), "");
+    if (!type[0]) { http_resp_error(resp,400,"missing type"); arena_destroy(a); return; }
+    int limit = (int)json_int(json_get(root,"limit"), 100);
+    if (limit <= 0 || limit > 1000) limit = 100;
+
+    JVal *cfg_v = json_get(root,"config");
+    const char *cfg_json = "{}";
+    if (cfg_v && cfg_v->type == JV_STRING) cfg_json = json_str(cfg_v, "{}");
+    else if (cfg_v && cfg_v->type == JV_OBJECT) {
+        JBuf jb; jb_init(&jb, a, 512); jb_obj_begin(&jb);
+        for (size_t i = 0; i < cfg_v->nkeys; i++) {
+            jb_key(&jb, cfg_v->keys[i]); JVal *vv = cfg_v->vals[i];
+            if (vv->type == JV_STRING)      jb_strn(&jb, vv->s, vv->len);
+            else if (vv->type == JV_NUMBER) jb_double(&jb, vv->n);
+            else if (vv->type == JV_BOOL)   jb_bool(&jb, vv->b);
+            else                            jb_null(&jb);
+        }
+        jb_obj_end(&jb); cfg_json = jb_done(&jb);
+    }
+
+    ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
+    if (!inst) { http_resp_error(resp,500,"connector load failed"); arena_destroy(a); return; }
+    const DfoConnector *api = connector_api(inst);
+    void *ctx = connector_ctx(inst);
+
+    /* Source = query (SQL if it has spaces, else a bare table/entity name). */
+    const char *entity = query[0] ? query : "";
+    const char *filter = NULL;
+    if (strchr(entity, ' ')) { filter = entity; entity = ""; }
+
+    DfoReadReq rr = { .cursor = "0", .limit = limit, .filter = filter };
+    ColBatch *b = NULL;
+    int rc = api->read_batch(ctx, a, &rr, entity, &b);
+    if (rc != 0) {
+        const char *reason = api->last_error ? api->last_error(ctx) : NULL;
+        JBuf jb; jb_init(&jb, a, 256); jb_obj_begin(&jb);
+        jb_key(&jb,"error"); jb_str(&jb, (reason && reason[0]) ? reason : "запрос не выполнен");
+        jb_obj_end(&jb);
+        char *out = (char *)jb_done(&jb);
+        connector_unload(inst); http_resp_json(resp, 200, out); arena_destroy(a); return;
+    }
+
+    JBuf jb; jb_init(&jb, a, 4096);
+    jb_obj_begin(&jb);
+    jb_key(&jb,"columns"); jb_arr_begin(&jb);
+    Schema *sc = b ? b->schema : NULL;
+    int ncols = sc ? sc->ncols : 0, nrows = b ? b->nrows : 0;
+    for (int c = 0; c < ncols; c++) jb_str(&jb, sc->cols[c].name);
+    jb_arr_end(&jb);
+    jb_key(&jb,"rows"); jb_arr_begin(&jb);
+    for (int r = 0; r < nrows; r++) {
+        jb_arr_begin(&jb);
+        for (int c = 0; c < ncols; c++) {
+            const uint8_t *bm = b->null_bitmap[c];
+            if (bm && ((bm[r/8] >> (r%8)) & 1u)) { jb_null(&jb); continue; }
+            switch (sc->cols[c].type) {
+                case COL_INT64:
+                case COL_BOOL:   jb_int(&jb, ((int64_t*)b->values[c])[r]); break;
+                case COL_DOUBLE: jb_double(&jb, ((double*)b->values[c])[r]); break;
+                default: {
+                    char *s = ((char**)b->values[c])[r];
+                    jb_str(&jb, s ? s : "");
+                }
+            }
+        }
+        jb_arr_end(&jb);
+    }
+    jb_arr_end(&jb);
+    jb_obj_end(&jb);
+    char *out = (char *)jb_done(&jb);
+    connector_unload(inst);
+    http_resp_json(resp, 200, out);
     arena_destroy(a);
 }
 
@@ -6153,6 +6330,8 @@ void api_register_routes(Router *r) {
     router_add(r,"POST",  "/api/tables/:name/indexes",  h_index_create);
     router_add(r,"GET",   "/api/tables/:name/indexes",  h_index_list);
     router_add(r,"POST",  "/api/connector/probe/entities", h_connector_probe_entities);
+    router_add(r,"POST",  "/api/connector/probe/ping",     h_connector_probe_ping);
+    router_add(r,"POST",  "/api/connector/probe/preview",  h_connector_probe_preview);
     router_add(r,"POST",  "/api/connector/probe/schema",   h_connector_probe_schema);
     // Auth endpoints
     router_add(r,"POST", "/api/auth/token",    h_auth_token);

@@ -22,7 +22,7 @@
           <label for="login-password" style="display: block; margin-bottom: 0.5rem;">Пароль</label>
           <input id="login-password" type="password" required value="admin" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
         </div>
-        <button type="submit" class="btn btn-primary" style="width: 100%;">Войти</button>
+        <button type="submit" class="btn btn-primary" style="width: 100%; justify-content: center;">Войти</button>
       </form>
     </div>
   </div>
@@ -55,21 +55,11 @@
 
     <!-- ═══ Pipelines list + tables ═══ -->
     <section id="view-pipelines" class="view">
-      <h1>Конвейеры
-        <button class="btn btn-primary btn-sm" onclick="openPipelineBuilder(null)" title="Создать новый конвейер в визуальном редакторе">+ Новый конвейер</button>
-        <button class="btn btn-sm" onclick="openYamlImport()" title="Импортировать YAML-описание конвейера">📄 Импорт YAML</button>
-        <button class="btn btn-sm" onclick="loadPipelinesView()" title="Перезагрузить">↻ Обновить</button>
+      <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
+        <button class="btn btn-primary btn-sm" style="min-width:136px;justify-content:center" onclick="openPipelineBuilder(null)" title="Создать новый конвейер в визуальном редакторе">+ Конвейер</button>
+        <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="openYamlImport()" title="Импортировать YAML-описание конвейера">📄 Импорт YAML</button>
+        <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="loadPipelinesView()" title="Перезагрузить">↻ Обновить</button>
       </h1>
-      <div class="help-banner">
-        <span class="help-banner-icon">💡</span>
-        <div class="help-banner-body">
-          <b>Конвейер</b> — это цепочка шагов, которая выполняется автоматически по расписанию.
-          Каждый шаг может <b>загрузить данные</b> (из CSV, HTTP, БД) и/или <b>трансформировать</b> их через SQL,
-          сохранив результат в таблицу. Нажмите <b>▶ Запустить</b> для ручного старта или
-          настройте cron-расписание для автозапуска.
-        </div>
-        <button class="help-banner-dismiss" onclick="this.closest('.help-banner').style.display='none'" title="Скрыть подсказку">✕</button>
-      </div>
       <div id="pipelines-list"></div>
 
       <!-- Таблицы данных, доступные конвейерам (раньше — отдельный раздел «Таблицы & SQL») -->
@@ -83,102 +73,71 @@
     <!-- ═══ Pipeline Builder ═══ -->
     <section id="view-builder" class="view">
       <div class="builder-topbar">
-        <button class="btn" onclick="switchView('pipelines')">← Конвейеры</button>
-        <h1 id="builder-title" style="margin:0;font-size:1.1rem;font-weight:600">Новый конвейер</h1>
-        <div style="display:flex;gap:.5rem;margin-left:auto">
-          <button class="btn btn-primary" onclick="savePipeline()">Сохранить</button>
-          <button class="btn" onclick="switchView('pipelines')">Отмена</button>
-        </div>
+        <button class="btn btn-sm" style="background:transparent;border:none;box-shadow:none" onclick="clearBuilderDraft();switchView('pipelines')">← Конвейеры</button>
+        <button class="btn btn-primary btn-sm" style="margin-left:auto;min-width:104px;justify-content:center" onclick="savePipeline()">Сохранить</button>
+        <button class="btn btn-sm" style="min-width:104px;justify-content:center" onclick="clearBuilderDraft();switchView('pipelines')">Отмена</button>
       </div>
 
       <!-- Граф последовательности — на всю ширину -->
       <div class="pb-flow-wrap">
         <div id="pb-flow-graph" class="pb-flow-graph"></div>
-        <button class="btn btn-primary btn-sm pb-add-step-btn" onclick="pbAddStep()">+ Добавить шаг</button>
       </div>
 
-      <!-- Настройки — горизонтальная полоска под графом -->
+      <!-- Настройки — единая форма под графом -->
+      <div class="builder-settings">
       <div class="builder-settings-row">
-        <div class="bsr-field bsr-name">
-          <label>Название <span class="required">*</span></label>
-          <input id="pb-name" type="text" placeholder="Мой ETL конвейер">
-        </div>
-        <div class="bsr-field">
-          <label>Расписание</label>
-          <select id="pb-cron-preset" onchange="applyCronPreset(this.value)">
-            <option value="">Только вручную</option>
-            <option value="* * * * *">Каждую минуту</option>
-            <option value="*/5 * * * *">Каждые 5 минут</option>
-            <option value="*/15 * * * *">Каждые 15 минут</option>
-            <option value="*/30 * * * *">Каждые 30 минут</option>
-            <option value="@hourly">Каждый час</option>
-            <option value="0 6 * * *">Каждый день в 6:00</option>
-            <option value="0 9 * * *">Каждый день в 9:00</option>
-            <option value="@daily">Каждый день в полночь</option>
-            <option value="0 9 * * 1-5">По будням в 9:00</option>
-            <option value="@weekly">Каждую неделю</option>
-            <option value="@monthly">Раз в месяц</option>
-          </select>
-        </div>
-        <div class="bsr-field">
-          <label>Cron</label>
-          <input id="pb-cron" type="text" placeholder="*/30 * * * *" oninput="syncCronPreset()">
-          <div id="pb-cron-human" class="cron-human">Без расписания — только вручную</div>
-        </div>
-        <div class="bsr-field bsr-toggle">
-          <label>Автозапуск</label>
-          <label class="toggle">
-            <input id="pb-enabled" type="checkbox" checked>
-            <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            <span class="toggle-label" id="pb-enabled-label">Включён</span>
-          </label>
-        </div>
-      </div>
-
-      <!-- Step 4: event-driven triggers (webhook + file_arrival in addition to cron) -->
-      <div class="builder-settings-row" style="border-top:1px dashed var(--border);padding-top:.6rem">
         <div style="flex:1">
-          <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem">
-            <strong style="font-size:.85rem">Дополнительные триггеры</strong>
-            <span style="font-size:.7rem;color:var(--muted)">помимо cron — webhook URL, появление файла в директории</span>
-            <button class="btn btn-sm" style="margin-left:auto" onclick="pbAddTrigger()">+ Добавить триггер</button>
+          <div style="display:flex;gap:.75rem 1rem;flex-wrap:wrap;align-items:flex-start">
+            <div class="bsr-field bsr-name">
+              <label>Название <span class="required">*</span></label>
+              <input id="pb-name" type="text" placeholder="Мой ETL конвейер">
+            </div>
+            <div class="bsr-field bsr-toggle">
+              <label>Автозапуск</label>
+              <label class="toggle">
+                <input id="pb-enabled" type="checkbox" checked>
+                <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              </label>
+            </div>
           </div>
-          <div id="pb-triggers"></div>
         </div>
       </div>
-      <div class="builder-settings-row">
-        <div class="bsr-field">
-          <label>Макс. попыток retry</label>
-          <input id="pb-max-retries" type="number" min="0" value="3">
-        </div>
-        <div class="bsr-field">
-          <label>Базовый backoff, сек</label>
-          <input id="pb-retry-delay" type="number" min="1" value="30">
-        </div>
-        <div class="bsr-field" style="flex:2">
-          <label>Webhook URL</label>
-          <input id="pb-webhook-url" type="text" placeholder="https://hooks.slack.com/services/...">
-        </div>
-        <div class="bsr-field">
-          <label>Алерт при</label>
-          <select id="pb-webhook-on">
-            <option value="failure">только при ошибке</option>
-            <option value="success">только при успехе</option>
-            <option value="all">всегда</option>
-          </select>
-        </div>
-        <div class="bsr-field">
-          <label>Cooldown, сек</label>
-          <input id="pb-alert-cooldown" type="number" min="0" value="300">
+
+      <!-- Запуск: cron-расписание + событийные триггеры в одной форме -->
+      <div class="builder-settings-row bsr-sep">
+        <div style="flex:1">
+          <div class="launch-fields" style="display:flex;gap:.75rem 1rem;flex-wrap:wrap;align-items:center">
+            <div class="bsr-field" style="flex:0 1 150px;min-width:120px;max-width:150px">
+              <label>Расписание (cron)</label>
+              <input id="pb-cron" type="text" placeholder="*/30 * * * *" oninput="syncCronPreset()">
+            </div>
+            <div class="bsr-field" style="flex:0 0 100px;min-width:100px;max-width:100px">
+              <label>Повторов</label>
+              <input id="pb-max-retries" type="number" min="0" value="3">
+            </div>
+            <div class="bsr-field" style="flex:0 0 100px;min-width:100px;max-width:100px">
+              <label>Пауза, сек</label>
+              <input id="pb-retry-delay" type="number" min="1" value="30">
+            </div>
+            <div class="bsr-field" style="flex:1 1 220px;min-width:200px;max-width:520px">
+              <label>Адрес для уведомлений</label>
+              <input id="pb-webhook-url" type="text" placeholder="https://hooks.slack.com/services/...">
+            </div>
+            <div class="bsr-field" style="flex:0 0 auto;min-width:140px;max-width:140px;margin-left:auto">
+              <label>&nbsp;</label>
+              <button class="btn btn-primary btn-sm" style="justify-content:center" onclick="pbAddTrigger()">+ Добавить триггер</button>
+            </div>
+          </div>
+          <div id="pb-triggers" style="margin-top:.5rem"></div>
         </div>
       </div>
+
+      </div><!-- /.builder-settings -->
 
       <!-- Карточки шагов -->
-      <div id="pb-steps">
-        <div class="empty-state">
-          Шагов пока нет.<br>
-          <button class="btn btn-primary" style="margin-top:.75rem" onclick="pbAddStep()">+ Добавить первый шаг</button>
-        </div>
+      <div id="pb-steps"></div>
+      <div style="display:flex;justify-content:flex-end;margin-top:.25rem">
+        <button class="fab-add" onclick="pbAddStep()" title="Добавить шаг" aria-label="Добавить шаг">+</button>
       </div>
     </section>
 
@@ -640,6 +599,21 @@
     <div class="modal-actions">
       <button class="btn" onclick="document.getElementById('runs-modal').classList.add('hidden')">Закрыть</button>
     </div>
+  </div>
+</div>
+
+<!-- Source data explorer: data table + SQL editor that re-queries the source -->
+<div id="src-data-modal" class="modal hidden" onclick="if(event.target===this)closeSrcDataModal()">
+  <div class="modal-box" style="max-width:1500px;width:96%;padding:1rem 1.25rem">
+    <h2 style="margin:0 0 .6rem;font-size:1rem">Данные источника</h2>
+    <textarea id="sdm-sql" rows="4" spellcheck="false"
+      style="width:100%;font-family:var(--mono);font-size:.82rem;padding:.5rem"
+      placeholder="SELECT * FROM orders WHERE active = true"></textarea>
+    <div style="display:flex;gap:.5rem;align-items:center;margin-top:.6rem;flex-wrap:wrap">
+      <span id="sdm-status" class="query-stat" style="margin-left:0"></span>
+      <button class="btn btn-primary" style="margin-left:auto" onclick="sdmRun()">▶ Выполнить</button>
+    </div>
+    <div id="sdm-result" style="margin-top:.8rem;max-height:60vh;overflow:auto"></div>
   </div>
 </div>
 

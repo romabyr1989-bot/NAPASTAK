@@ -198,8 +198,7 @@ int pipeline_from_json(Pipeline *p, const char *json) {
     p->enabled = json_bool(json_get(root,"enabled"),true);
     strncpy(p->webhook_url, json_str(json_get(root,"webhook_url"),""), sizeof(p->webhook_url)-1);
     strncpy(p->webhook_on,  json_str(json_get(root,"webhook_on"),"failure"), sizeof(p->webhook_on)-1);
-    p->alert_cooldown = (int)json_int(json_get(root,"alert_cooldown"), 300);
-    p->last_alert_at = 0;
+    p->last_run_failed = (int)json_int(json_get(root,"last_run_failed"), 0);
 
     /* Step 4: parse triggers[] if present.
      * Back-compat: when absent, synthesize a single TRIGGER_CRON if `cron`
@@ -308,7 +307,7 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
     jb_key(&jb,"enabled"); jb_bool(&jb,p->enabled);
     jb_key(&jb,"webhook_url");   jb_str(&jb,p->webhook_url);
     jb_key(&jb,"webhook_on");    jb_str(&jb,p->webhook_on);
-    jb_key(&jb,"alert_cooldown"); jb_int(&jb,p->alert_cooldown);
+    jb_key(&jb,"last_run_failed"); jb_int(&jb,p->last_run_failed);
     jb_key(&jb,"last_run");jb_int(&jb,p->last_run);
     jb_key(&jb,"next_run");jb_int(&jb,p->next_run);
     jb_key(&jb,"status");  jb_int(&jb,(int)p->run_status);

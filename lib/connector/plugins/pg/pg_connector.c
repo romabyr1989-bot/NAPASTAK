@@ -25,6 +25,9 @@ typedef struct {
     int     batch_size;
     char    cursor_column[128];  /* if set → incremental high-watermark reads */
     Arena  *arena;
+    char    last_err[512];       /* human-readable reason of the last failure */
+    char    read_mode[16];       /* "full" | "cursor" | "cdc" */
+    char    cdc_slot[128];       /* logical replication slot name (cdc mode) */
 } PgCtx;
 
 /* ── Маппинг pg-типа (строка из information_schema) в ColType ── */
@@ -91,6 +94,8 @@ static void *pg_create(const char *cfg, Arena *a) {
     /* cursor_column: when present, read_batch does incremental high-watermark
      * reads on this column instead of OFFSET paging (see pg_read_batch). */
     cfg_get(cfg, "cursor_column",   ctx->cursor_column, sizeof(ctx->cursor_column), "");
+    cfg_get(cfg, "read_mode",       ctx->read_mode,     sizeof(ctx->read_mode),     "full");
+    cfg_get(cfg, "cdc_slot",        ctx->cdc_slot,      sizeof(ctx->cdc_slot),      "dfo_cdc");
 
     ctx->batch_size = atoi(bsz);
     if (ctx->batch_size <= 0 || ctx->batch_size > BATCH_SIZE)
@@ -107,7 +112,12 @@ static void *pg_create(const char *cfg, Arena *a) {
 
     ctx->conn = PQconnectdb(ctx->dsn);
     if (PQstatus(ctx->conn) != CONNECTION_OK) {
-        LOG_ERROR("pg_connector: connect failed: %s", PQerrorMessage(ctx->conn));
+        const char *em = PQerrorMessage(ctx->conn);
+        LOG_ERROR("pg_connector: connect failed: %s", em);
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", em ? em : "connect failed");
+        /* trim trailing newline libpq appends */
+        size_t L = strlen(ctx->last_err);
+        while (L && (ctx->last_err[L-1] == '\n' || ctx->last_err[L-1] == '\r')) ctx->last_err[--L] = '\0';
         PQfinish(ctx->conn);
         ctx->conn = NULL;
         return ctx; /* return ctx so destroy() can free properly */
@@ -129,6 +139,12 @@ static int pg_ping(void *vctx) {
     int ok = (PQresultStatus(r) == PGRES_TUPLES_OK);
     PQclear(r);
     return ok ? 0 : -1;
+}
+
+/* ── last_error() ── human-readable reason of the last failure (e.g. connect) */
+static const char *pg_last_error(void *vctx) {
+    PgCtx *ctx = vctx;
+    return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
 }
 
 /* ── list_entities(): список таблиц и вьюх в схеме public ── */
@@ -214,6 +230,24 @@ static int64_t parse_pg_ts(const char *s) {
     return 0;
 }
 
+/* CDC: ensure a logical replication slot exists (test_decoding output plugin).
+ * Requires wal_level=logical and a role with REPLICATION. Idempotent. */
+static void pg_cdc_ensure_slot(PgCtx *ctx) {
+    const char *p[1] = { ctx->cdc_slot };
+    PGresult *chk = PQexecParams(ctx->conn,
+        "SELECT 1 FROM pg_replication_slots WHERE slot_name=$1", 1, NULL, p, NULL, NULL, 0);
+    int exists = (PQresultStatus(chk) == PGRES_TUPLES_OK && PQntuples(chk) > 0);
+    PQclear(chk);
+    if (exists) return;
+    PGresult *cr = PQexecParams(ctx->conn,
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')", 1, NULL, p, NULL, NULL, 0);
+    if (PQresultStatus(cr) != PGRES_TUPLES_OK)
+        LOG_WARN("pg cdc: create slot '%s' failed: %s", ctx->cdc_slot, PQerrorMessage(ctx->conn));
+    else
+        LOG_INFO("pg cdc: created logical slot '%s' (test_decoding)", ctx->cdc_slot);
+    PQclear(cr);
+}
+
 /* ── read_batch(): читаем один батч строк из PG ──
  * Два режима, выбор по конфигу:
  *   • OFFSET-пагинация (по умолчанию): cursor — строковое целое смещение.
@@ -244,10 +278,22 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     /* req->filter may carry a full query */
     if (req && req->filter && req->filter[0]) src = req->filter;
 
-    bool incremental = ctx->cursor_column[0] != '\0';
+    bool cdc = (strcasecmp(ctx->read_mode, "cdc") == 0);
+    bool incremental = !cdc && ctx->cursor_column[0] != '\0';
     PGresult *res;
 
-    if (incremental) {
+    if (cdc) {
+        /* Real CDC: drain accumulated WAL changes from a logical slot. Each call
+         * consumes up to `limit` changes (so the read loop empties the slot, and
+         * the next pipeline run picks up only what's new). Columns: lsn,xid,data. */
+        pg_cdc_ensure_slot(ctx);
+        char lim[24]; snprintf(lim, sizeof(lim), "%lld", (long long)limit);
+        const char *params[2] = { ctx->cdc_slot, lim };
+        res = PQexecParams(ctx->conn,
+            "SELECT lsn::text AS lsn, xid::text AS xid, data "
+            "FROM pg_logical_slot_get_changes($1, NULL, $2::int)",
+            2, NULL, params, NULL, NULL, 0);
+    } else if (incremental) {
         /* High-watermark read on cursor_column. */
         const char *cc = ctx->cursor_column;
         char base[PG_MAX_SQL];
@@ -496,4 +542,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_stop      = NULL,
     .ping          = pg_ping,
     .write_batch   = pg_write_batch,
+    .last_error    = pg_last_error,
 };

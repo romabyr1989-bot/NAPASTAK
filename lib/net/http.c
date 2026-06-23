@@ -202,6 +202,7 @@ static void send_response(int fd, HttpResp *resp) {
             "Content-Type: %s\r\n"
             "Content-Length: %zu\r\n"
             "Access-Control-Allow-Origin: *\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Connection: keep-alive\r\n"
             "X-Correlation-Id: %s\r\n"
             "\r\n",
@@ -213,6 +214,7 @@ static void send_response(int fd, HttpResp *resp) {
             "Content-Type: %s\r\n"
             "Content-Length: %zu\r\n"
             "Access-Control-Allow-Origin: *\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Connection: keep-alive\r\n"
             "\r\n",
             resp->status, http_status_text(resp->status), ct, resp->body_len);
