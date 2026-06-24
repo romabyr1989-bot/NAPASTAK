@@ -43,6 +43,7 @@ typedef struct {
     char    cursor_column[128];   /* if set → incremental high-watermark reads */
     int     gp_major;             /* Greenplum major (5/6/7); 0 = unknown */
     Arena  *arena;
+    char    last_err[512];        /* human-readable reason of the last failure */
 } GpCtx;
 
 /* ── Маппинг GP/PG-типа (typname из pg_type) в ColType ──
@@ -151,7 +152,12 @@ static void *gp_create(const char *cfg, Arena *a) {
 
     ctx->conn = PQconnectdb(ctx->dsn);
     if (PQstatus(ctx->conn) != CONNECTION_OK) {
-        LOG_ERROR("gp_connector: connect failed: %s", PQerrorMessage(ctx->conn));
+        const char *em = PQerrorMessage(ctx->conn);
+        LOG_ERROR("gp_connector: connect failed: %s", em);
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", em ? em : "connection failed");
+        size_t L = strlen(ctx->last_err);
+        while (L > 0 && (ctx->last_err[L-1] == '\n' || ctx->last_err[L-1] == '\r'))
+            ctx->last_err[--L] = '\0';
         PQfinish(ctx->conn);
         ctx->conn = NULL;
         return ctx;
@@ -180,6 +186,8 @@ static void *gp_create(const char *cfg, Arena *a) {
             if (!strstr(vs, "Greenplum")) {
                 LOG_ERROR("gp_connector: server is not Greenplum (version: %s) — "
                           "use connector_type=postgresql for plain PG", vs);
+                snprintf(ctx->last_err, sizeof(ctx->last_err),
+                         "сервер не является Greenplum — используйте коннектор PostgreSQL");
                 PQclear(r);
                 PQfinish(ctx->conn);
                 ctx->conn = NULL;
@@ -214,6 +222,12 @@ static int gp_ping(void *vctx) {
     int ok = (PQresultStatus(r) == PGRES_TUPLES_OK);
     PQclear(r);
     return ok ? 0 : -1;
+}
+
+/* ── last_error(): human-readable reason of the last failure (ABI v3) ── */
+static const char *gp_last_error(void *vctx) {
+    GpCtx *ctx = vctx;
+    return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
 }
 
 /* ── list_entities(): таблицы и вьюхи схемы через pg_catalog ──
@@ -443,6 +457,92 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     return 0;
 }
 
+/* ── write_batch(): выгрузка строк в таблицу GP (sink, как у pg) ── */
+#define GP_INS_CHUNK 250
+static int gp_exec_ok(PGconn *c, const char *sql) {
+    PGresult *r = PQexec(c, sql);
+    int ok = (PQresultStatus(r) == PGRES_COMMAND_OK || PQresultStatus(r) == PGRES_TUPLES_OK);
+    if (!ok) LOG_ERROR("gp sink: %s — %s", sql, PQerrorMessage(c));
+    PQclear(r);
+    return ok ? 0 : -1;
+}
+
+static int gp_write_batch(void *vctx, Arena *a, const char *entity,
+                          const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a;
+    GpCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) { LOG_ERROR("gp sink: no connection"); return -1; }
+    if (!entity || !entity[0]) { LOG_ERROR("gp sink: empty target table"); return -1; }
+    int ncols = batch->ncols;
+
+    char *eident = PQescapeIdentifier(ctx->conn, entity, strlen(entity));
+    if (!eident) return -1;
+
+    /* CREATE TABLE IF NOT EXISTS <entity> (col TEXT, ...) */
+    {
+        size_t cap = 64 + (size_t)ncols * 80; char *ddl = malloc(cap); size_t off = 0;
+        off += (size_t)snprintf(ddl+off, cap-off, "CREATE TABLE IF NOT EXISTS %s (", eident);
+        for (int c = 0; c < ncols; c++) {
+            char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
+            off += (size_t)snprintf(ddl+off, cap-off, "%s%s TEXT", c?", ":"", col ? col : "\"col\"");
+            if (col) PQfreemem(col);
+        }
+        snprintf(ddl+off, cap-off, ")");
+        int rc = gp_exec_ok(ctx->conn, ddl); free(ddl);
+        if (rc < 0) { PQfreemem(eident); return -1; }
+    }
+    if (mode == DFO_SINK_OVERWRITE) {
+        char trunc[512]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE %s", eident);
+        if (gp_exec_ok(ctx->conn, trunc) < 0) { PQfreemem(eident); return -1; }
+    }
+
+    char collist[4096]; size_t co = 0; collist[0] = '\0';
+    co += (size_t)snprintf(collist+co, sizeof(collist)-co, "(");
+    for (int c = 0; c < ncols; c++) {
+        char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
+        co += (size_t)snprintf(collist+co, sizeof(collist)-co, "%s%s", c?", ":"", col ? col : "\"col\"");
+        if (col) PQfreemem(col);
+    }
+    snprintf(collist+co, sizeof(collist)-co, ")");
+
+    int written = 0;
+    for (int start = 0; start < batch->nrows; start += GP_INS_CHUNK) {
+        int end = start + GP_INS_CHUNK; if (end > batch->nrows) end = batch->nrows;
+        size_t cap = 4096; char *sql = malloc(cap); size_t off = 0;
+        #define GP_APP(...) do { \
+            int need = snprintf(NULL,0,__VA_ARGS__); \
+            if (off + (size_t)need + 1 > cap) { while (off+(size_t)need+1>cap) cap*=2; sql=realloc(sql,cap);} \
+            off += (size_t)snprintf(sql+off, cap-off, __VA_ARGS__); } while(0)
+        GP_APP("INSERT INTO %s %s VALUES ", eident, collist);
+        for (int r = start; r < end; r++) {
+            GP_APP("%s(", r>start?", ":"");
+            for (int c = 0; c < ncols; c++) {
+                const uint8_t *bm = batch->null_bitmap[c];
+                int isnull = (bm && ((bm[r/8] >> (r%8)) & 1u));
+                if (isnull) { GP_APP("%sNULL", c?", ":""); continue; }
+                char numbuf[64]; const char *v;
+                switch (schema->cols[c].type) {
+                    case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
+                    case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
+                    default:         v = ((char**)batch->values[c])[r]; if(!v) v=""; break;
+                }
+                char *lit = PQescapeLiteral(ctx->conn, v, strlen(v));
+                GP_APP("%s%s", c?", ":"", lit ? lit : "''");
+                if (lit) PQfreemem(lit);
+            }
+            GP_APP(")");
+        }
+        #undef GP_APP
+        int rc = gp_exec_ok(ctx->conn, sql); free(sql);
+        if (rc < 0) { PQfreemem(eident); return -1; }
+        written += (end - start);
+    }
+    PQfreemem(eident);
+    LOG_INFO("gp sink: %d rows → %s (%s)", written, entity,
+             mode==DFO_SINK_OVERWRITE?"overwrite":"append");
+    return written;
+}
+
 const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "greenplum",
@@ -460,6 +560,6 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start     = NULL,
     .cdc_stop      = NULL,
     .ping          = gp_ping,
-    /* Read-only source connector — no sink. */
-    .write_batch   = NULL,
+    .write_batch   = gp_write_batch,
+    .last_error    = gp_last_error,
 };

@@ -60,9 +60,7 @@ CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
 PG_PLUGIN      = $(LIBDIR)/pg_connector.so
 PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
 JSONHTTP_PLUGIN= $(LIBDIR)/json_http_connector.so
-S3_PLUGIN      = $(LIBDIR)/s3_connector.so
 KAFKA_PLUGIN   = $(LIBDIR)/kafka_connector.so
-AIRBYTE_PLUGIN = $(LIBDIR)/airbyte_connector.so
 GP_PLUGIN      = $(LIBDIR)/gp_connector.so
 ORACLE_PLUGIN  = $(LIBDIR)/oracle_connector.so
 
@@ -115,7 +113,7 @@ endif
         test-integration test-sql test-all bench flight gp oracle
 
 # Base targets always built
-_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN) $(AIRBYTE_PLUGIN)
+_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
 ifeq ($(HAS_PQ),yes)
   _ALL_TARGETS += $(PG_PLUGIN) $(GP_PLUGIN)   # Greenplum reuses libpq
 endif
@@ -149,9 +147,7 @@ dirs:
 	           $(OUTDIR)/lib/auth $(OUTDIR)/lib/matview $(OUTDIR)/lib/cluster \
 	           $(OUTDIR)/lib/yaml $(OUTDIR)/lib/pgwire \
 	           $(OUTDIR)/src/gateway $(OUTDIR)/src/storage_node $(OUTDIR)/src/mcp_server \
-	           $(OUTDIR)/lib/connector/plugins/s3 \
-	           $(OUTDIR)/lib/connector/plugins/kafka \
-	           $(OUTDIR)/lib/connector/plugins/airbyte
+	           $(OUTDIR)/lib/connector/plugins/kafka
 
 # compile rule
 $(OUTDIR)/%.o: %.c
@@ -221,17 +217,6 @@ $(JSONHTTP_PLUGIN): lib/connector/plugins/json_http/json_http_connector.c \
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
-# S3 / MinIO connector (requires libcurl + libcrypto)
-$(S3_PLUGIN): lib/connector/plugins/s3/s3_connector.c \
-              lib/connector/plugins/s3/aws_sig4.c \
-              $(OUTDIR)/lib/core/arena.o \
-              $(OUTDIR)/lib/storage/storage.o \
-              $(OUTDIR)/lib/core/log.o \
-              $(OUTDIR)/lib/core/json.o
-	@echo "  SO  $@"
-	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl -lcrypto \
-	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
-
 # Kafka connector (requires librdkafka; libcurl for Schema Registry — Avro)
 $(KAFKA_PLUGIN): lib/connector/plugins/kafka/kafka_connector.c \
                  lib/connector/plugins/kafka/avro_decode.h \
@@ -263,17 +248,6 @@ $(ORACLE_PLUGIN): lib/connector/plugins/oracle/oracle_connector.c \
                   $(OUTDIR)/lib/core/log.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) $(ORACLECFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(ORACLELDFLAGS) \
-	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
-
-# Airbyte runner — universal connector that shells out to docker/podman
-# Runs any whitelisted airbyte/source-* image. No external deps beyond core.
-$(AIRBYTE_PLUGIN): lib/connector/plugins/airbyte/airbyte_runner.c \
-                   $(OUTDIR)/lib/core/arena.o \
-                   $(OUTDIR)/lib/storage/storage.o \
-                   $(OUTDIR)/lib/core/log.o \
-                   $(OUTDIR)/lib/core/json.o
-	@echo "  SO  $@"
-	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # ── Unit tests ──

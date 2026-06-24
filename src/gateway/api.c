@@ -4056,7 +4056,9 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     for (;;) {
         DfoReadReq req = { .cursor = cursor_buf, .limit = BATCH_SIZE, .filter = filter };
         ColBatch *batch = NULL;
-        if (api->read_batch(ctx, a, &req, entity, &batch) != 0 || !batch || batch->nrows == 0)
+        /* rc: <0 = error; 0 = ok (more pages); 1 = ok, last/only page. */
+        int rc = api->read_batch(ctx, a, &req, entity, &batch);
+        if (rc < 0 || !batch || batch->nrows == 0)
             break;
 
         /* Create the table on first non-empty batch */
@@ -4083,8 +4085,8 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
         /* Advance cursor */
         snprintf(cursor_buf, sizeof(cursor_buf), "%d", total_rows);
 
-        /* If batch was smaller than requested, we're done */
-        if (batch->nrows < BATCH_SIZE) break;
+        /* rc==1 = last/only page; a short batch also signals the end. */
+        if (rc == 1 || batch->nrows < BATCH_SIZE) break;
     }
 
     if (table_created)
@@ -5896,7 +5898,9 @@ static void h_connector_probe_preview(HttpReq *req, HttpResp *resp) {
     DfoReadReq rr = { .cursor = "0", .limit = limit, .filter = filter };
     ColBatch *b = NULL;
     int rc = api->read_batch(ctx, a, &rr, entity, &b);
-    if (rc != 0) {
+    /* rc: <0 = error; 0 = ok (more pages); 1 = ok, last/only page (data present).
+       Only a negative code is a real failure — 1 still carries a valid batch. */
+    if (rc < 0) {
         const char *reason = api->last_error ? api->last_error(ctx) : NULL;
         JBuf jb; jb_init(&jb, a, 256); jb_obj_begin(&jb);
         jb_key(&jb,"error"); jb_str(&jb, (reason && reason[0]) ? reason : "запрос не выполнен");

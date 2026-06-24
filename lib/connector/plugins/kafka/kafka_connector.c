@@ -8,6 +8,7 @@
 #include <curl/curl.h>
 #include <pthread.h>
 #include <string.h>
+#include <time.h>
 #include <strings.h>   /* strcasecmp */
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -35,6 +36,14 @@ typedef struct {
     char  group_id[128];
     char  topic_name[128];
     char  data_format[16];   /* "json" | "csv" | "avro" */
+
+    /* Security (managed Kafka: Confluent Cloud / MSK / Aiven need SASL_SSL) */
+    char  security_protocol[32];  /* PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL */
+    char  sasl_mechanism[32];     /* PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512 */
+    char  sasl_username[256];
+    char  sasl_password[256];
+    char  offset_reset[16];       /* earliest | latest (default earliest) */
+    char  last_err[512];          /* human-readable reason of the last failure */
 
     /* Avro / Schema Registry (data_format == "avro") */
     char  schema_registry_url[512];  /* e.g. "http://registry:8081" */
@@ -75,27 +84,45 @@ static void cfg_str(const char *cfg, const char *key, char *dst, size_t dstsz)
 
 /* ── Kafka rdkafka helpers ── */
 
-static rd_kafka_t *make_consumer(const char *brokers, const char *group_id,
-                                  char *errstr, size_t errlen)
+/* Apply SASL/SSL security settings to a conf (consumer or producer). Each key
+ * is set only when non-empty, so plaintext clusters keep working unchanged.
+ * Managed Kafka (Confluent Cloud / MSK / Aiven) typically needs:
+ *   security.protocol=SASL_SSL, sasl.mechanism=PLAIN, sasl.username/password. */
+static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
+                                 char *errstr, size_t errlen)
+{
+    if (ctx->security_protocol[0])
+        rd_kafka_conf_set(conf, "security.protocol", ctx->security_protocol, errstr, errlen);
+    if (ctx->sasl_mechanism[0])
+        rd_kafka_conf_set(conf, "sasl.mechanism", ctx->sasl_mechanism, errstr, errlen);
+    if (ctx->sasl_username[0])
+        rd_kafka_conf_set(conf, "sasl.username", ctx->sasl_username, errstr, errlen);
+    if (ctx->sasl_password[0])
+        rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
+}
+
+static rd_kafka_t *make_consumer(const KafkaCtx *ctx, char *errstr, size_t errlen)
 {
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
 
-    if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers,
+    if (rd_kafka_conf_set(conf, "bootstrap.servers", ctx->brokers,
                           errstr, errlen) != RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
         return NULL;
     }
-    if (rd_kafka_conf_set(conf, "group.id", group_id,
+    if (rd_kafka_conf_set(conf, "group.id", ctx->group_id,
                           errstr, errlen) != RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
         return NULL;
     }
-    /* Start from earliest unconsumed offset */
-    if (rd_kafka_conf_set(conf, "auto.offset.reset", "earliest",
+    /* Where to start when no committed offset: earliest (default) | latest. */
+    const char *off = ctx->offset_reset[0] ? ctx->offset_reset : "earliest";
+    if (rd_kafka_conf_set(conf, "auto.offset.reset", off,
                           errstr, errlen) != RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
         return NULL;
     }
+    kafka_apply_security(conf, ctx, errstr, errlen);
 
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, errlen);
     if (!rk) return NULL;
@@ -449,6 +476,12 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"data_format\"", ctx->data_format, sizeof(ctx->data_format));
         cfg_str(config_json, "\"schema_registry_url\"",  ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
         cfg_str(config_json, "\"schema_registry_auth\"", ctx->sr_auth,             sizeof(ctx->sr_auth));
+        /* security (optional — empty keeps plaintext) */
+        cfg_str(config_json, "\"security_protocol\"", ctx->security_protocol, sizeof(ctx->security_protocol));
+        cfg_str(config_json, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
+        cfg_str(config_json, "\"sasl_username\"",     ctx->sasl_username,     sizeof(ctx->sasl_username));
+        cfg_str(config_json, "\"sasl_password\"",     ctx->sasl_password,     sizeof(ctx->sasl_password));
+        cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
     }
 
     if (strcasecmp(ctx->data_format, "avro") == 0 && !ctx->schema_registry_url[0])
@@ -456,9 +489,10 @@ static void *kafka_create(const char *config_json, Arena *arena)
                   "(messages will fall back to raw)");
 
     char errstr[512];
-    ctx->rk = make_consumer(ctx->brokers, ctx->group_id, errstr, sizeof(errstr));
+    ctx->rk = make_consumer(ctx, errstr, sizeof(errstr));
     if (!ctx->rk) {
         LOG_ERROR("kafka: failed to create consumer: %s", errstr);
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", errstr[0] ? errstr : "consumer init failed");
         return ctx;
     }
 
@@ -608,20 +642,32 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     ColBatch **msgs     = arena_alloc(a, limit * sizeof(ColBatch *));
     int        msg_count = 0;
 
-    int64_t deadline_ms = 1000; /* 1 second total timeout */
-    int64_t elapsed_ms  = 0;
+    /* Measure REAL wall-clock time, not a poll counter: rd_kafka_consumer_poll()
+     * returns immediately while the consumer-group is still being assigned its
+     * partitions (cold-start rebalance), so a "+100ms per poll" counter races to
+     * the deadline in milliseconds and the read returns 0 rows before any message
+     * arrives. We give the coordinator up to `deadline_ms` of real time, but once
+     * we've received at least one message we stop as soon as the topic drains. */
+    const int64_t deadline_ms = 10000;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    bool got_any = false;
 
-    while (msg_count < (int)limit && elapsed_ms < deadline_ms) {
-        rd_kafka_message_t *msg = rd_kafka_consumer_poll(ctx->rk, 100 /*ms*/);
-        elapsed_ms += 100;
+    while (msg_count < (int)limit) {
+        struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+        int64_t elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000
+                           + (tn.tv_nsec - t0.tv_nsec) / 1000000;
+        if (elapsed_ms >= deadline_ms) break;
 
-        if (!msg) continue;
+        rd_kafka_message_t *msg = rd_kafka_consumer_poll(ctx->rk, 500 /*ms*/);
+        if (!msg) { if (got_any) break; else continue; }  /* drained after first msg */
         if (msg->err) {
             if (msg->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
                 LOG_WARN("kafka: poll error: %s", rd_kafka_message_errstr(msg));
             rd_kafka_message_destroy(msg);
+            if (got_any) break;   /* EOF after reading messages → done */
             continue;
         }
+        got_any = true;
 
         const char *payload = (const char *)msg->payload;
         size_t      plen    = msg->len;
@@ -753,11 +799,19 @@ static int kafka_ping(void *vctx)
                                                  NULL, &meta, 3000 /*ms*/);
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
         LOG_WARN("kafka: ping failed: %s", rd_kafka_err2str(err));
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", rd_kafka_err2str(err));
         return -1;
     }
     rd_kafka_metadata_destroy(meta);
     LOG_INFO("kafka: ping OK, brokers=%s", ctx->brokers);
     return 0;
+}
+
+/* ── last_error(): human-readable reason of the last failure (ABI v3) ── */
+static const char *kafka_last_error(void *vctx)
+{
+    KafkaCtx *ctx = (KafkaCtx *)vctx;
+    return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
 }
 
 /* ── Sink: produce one JSON message per row to a topic ──
@@ -796,6 +850,7 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
     if (rd_kafka_conf_set(conf, "bootstrap.servers", ctx->brokers, errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
         LOG_ERROR("kafka sink: conf: %s", errstr); rd_kafka_conf_destroy(conf); return -1;
     }
+    kafka_apply_security(conf, ctx, errstr, sizeof(errstr));
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (!rk) { LOG_ERROR("kafka sink: producer: %s", errstr); return -1; }
     rd_kafka_topic_t *rkt = rd_kafka_topic_new(rk, topic, NULL);
@@ -862,4 +917,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_stop      = kafka_cdc_stop,
     .ping          = kafka_ping,
     .write_batch   = kafka_write_batch,
+    .last_error    = kafka_last_error,
 };

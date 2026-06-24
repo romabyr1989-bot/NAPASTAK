@@ -41,6 +41,7 @@
 /* Единый ODPI-C контекст на процесс — создаётся один раз (pthread_once). */
 static dpiContext  *gContext = NULL;
 static int          gContextOk = 0;
+static char         gInitErr[512] = "";   /* real ODPI-C init error (e.g. DPI-1047) */
 static pthread_once_t gOnce = PTHREAD_ONCE_INIT;
 
 static void ora_context_init(void) {
@@ -51,6 +52,7 @@ static void ora_context_init(void) {
     } else {
         LOG_ERROR("oracle: dpiContext init failed: %.*s",
                   err.messageLength, err.message);
+        snprintf(gInitErr, sizeof(gInitErr), "%.*s", err.messageLength, err.message);
         gContextOk = 0;
     }
 }
@@ -63,6 +65,7 @@ typedef struct {
     int      batch_size;
     int      ora_major;           /* 11/12/19/21/23 */
     Arena   *arena;
+    char     last_err[512];       /* human-readable reason of the last failure */
 } OraCtx;
 
 /* ── Ручной парсер JSON-поля (копия из pg_connector.c). ── */
@@ -194,6 +197,9 @@ static void *ora_create(const char *cfg, Arena *a) {
 
     if (!gContextOk) {
         LOG_ERROR("oracle: ODPI-C context unavailable — cannot connect");
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s",
+                 gInitErr[0] ? gInitErr
+                             : "Oracle Instant Client недоступен (ODPI-C не инициализирован)");
         return ctx;   /* conn == NULL */
     }
 
@@ -207,6 +213,15 @@ static void *ora_create(const char *cfg, Arena *a) {
                        connstr, (uint32_t)strlen(connstr),
                        NULL, NULL, &ctx->conn) != DPI_SUCCESS) {
         ora_log_err("connect");
+        if (gContextOk) {
+            dpiErrorInfo err;
+            dpiContext_getError(gContext, &err);
+            snprintf(ctx->last_err, sizeof(ctx->last_err), "%.*s",
+                     err.messageLength, err.message);
+            size_t L = strlen(ctx->last_err);
+            while (L > 0 && (ctx->last_err[L-1] == '\n' || ctx->last_err[L-1] == '\r'))
+                ctx->last_err[--L] = '\0';
+        }
         ctx->conn = NULL;
         return ctx;
     }
@@ -227,6 +242,9 @@ static void *ora_create(const char *cfg, Arena *a) {
         "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'",
         "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3'",
         "ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'",
+        /* фикс десятичного разделителя '.' — NUMBER читаем как VARCHAR (см.
+         * read_batch), и текст не должен зависеть от локали сессии. */
+        "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'",
         NULL
     };
     for (int i = 0; nls_stmts[i]; i++)
@@ -246,6 +264,12 @@ static int ora_ping(void *vctx) {
     OraCtx *ctx = vctx;
     if (!ctx || !ctx->conn) return -1;
     return (dpiConn_ping(ctx->conn) == DPI_SUCCESS) ? 0 : -1;
+}
+
+/* ── last_error(): human-readable reason of the last failure (ABI v3) ── */
+static const char *ora_last_error(void *vctx) {
+    OraCtx *ctx = vctx;
+    return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
 }
 
 /* Прочитать одну колонку текущей строки как строку (в арену). nativeType из
@@ -544,6 +568,12 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         memcpy(nm, qi.name, nlen); nm[nlen] = '\0';
         if (!strcasecmp(nm, "DFO__RN")) { raw_to_out[c] = -1; continue; }   /* служебная */
         otype[ncols_out] = qi.typeInfo.oracleTypeNum;
+        /* NUMBER читаем нативной строкой (Oracle конвертит → точный десятичный
+         * текст), а не через double — иначе 540.20 превращается в
+         * 540.20000000000005 и теряется точность для NUMBER > 2^53. */
+        if (qi.typeInfo.oracleTypeNum == DPI_ORACLE_TYPE_NUMBER)
+            dpiStmt_defineValue(st, (uint32_t)(c+1), DPI_ORACLE_TYPE_VARCHAR,
+                                DPI_NATIVE_TYPE_BYTES, 128, 0, NULL);
         /* cursor bookmark column (сравнение без регистра) */
         if (incremental && !strcasecmp(nm, cc)) cursor_out_idx = ncols_out;
         str_lower(nm);
@@ -596,6 +626,93 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     return 0;
 }
 
+/* ── write_batch(): выгрузка строк в таблицу Oracle (sink) ── */
+#define ORA_INS_CHUNK 100
+static int ora_exec_chk(dpiConn *conn, const char *sql) {
+    dpiStmt *st;
+    if (dpiConn_prepareStmt(conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
+        ora_log_err("sink prepare"); return -1;
+    }
+    uint32_t cols;
+    int rc = dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &cols);
+    if (rc != DPI_SUCCESS) ora_log_err("sink execute");
+    dpiStmt_release(st);
+    return rc == DPI_SUCCESS ? 0 : -1;
+}
+
+static int ora_write_batch(void *vctx, Arena *a, const char *entity,
+                           const Schema *schema, const ColBatch *batch, int mode) {
+    (void)a;
+    OraCtx *ctx = vctx;
+    if (!ctx || !ctx->conn) { LOG_ERROR("oracle sink: no connection"); return -1; }
+    if (!entity || !entity[0]) { LOG_ERROR("oracle sink: empty target table"); return -1; }
+    int ncols = batch->ncols;
+
+    /* CREATE TABLE IF NOT EXISTS через PL/SQL (в Oracle нет IF NOT EXISTS). */
+    {
+        size_t cap = 256 + (size_t)ncols * 80; char *cols = malloc(cap); size_t off = 0;
+        for (int c = 0; c < ncols; c++)
+            off += (size_t)snprintf(cols+off, cap-off, "%s\"%s\" VARCHAR2(4000)", c?", ":"", schema->cols[c].name);
+        size_t dcap = cap + 600; char *ddl = malloc(dcap);
+        snprintf(ddl, dcap,
+            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE \"%s\" (%s)'; "
+            "EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
+            entity, cols);
+        int rc = ora_exec_chk(ctx->conn, ddl); free(cols); free(ddl);
+        if (rc < 0) return -1;
+    }
+    if (mode == DFO_SINK_OVERWRITE) {
+        char trunc[600]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE \"%s\"", entity);
+        ora_exec_chk(ctx->conn, trunc);
+    }
+
+    char collist[4096]; size_t co = 0;
+    co += (size_t)snprintf(collist+co, sizeof(collist)-co, "(");
+    for (int c = 0; c < ncols; c++)
+        co += (size_t)snprintf(collist+co, sizeof(collist)-co, "%s\"%s\"", c?", ":"", schema->cols[c].name);
+    snprintf(collist+co, sizeof(collist)-co, ")");
+
+    int written = 0;
+    for (int start = 0; start < batch->nrows; start += ORA_INS_CHUNK) {
+        int end = start + ORA_INS_CHUNK; if (end > batch->nrows) end = batch->nrows;
+        size_t cap = 4096; char *sql = malloc(cap); size_t off = 0;
+        #define ORA_APP(...) do { \
+            int need = snprintf(NULL,0,__VA_ARGS__); \
+            if (off + (size_t)need + 1 > cap) { while (off+(size_t)need+1>cap) cap*=2; sql=realloc(sql,cap);} \
+            off += (size_t)snprintf(sql+off, cap-off, __VA_ARGS__); } while(0)
+        ORA_APP("INSERT ALL ");   /* Oracle multi-row: INSERT ALL ... SELECT 1 FROM dual */
+        for (int r = start; r < end; r++) {
+            ORA_APP("INTO \"%s\" %s VALUES (", entity, collist);
+            for (int c = 0; c < ncols; c++) {
+                const uint8_t *bm = batch->null_bitmap[c];
+                if (bm && ((bm[r/8] >> (r%8)) & 1u)) { ORA_APP("%sNULL", c?", ":""); continue; }
+                char numbuf[64];
+                switch (schema->cols[c].type) {
+                    case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]);
+                                     ORA_APP("%s%s", c?", ":"", numbuf); continue;
+                    case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]);
+                                     ORA_APP("%s%s", c?", ":"", numbuf); continue;
+                    default: break;
+                }
+                const char *v = ((char**)batch->values[c])[r]; if (!v) v = "";
+                ORA_APP("%s'", c?", ":"");
+                for (const char *p=v; *p; p++) { if (*p=='\'') ORA_APP("''"); else ORA_APP("%c", *p); }
+                ORA_APP("'");
+            }
+            ORA_APP(") ");
+        }
+        ORA_APP("SELECT 1 FROM dual");
+        #undef ORA_APP
+        int rc = ora_exec_chk(ctx->conn, sql); free(sql);
+        if (rc < 0) return -1;
+        written += (end - start);
+    }
+    dpiConn_commit(ctx->conn);
+    LOG_INFO("oracle sink: %d rows → %s (%s)", written, entity,
+             mode==DFO_SINK_OVERWRITE?"overwrite":"append");
+    return written;
+}
+
 const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "oracle",
@@ -619,6 +736,6 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start     = NULL,
     .cdc_stop      = NULL,
     .ping          = ora_ping,
-    /* Read-only source connector — no sink. */
-    .write_batch   = NULL,
+    .write_batch   = ora_write_batch,
+    .last_error    = ora_last_error,
 };

@@ -56,7 +56,10 @@ static void *csv_create(const char *cfg, Arena *a) {
         const char *d = strstr(cfg, "\"delimiter\"");
         if (d) { d=strchr(d,':');if(d){d++;while(*d==' ')d++;if(*d=='"')ctx->delimiter=d[1];}}
         const char *h = strstr(cfg, "\"header\"");
-        if (h) { h=strchr(h,':');if(h){h++;while(*h==' ')h++;ctx->has_header=(*h!='f');}}
+        /* accepts string ("true"/"false") or literal (true/false/0/1) — skip an
+         * optional opening quote, then look at the first meaningful char. */
+        if (h) { h=strchr(h,':');if(h){h++;while(*h==' ')h++;if(*h=='"')h++;
+                 ctx->has_header=(*h!='f'&&*h!='F'&&*h!='0');}}
     }
     /* infer schema from first two lines */
     FILE *f = fopen(ctx->path, "r");
@@ -81,7 +84,9 @@ static void *csv_create(const char *cfg, Arena *a) {
         for(int i=0;i<n;i++) types[i]=COL_TEXT;
         Schema *schema=arena_calloc(a,sizeof(Schema));
         schema->ncols=n; schema->cols=arena_alloc(a,n*sizeof(ColDef));
-        for(int i=0;i<n;i++){schema->cols[i].name=hdrs[i];schema->cols[i].type=types[i];schema->cols[i].nullable=true;}
+        /* use ctx->headers (real header row, or generated col0/col1… when
+         * has_header=false) — NOT the raw first line. */
+        for(int i=0;i<n;i++){schema->cols[i].name=ctx->headers[i];schema->cols[i].type=types[i];schema->cols[i].nullable=true;}
         ctx->schema=schema;
     }
     fclose(f);

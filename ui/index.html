@@ -617,6 +617,21 @@
   </div>
 </div>
 
+<!-- SQL-transform table view: SQL editor over DFO tables + result -->
+<div id="sql-data-modal" class="modal hidden" onclick="if(event.target===this)closeSqlDataModal()">
+  <div class="modal-box" style="max-width:1500px;width:96%;padding:1rem 1.25rem">
+    <h2 style="margin:0 0 .6rem;font-size:1rem">Результат шага</h2>
+    <textarea id="sqm-sql" rows="4" spellcheck="false"
+      style="width:100%;font-family:var(--mono);font-size:.82rem;padding:.5rem"
+      placeholder="SELECT * FROM {@prev} WHERE ..."></textarea>
+    <div style="display:flex;gap:.5rem;align-items:center;margin-top:.6rem;flex-wrap:wrap">
+      <span id="sqm-status" class="query-stat" style="margin-left:0"></span>
+      <button class="btn btn-primary" style="margin-left:auto" onclick="sqmRun()">▶ Выполнить</button>
+    </div>
+    <div id="sqm-result" style="margin-top:.8rem;max-height:60vh;overflow:auto"></div>
+  </div>
+</div>
+
 <!-- Table preview modal (replaces the old Query view inline SQL editor) -->
 <div id="table-preview-modal" class="modal hidden">
   <div class="modal-box" style="max-width:1000px;width:92%">

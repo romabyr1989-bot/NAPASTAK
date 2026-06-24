@@ -24,6 +24,7 @@ typedef struct {
     char total_field[64];    /* поле с общим числом записей (для offset-режима) */
     int  page_size;          /* записей на страницу */
     char post_body[2048];    /* тело POST (при method=POST) */
+    char last_err[512];      /* human-readable reason of the last failure */
     Arena *arena;
 } JHCtx;
 
@@ -100,6 +101,10 @@ static char *jh_fetch(JHCtx *ctx, const char *cursor_or_offset, Arena *a) {
 
     if (res!=CURLE_OK || http_code<200 || http_code>=300) {
         LOG_ERROR("json_http fetch %s → curl=%d http=%ld",url,(int)res,http_code);
+        if (res!=CURLE_OK)
+            snprintf(ctx->last_err,sizeof(ctx->last_err),"Ошибка соединения: %s",curl_easy_strerror(res));
+        else
+            snprintf(ctx->last_err,sizeof(ctx->last_err),"HTTP %ld от сервера",http_code);
         free(buf.data); return NULL;
     }
 
@@ -253,6 +258,12 @@ static int jh_ping(void *vctx) {
     char *body=jh_fetch(ctx,NULL,a);
     arena_destroy(a);
     return body?0:-1;
+}
+
+/* ── last_error(): human-readable reason of the last failure (ABI v3) ── */
+static const char *jh_last_error(void *vctx) {
+    JHCtx *ctx=vctx;
+    return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
 }
 
 static int jh_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
@@ -450,4 +461,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_stop     = NULL,
     .ping         = jh_ping,
     .write_batch  = jh_write_batch,
+    .last_error   = jh_last_error,
 };

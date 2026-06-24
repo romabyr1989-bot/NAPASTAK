@@ -357,6 +357,17 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 .conn-group {
   padding: .25rem 0 0;
 }
+/* подсказки у подписей полей скрыты — форма чище */
+.label-hint { display: none; }
+/* подписи полей в формах подключения — в одну строку, чтобы поля в колонках
+   оставались на одной линии (иначе перенос длинной подписи сдвигает поле ниже) */
+.conn-group label { white-space: nowrap; }
+/* одинаковая высота input и select в формах подключения — иначе селект
+   (напр. «Защита соединения») чуть выше инпута и строка «съезжает» */
+.conn-group input[type=text],
+.conn-group input[type=password],
+.conn-group input[type=number],
+.conn-group select { height: 38px; box-sizing: border-box; }
 .conn-group-title {
   font-size: .72rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .05em; color: var(--muted); margin-bottom: .6rem;

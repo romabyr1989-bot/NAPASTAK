@@ -119,22 +119,42 @@ const char *qe_normalize_inn(const char *s, Arena *a) {
     return out;
 }
 
-/* normalize_name(s): ASCII-lowercase, trim, collapse internal whitespace runs
- * to a single space. (ASCII case-fold only — Cyrillic passes through unchanged.) */
+/* normalize_name(s): lowercase, trim, collapse internal whitespace runs to a
+ * single space. Case-folds BOTH ASCII and Cyrillic (UTF-8), mirroring pg_trgm's
+ * case-insensitive behaviour — essential for Russian MDM name matching where the
+ * same name arrives as «Иванов» from one system and «ИВАНОВ» from another. */
 const char *qe_normalize_name(const char *s, Arena *a) {
     if (!s) return "";
     size_t len = strlen(s);
-    char *out = arena_alloc(a, len + 1);
+    char *out = arena_alloc(a, len + 1);   /* lowercase keeps byte length */
     size_t n = 0;
     bool prev_space = true;   /* trim leading */
-    for (size_t i = 0; i < len; i++) {
-        char c = s[i];
+    for (size_t i = 0; i < len; ) {
+        unsigned char c = (unsigned char)s[i];
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             if (!prev_space && n > 0) { out[n++] = ' '; prev_space = true; }
-        } else {
-            out[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;   /* ASCII lower */
-            prev_space = false;
+            i++;
+            continue;
         }
+        /* Cyrillic uppercase (2-byte UTF-8) → lowercase. А..Я = U+0410..U+042F,
+         * Ё = U+0401. Lowercase counterparts add 0x20 to the code point. */
+        if (c == 0xD0 && i + 1 < len) {
+            unsigned char d = (unsigned char)s[i+1];
+            if (d >= 0x90 && d <= 0x9F) {            /* А..П → а..п (stay 0xD0) */
+                out[n++] = (char)0xD0; out[n++] = (char)(d + 0x20);
+            } else if (d >= 0xA0 && d <= 0xAF) {     /* Р..Я → р..я (0xD0→0xD1) */
+                out[n++] = (char)0xD1; out[n++] = (char)(d - 0x20);
+            } else if (d == 0x81) {                  /* Ё → ё */
+                out[n++] = (char)0xD1; out[n++] = (char)0x91;
+            } else {                                  /* already lowercase / other */
+                out[n++] = (char)c; out[n++] = (char)d;
+            }
+            i += 2; prev_space = false;
+            continue;
+        }
+        out[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;   /* ASCII lower */
+        prev_space = false;
+        i++;
     }
     while (n > 0 && out[n-1] == ' ') n--;   /* trim trailing */
     out[n] = '\0';

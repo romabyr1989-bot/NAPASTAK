@@ -21,58 +21,6 @@ const pb = { steps: [], editId: null, max_retries: 3, retry_delay_sec: 30, webho
 /* User preferences */
 let prefs = {};
 
-/* ═══════════════════════════════════════════════════
-   AIRBYTE — pre-defined source catalog
-   Used by the pipeline builder when connector_type === 'airbyte'.
-   Versions pinned to known-good as of 2026-05.
-═══════════════════════════════════════════════════ */
-const AIRBYTE_CATALOG = {
-  /* databases */
-  'PostgreSQL':     { image: 'airbyte/source-postgres:3.6.16',         category: 'database' },
-  'MySQL':          { image: 'airbyte/source-mysql:3.7.4',             category: 'database' },
-  'MongoDB v2':     { image: 'airbyte/source-mongodb-v2:1.5.0',        category: 'database' },
-  'MS SQL Server':  { image: 'airbyte/source-mssql:4.0.31',            category: 'database' },
-  'Oracle':         { image: 'airbyte/source-oracle:0.5.4',            category: 'database' },
-  'Snowflake':      { image: 'airbyte/source-snowflake:0.3.1',         category: 'database' },
-  /* payments / finance */
-  'Stripe':         { image: 'airbyte/source-stripe:5.5.0',            category: 'payments' },
-  'PayPal':         { image: 'airbyte/source-paypal-transaction:2.5.5', category: 'payments' },
-  /* CRM / sales */
-  'HubSpot':        { image: 'airbyte/source-hubspot:4.4.5',           category: 'crm' },
-  'Salesforce':     { image: 'airbyte/source-salesforce:2.5.20',       category: 'crm' },
-  'Pipedrive':      { image: 'airbyte/source-pipedrive:2.2.0',         category: 'crm' },
-  'Intercom':       { image: 'airbyte/source-intercom:0.8.5',          category: 'crm' },
-  /* marketing */
-  'Mailchimp':      { image: 'airbyte/source-mailchimp:2.0.16',        category: 'marketing' },
-  'SendGrid':       { image: 'airbyte/source-sendgrid:1.1.4',          category: 'marketing' },
-  'Facebook Ads':   { image: 'airbyte/source-facebook-marketing:3.3.10', category: 'marketing' },
-  'Google Ads':     { image: 'airbyte/source-google-ads:3.7.4',        category: 'marketing' },
-  /* analytics */
-  'Google Analytics': { image: 'airbyte/source-google-analytics-data-api:2.6.0', category: 'analytics' },
-  'Mixpanel':       { image: 'airbyte/source-mixpanel:2.5.0',          category: 'analytics' },
-  'Amplitude':      { image: 'airbyte/source-amplitude:0.4.6',         category: 'analytics' },
-  'Segment':        { image: 'airbyte/source-segment:0.1.0',           category: 'analytics' },
-  /* commerce */
-  'Shopify':        { image: 'airbyte/source-shopify:2.4.10',          category: 'ecommerce' },
-  'WooCommerce':    { image: 'airbyte/source-woocommerce:0.4.0',       category: 'ecommerce' },
-  'Square':         { image: 'airbyte/source-square:1.6.6',            category: 'ecommerce' },
-  /* dev / ops */
-  'GitHub':         { image: 'airbyte/source-github:1.7.3',            category: 'dev' },
-  'GitLab':         { image: 'airbyte/source-gitlab:3.0.4',            category: 'dev' },
-  'Jira':           { image: 'airbyte/source-jira:1.7.5',              category: 'dev' },
-  'Linear':         { image: 'airbyte/source-linear:0.4.0',            category: 'dev' },
-  /* comms */
-  'Slack':          { image: 'airbyte/source-slack:1.4.0',             category: 'comms' },
-  'Notion':         { image: 'airbyte/source-notion:2.2.6',            category: 'comms' },
-  'Zendesk':        { image: 'airbyte/source-zendesk-support:4.7.4',   category: 'comms' },
-  /* dev sample */
-  'Faker (test)':   { image: 'airbyte/source-faker:6.2.6',             category: 'sample' },
-};
-function airbyteCategoryColor(cat) {
-  return ({database:'#5b6ef5',payments:'#34d399',crm:'#fbbf24',marketing:'#f87171',
-          analytics:'#22d3ee',ecommerce:'#a78bfa',dev:'#94a3b8',comms:'#fb7185',
-          sample:'#94a3b8'})[cat] || '#94a3b8';
-}
 
 
 /* ═══════════════════════════════════════════════════
@@ -324,11 +272,17 @@ async function runStepSQL(idx) {
     const ms = (performance.now() - t0).toFixed(1);
     const rows = data.rows || [];
     panel.innerHTML = '';
+    step._lastSqlResult = data;            /* remember for the table-view modal */
     const status = document.createElement('div');
     status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.4rem';
-    status.innerHTML = `▶ SQL — ${rows.length} ${pluralRows(rows.length)} · ${ms} мс`;
+    status.innerHTML = `▶ SQL — ${rows.length} ${pluralRows(rows.length)} · ${ms} мс · клик по таблице → окно запроса`;
     panel.appendChild(status);
-    panel.appendChild(makeResultTable(data));
+    const wrap = document.createElement('div');
+    wrap.style.cursor = 'pointer';
+    wrap.title = 'Открыть в окне и сделать SQL-запрос по таблицам DFO';
+    wrap.onclick = () => openSqlDataModal(idx);
+    wrap.appendChild(makeResultTable(data));
+    panel.appendChild(wrap);
   } catch (err) {
     let msg = String(err);
     try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
@@ -1215,20 +1169,59 @@ async function pbTestConnection(idx) {
 }
 
 /* Run the source table/SQL against the DB and show the rows inline below. */
+/* Preview recent messages from a Kafka topic. Reads from the start under a
+ * throwaway consumer group so it doesn't disturb the pipeline's real group. */
+async function pbPreviewKafka(idx) {
+  const step = pb.steps[idx];
+  const out  = document.getElementById(`pb-dbpreview-${idx}`);
+  if (!out) return;
+  const cfg = safeParse(step.connector_config, {});
+  if (!cfg.topic) {
+    out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи топик</div>';
+    return;
+  }
+  /* fresh group each time → always reads from the beginning, no offset commits
+     to the real consumer group */
+  const previewCfg = { ...cfg, group_id: `dfo_preview_${idx}_${Date.now()}`, offset_reset: 'earliest' };
+  out.innerHTML = '<div style="padding:.4rem;color:var(--muted);font-size:.8rem">Читаю сообщения…</div>';
+  try {
+    const r = await apiPost('/api/connector/probe/preview',
+      { type: 'kafka', config: previewCfg, query: cfg.topic, limit: 50 });
+    if (!r) { out.innerHTML = '<div style="padding:.4rem;color:var(--red);font-size:.8rem">Пустой ответ</div>'; return; }
+    if (r.error) {
+      out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem;white-space:pre-wrap">${escHtml(r.error)}</div>`;
+      return;
+    }
+    out.innerHTML = '';
+    const status = document.createElement('div');
+    status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.35rem';
+    const n = (r.rows || []).length;
+    status.textContent = n ? `${n} ${pluralRows(n)} из топика «${cfg.topic}»` : `В топике «${cfg.topic}» пока нет сообщений`;
+    out.appendChild(status);
+    if (n) out.appendChild(makeResultTable(r));
+  } catch (e) {
+    out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem">${escHtml(String(e))}</div>`;
+  }
+}
+
 async function pbPreviewSource(idx) {
   const step = pb.steps[idx];
   const out  = document.getElementById(`pb-dbpreview-${idx}`);
   if (!out) return;
   const cfg = safeParse(step.connector_config, {});
+  /* file/HTTP sources have no SQL — the source is in their own config */
+  const isHttp = ['json_http','csv','parquet'].includes(step.connector_type);
   const query = (cfg.query || cfg.table || '').trim();
-  if (!query) {
+  if (isHttp) {
+    if (!cfg.url && !cfg.path) { out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи адрес (URL) или путь к файлу</div>'; return; }
+  } else if (!query) {
     out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи таблицу или SQL источника</div>';
     return;
   }
   out.innerHTML = '<div style="padding:.4rem;color:var(--muted);font-size:.8rem">Выполняется…</div>';
   try {
     const r = await apiPost('/api/connector/probe/preview',
-      { type: step.connector_type, config: cfg, query, limit: 200 });
+      { type: step.connector_type, config: cfg, query: query || '', limit: 200 });
     if (!r) { out.innerHTML = '<div style="padding:.4rem;color:var(--red);font-size:.8rem">Пустой ответ</div>'; return; }
     if (r.error) {
       out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem;white-space:pre-wrap">${escHtml(r.error)}</div>`;
@@ -1236,16 +1229,24 @@ async function pbPreviewSource(idx) {
     }
     out.innerHTML = '';
     step._lastPreview = r;          /* remember for the data-explorer modal */
+    const n = (r.rows || []).length;
     const status = document.createElement('div');
     status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.35rem';
-    status.textContent = `${(r.rows || []).length} ${pluralRows((r.rows || []).length)} · клик по таблице → SQL-запрос`;
-    out.appendChild(status);
-    const wrap = document.createElement('div');
-    wrap.style.cursor = 'pointer';
-    wrap.title = 'Открыть в окне и сделать SQL-запрос';
-    wrap.onclick = () => openSrcDataModal(idx);
-    wrap.appendChild(makeResultTable(r));
-    out.appendChild(wrap);
+    if (isHttp) {
+      /* REST: no SQL queries — just show the fetched rows. */
+      status.textContent = `${n} ${pluralRows(n)}`;
+      out.appendChild(status);
+      out.appendChild(makeResultTable(r));
+    } else {
+      status.textContent = `${n} ${pluralRows(n)} · клик по таблице → SQL-запрос`;
+      out.appendChild(status);
+      const wrap = document.createElement('div');
+      wrap.style.cursor = 'pointer';
+      wrap.title = 'Открыть в окне и сделать SQL-запрос';
+      wrap.onclick = () => openSrcDataModal(idx);
+      wrap.appendChild(makeResultTable(r));
+      out.appendChild(wrap);
+    }
   } catch (e) {
     out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem">${escHtml(String(e))}</div>`;
   }
@@ -1298,6 +1299,45 @@ async function sdmRun() {
   }
 }
 
+/* ── SQL-transform table view: modal with a SQL editor over DFO's own tables
+ * (/api/tables/query). Opened by clicking the step's SQL result table. ── */
+let sqmIdx = -1;
+function openSqlDataModal(idx) {
+  sqmIdx = idx;
+  document.getElementById('sqm-sql').value = pb.steps[idx].transform_sql || '';
+  const res = pb.steps[idx]._lastSqlResult;
+  const out = document.getElementById('sqm-result');
+  out.innerHTML = '';
+  if (res) out.appendChild(makeResultTable(res));
+  document.getElementById('sqm-status').textContent =
+    res ? `${(res.rows || []).length} ${pluralRows((res.rows || []).length)}` : '';
+  document.getElementById('sql-data-modal').classList.remove('hidden');
+}
+function closeSqlDataModal() {
+  document.getElementById('sql-data-modal').classList.add('hidden');
+}
+async function sqmRun() {
+  if (sqmIdx < 0) return;
+  const step = pb.steps[sqmIdx];
+  const sql = document.getElementById('sqm-sql').value.trim();
+  const out = document.getElementById('sqm-result');
+  const status = document.getElementById('sqm-status');
+  if (!sql) { status.style.color = 'var(--amber)'; status.textContent = 'Пустой запрос'; return; }
+  status.style.color = 'var(--muted)'; status.textContent = 'Выполняется…'; out.innerHTML = '';
+  try {
+    const data = await apiPost('/api/tables/query', { sql });
+    if (!data) { status.textContent = 'Пустой ответ'; return; }
+    status.textContent = `${(data.rows || []).length} ${pluralRows((data.rows || []).length)}`;
+    out.appendChild(makeResultTable(data));
+    step._lastSqlResult = data;
+  } catch (e) {
+    let msg = String(e);
+    try { const j = JSON.parse(msg.replace(/^Error:\s*/, '')); if (j.error) msg = j.error; } catch (_) {}
+    status.style.color = 'var(--red)'; status.textContent = 'Ошибка';
+    out.innerHTML = `<div style="padding:.5rem;color:var(--red);font-size:.82rem;white-space:pre-wrap">${escHtml(msg)}</div>`;
+  }
+}
+
 /* ── Step "type" ────────────────────────────────────────────────────────────
  * A step has no explicit "type" field — the backend dispatches on WHICH field
  * is filled (python_code → connector_type → scd2_business_key → transform_sql).
@@ -1325,10 +1365,24 @@ const MATCH_RULES_STARTER =
       metric_function: 'word_similarity', operator: '>=', threshold: 0.80, normalize: 'name' }
   ], null, 2);
 
-const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','s3','kafka','airbyte'];
+const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','kafka'];
+
+/* Human-readable connector list for the unified «Источник» sub-selector. */
+const SOURCE_OPTIONS = [
+  ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
+  ['kafka','Kafka'], ['json_http','HTTP / REST'],
+  ['csv','CSV'], ['parquet','Parquet'],
+];
 
 /* Connectors that can act as sinks (write_batch in ABI v2). */
-const SINK_TYPES = ['csv','json_http','postgresql','s3','kafka'];
+const SINK_TYPES = ['csv','json_http','postgresql','kafka','greenplum','oracle','parquet'];
+
+/* Human-readable sink list for the unified «Приёмник» sub-selector. */
+const SINK_OPTIONS = [
+  ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
+  ['kafka','Kafka'], ['json_http','HTTP / Webhook'],
+  ['csv','CSV'], ['parquet','Parquet'],
+];
 
 function stepType(step) {
   if (step._ui_type) return step._ui_type;
@@ -1370,6 +1424,23 @@ function pbChangeStepType(idx, type) {
     s.connector_config = '{}';
     if (!s.sink_mode) s.sink_mode = 'append';
     if (s.sink_entity == null) s.sink_entity = '';
+  } else if (type === 'transform') {
+    /* Unified transform step: SQL by default; language switched in-form. */
+    s._ui_type = '';      /* let stepType derive from the filled field */
+    s._lang = 'sql';
+  } else if (type === 'source') {
+    /* Unified source step: pick the connector in-form (default PostgreSQL). */
+    s._ui_type = '';
+    s.connector_type = 'postgresql';
+    s.connector_config = '{}';
+  } else if (type === 'sink') {
+    /* Unified sink step: pick the connector in-form (default PostgreSQL). */
+    s._ui_type = '';
+    s.is_sink = true;
+    s.connector_type = 'postgresql';
+    s.connector_config = '{}';
+    if (!s.sink_mode) s.sink_mode = 'append';
+    if (s.sink_entity == null) s.sink_entity = '';
   } else if (type === 'python') {
     s.python_code = PY_STARTER;
   } else if (type === 'scala') {
@@ -1386,6 +1457,39 @@ function pbChangeStepType(idx, type) {
     s.match_rules = s.match_rules || MATCH_RULES_STARTER;
   }
   renderBuilderSteps();
+}
+
+/* Switch the language of a unified «Трансформация» step (SQL / Python / Scala).
+ * transform_sql is kept (it's the SQL transform in SQL mode, or the input SELECT
+ * feeding df in Python/Scala mode); only the chosen code field is seeded. */
+function pbSetTransformLang(idx, lang) {
+  const s = pb.steps[idx];
+  s._ui_type = '';
+  s._lang = lang;
+  s.python_code = ''; s.python_file = ''; s.scala_code = '';
+  if (lang === 'python') {
+    s.python_code = PY_STARTER;
+  } else if (lang === 'scala') {
+    s.scala_code = SCALA_STARTER;
+    if (s.scala_timeout_sec == null) s.scala_timeout_sec = 600;
+  }
+  renderBuilderSteps();
+  if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
+}
+
+/* Switch the method of a unified «Сопоставление» step: 'match' (fuzzy SQL) or
+ * 'matchrules' (rule engine). transform_sql (candidate set) is kept. */
+function pbSetMatchMethod(idx, method) {
+  const s = pb.steps[idx];
+  if (method === 'matchrules') {
+    s._ui_type = 'matchrules';
+    s.match_rules = s.match_rules || MATCH_RULES_STARTER;
+  } else {
+    s._ui_type = 'match';
+    s.match_rules = '';
+  }
+  renderBuilderSteps();
+  if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
 }
 
 /* Match step → builds a jaro_winkler() cross-match query into transform_sql.
@@ -1405,24 +1509,45 @@ WHERE jaro_winkler(a.${c}, b.${c}) >= ${th}`;
   renderBuilderSteps();
 }
 
+/* Build a match-rules JSON (one rule) from the human-readable Russian fields. */
+function pbBuildMatchRule(idx) {
+  const s = pb.steps[idx];
+  const cols = v => (v || '').split(',').map(x => x.trim()).filter(Boolean);
+  const rule = {
+    rule_name:       (s._mr_name || 'Правило 1').trim(),
+    id_column:       (s._mr_id || 'party_id').trim(),
+    scan_columns:    cols(s._mr_scan),
+    test_columns:    cols(s._mr_test),
+    metric_function: s._mr_metric || 'word_similarity',
+    operator:        '>=',
+    threshold:       s._mr_threshold != null ? Number(s._mr_threshold) : 0.80,
+  };
+  if (s._mr_normalize) rule.normalize = s._mr_normalize;
+  s.match_rules = JSON.stringify([rule], null, 2);
+  renderBuilderSteps();
+  if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
+}
+
 /* Sink (приёмник) fields: destination entity + write mode. The connection
  * config (path/host/bucket/brokers/...) is rendered by makeConnectorConfigHTML
  * above, since a sink reuses the connector's own config form. */
 function makeSinkFieldsHTML(step, idx) {
+  /* Kafka / REST: назначение задаётся в блоке подключения (топик / URL), как у
+     источника; отдельного поля назначения и режима записи не нужно. */
+  if (step.connector_type === 'kafka' || step.connector_type === 'json_http') return '';
   const ENT = {
     csv:        ['Путь файла',        './data/export.csv'],
+    parquet:    ['Путь файла',        './data/export.parquet'],
     json_http:  ['URL (пусто = из конфига)', 'https://hooks.example.com/ingest'],
     postgresql: ['Таблица назначения', 'public.export_table'],
-    s3:         ['Ключ объекта',       'exports/revenue.csv'],
+    greenplum:  ['Таблица назначения', 'public.export_table'],
+    oracle:     ['Таблица назначения', 'EXPORT_TABLE'],
     kafka:      ['Топик',              'dfo_export'],
   }[step.connector_type] || ['Назначение', ''];
   const mode = step.sink_mode || 'append';
   return `
-    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
-      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
-        📤 Приёмник. Поле <strong>SQL-трансформация</strong> ниже = запрос-источник
-        (его строки выгружаются наружу). Поле «Результат → таблица» для приёмника не используется.</div>
-      <div class="step-row-2">
+    <div style="margin-top:.75rem">
+      <div class="step-row-2" style="align-items:center">
         <div class="form-group" style="margin:0">
           <label>${ENT[0]}</label>
           <input type="text" value="${escAttr(step.sink_entity || '')}" placeholder="${escAttr(ENT[1])}"
@@ -1431,8 +1556,8 @@ function makeSinkFieldsHTML(step, idx) {
         <div class="form-group" style="margin:0">
           <label>Режим записи</label>
           <select onchange="pbUpdateStep(${idx},'sink_mode',this.value)">
-            <option value="append"    ${mode==='append'   ?'selected':''}>Дозапись (append)</option>
-            <option value="overwrite" ${mode==='overwrite'?'selected':''}>Перезапись (overwrite)</option>
+            <option value="append"    ${mode==='append'   ?'selected':''}>Дозапись — добавить к существующим</option>
+            <option value="overwrite" ${mode==='overwrite'?'selected':''}>Перезапись — заменить всё</option>
           </select>
         </div>
       </div>
@@ -1440,45 +1565,52 @@ function makeSinkFieldsHTML(step, idx) {
 }
 
 function makeScd2FieldsHTML(step, idx) {
-  const f = (label, key, ph, hint) => `
-    <div class="form-group" style="margin:0"><label>${label}${hint ? ` <span class="label-hint">${hint}</span>` : ''}</label>
+  const f = (label, key, ph) => `
+    <div class="form-group" style="margin:0"><label>${label}</label>
       <input type="text" value="${escAttr(step[key] || '')}" placeholder="${ph}"
              oninput="pbUpdateStep(${idx},'${key}',this.value)"></div>`;
   return `
-    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
-      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
-        🕒 SCD2 (тип 2). Поле <strong>SQL-трансформация</strong> ниже = входящий срез источника.</div>
-      <div class="step-row-2">${f('Business key','scd2_business_key','customer_id','через запятую')}${f('Compare columns','scd2_compare_columns','name,email,city','пусто = все')}</div>
-      <div class="step-row-2" style="margin-top:.4rem">${f('valid_from колонка','scd2_effective_from_col','valid_from')}${f('valid_to колонка','scd2_effective_to_col','valid_to')}</div>
-      <div class="step-row-2" style="margin-top:.4rem">${f('transaction_time','scd2_transaction_time','updated_at','для ORDER BY окна')}${f('deleted_flag','scd2_deleted_flag','is_deleted','soft-delete в источнике')}</div>
-      <div class="step-row-2" style="margin-top:.4rem">${f('hash колонка','scd2_hash_col','_dfo_row_hash','MD5 по compare-колонкам; ускоряет детект изменений и ловит ""↔NULL')}</div>
+    <div style="margin-top:.75rem">
+      <div class="step-row-2">
+        ${f('Бизнес-ключ записи','scd2_business_key','customer_id — через запятую для составного')}
+        ${f('Целевая таблица историзации','target_table','dim_customers')}
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem">
+        ${f('Колонка начала действия','scd2_effective_from_col','valid_from')}
+        ${f('Колонка конца действия','scd2_effective_to_col','valid_to')}
+      </div>
+      <div class="form-group" style="margin:.4rem 0 0">
+        <label>Колонки сравнения (пусто = все колонки)</label>
+        <input type="text" value="${escAttr(step.scd2_compare_columns || '')}" placeholder="name, email, city"
+               oninput="pbUpdateStep(${idx},'scd2_compare_columns',this.value)">
+      </div>
     </div>`;
 }
 
 function makeMatchFieldsHTML(step, idx) {
   const thr = step._match_threshold != null ? step._match_threshold : 0.85;
   return `
-    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
-      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
-        🔗 Match (fuzzy). Кнопка соберёт SQL c <code>jaro_winkler()</code> в поле <strong>SQL-трансформация</strong> ниже — его можно править.</div>
+    <div style="margin-top:.75rem">
       <div class="step-row-2">
-        <div class="form-group" style="margin:0"><label>Таблица A</label>
-          <input type="text" value="${escAttr(step._match_left || '')}" placeholder="customers_crm"
+        <div class="form-group" style="margin:0"><label>Первая таблица</label>
+          <input type="text" value="${escAttr(step._match_left || '')}" placeholder="клиенты_crm"
                  oninput="pbUpdateStep(${idx},'_match_left',this.value)"></div>
-        <div class="form-group" style="margin:0"><label>Таблица B</label>
-          <input type="text" value="${escAttr(step._match_right || '')}" placeholder="customers_erp"
+        <div class="form-group" style="margin:0"><label>Вторая таблица</label>
+          <input type="text" value="${escAttr(step._match_right || '')}" placeholder="клиенты_erp"
                  oninput="pbUpdateStep(${idx},'_match_right',this.value)"></div>
       </div>
-      <div class="step-row-2" style="margin-top:.4rem">
-        <div class="form-group" style="margin:0"><label>Ключевая колонка</label>
-          <input type="text" value="${escAttr(step._match_col || '')}" placeholder="name"
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0"><label>Колонка для сравнения</label>
+          <input type="text" value="${escAttr(step._match_col || '')}" placeholder="имя"
                  oninput="pbUpdateStep(${idx},'_match_col',this.value)"></div>
-        <div class="form-group" style="margin:0"><label>Порог similarity (0..1)</label>
+        <div class="form-group" style="margin:0"><label>Порог схожести (0–1)</label>
           <input type="number" min="0" max="1" step="0.05" value="${escAttr(thr)}"
                  oninput="pbUpdateStep(${idx},'_match_threshold',parseFloat(this.value))"></div>
       </div>
-      <button type="button" class="btn btn-sm btn-primary" style="margin-top:.5rem"
-              onclick="event.stopPropagation();pbGenerateMatchSQL(${idx})">⚙ Сгенерировать SQL</button>
+      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbGenerateMatchSQL(${idx})">⚙ Построить запрос</button>
+      </div>
     </div>`;
 }
 
@@ -1486,15 +1618,61 @@ function makeMatchFieldsHTML(step, idx) {
  * candidate set comes from the SQL-трансформация field below; match_rules is a
  * JSON array of rules. See docs/MATCH_RULES.md. */
 function makeMatchRulesFieldsHTML(step, idx) {
+  /* Pre-fill the structured fields from the first rule in the JSON (round-trip). */
+  let first = {};
+  try { const arr = JSON.parse(step.match_rules || '[]'); if (Array.isArray(arr) && arr[0]) first = arr[0]; } catch (_) {}
+  const val   = (uiKey, jsonKey) => step[uiKey] != null ? step[uiKey] : (first[jsonKey] || '');
+  const name  = val('_mr_name', 'rule_name');
+  const idCol = val('_mr_id', 'id_column');
+  const scan  = step._mr_scan != null ? step._mr_scan : (first.scan_columns || []).join(', ');
+  const test  = step._mr_test != null ? step._mr_test : (first.test_columns || []).join(', ');
+  const metric = step._mr_metric || first.metric_function || 'word_similarity';
+  const thr   = step._mr_threshold != null ? step._mr_threshold : (first.threshold != null ? first.threshold : 0.80);
+  const norm  = step._mr_normalize != null ? step._mr_normalize : (first.normalize || '');
   return `
-    <div style="margin-top:.75rem;padding:.6rem;border:1px dashed var(--border);border-radius:var(--radius)">
-      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
-        🧬 Match-rules (движок). Кандидаты — из поля <strong>SQL-трансформация</strong> ниже;
-        результат (<code>id_a,id_b,rule_name,metric_value</code>) — в <strong>target_table</strong>.
-        Метрики: <code>word_similarity</code> · <code>jaro_winkler</code> · <code>levenshtein</code>.</div>
-      <div class="form-group" style="margin:0">
-        <label>Правила (JSON-массив) <span class="label-hint">scan_columns = точная группа; test_columns = similarity</span></label>
-        <textarea class="mono-textarea" rows="12"
+    <div style="margin-top:.75rem">
+      <div class="step-row-2">
+        <div class="form-group" style="margin:0"><label>Название правила</label>
+          <input type="text" value="${escAttr(name)}" placeholder="Правило 1: документ → ФИО"
+                 oninput="pbUpdateStep(${idx},'_mr_name',this.value)"></div>
+        <div class="form-group" style="margin:0"><label>Колонка идентификатора</label>
+          <input type="text" value="${escAttr(idCol)}" placeholder="party_id"
+                 oninput="pbUpdateStep(${idx},'_mr_id',this.value)"></div>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0"><label>Колонки группировки (точное совпадение, через запятую)</label>
+          <input type="text" value="${escAttr(scan)}" placeholder="номер_документа"
+                 oninput="pbUpdateStep(${idx},'_mr_scan',this.value)"></div>
+        <div class="form-group" style="margin:0"><label>Колонки сравнения (по схожести, через запятую)</label>
+          <input type="text" value="${escAttr(test)}" placeholder="фамилия, имя"
+                 oninput="pbUpdateStep(${idx},'_mr_test',this.value)"></div>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0"><label>Метрика схожести</label>
+          <select onchange="pbUpdateStep(${idx},'_mr_metric',this.value)">
+            <option value="word_similarity" ${metric==='word_similarity'?'selected':''}>Похожесть слов</option>
+            <option value="jaro_winkler"    ${metric==='jaro_winkler'   ?'selected':''}>Джаро–Винклер</option>
+            <option value="levenshtein"     ${metric==='levenshtein'    ?'selected':''}>Левенштейн</option>
+          </select></div>
+        <div class="form-group" style="margin:0"><label>Порог схожести (0–1)</label>
+          <input type="number" min="0" max="1" step="0.05" value="${escAttr(thr)}"
+                 oninput="pbUpdateStep(${idx},'_mr_threshold',parseFloat(this.value))"></div>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0"><label>Нормализация значений</label>
+          <select onchange="pbUpdateStep(${idx},'_mr_normalize',this.value)">
+            <option value=""     ${norm===''    ?'selected':''}>Нет</option>
+            <option value="name" ${norm==='name'?'selected':''}>Имена / ФИО</option>
+          </select></div>
+        <div class="form-group" style="margin:0"></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbBuildMatchRule(${idx})">⚙ Построить правило</button>
+      </div>
+      <div class="form-group" style="margin:.6rem 0 0">
+        <label>Все правила в формате JSON</label>
+        <textarea class="mono-textarea" rows="8"
           oninput="pb.steps[${idx}].match_rules=this.value"
           style="font-family:var(--mono);font-size:.74rem">${escHtml(step.match_rules || '')}</textarea>
       </div>
@@ -1598,6 +1776,27 @@ function makeStepCard(step, idx) {
   div.className = 'step-card';
   div.id = `step-card-${idx}`;
   const t = stepType(step);
+  const isTransform = ['sql','python','scala'].includes(t);
+  const lang = t === 'python' ? 'python' : t === 'scala' ? 'scala' : 'sql';
+  const isMatch = t === 'match' || t === 'matchrules';
+  const matchMethod = t === 'matchrules' ? 'matchrules' : 'match';
+  const isSource = CONNECTOR_TYPES.includes(t);   /* unified «Источник» step */
+  const isSink = t.startsWith('sink:');            /* unified «Приёмник» step */
+  const sinkType = isSink ? t.slice(5) : '';
+  /* Input/transform SQL block — placed BEFORE the code editor for transforms
+     (вход → код), and AFTER the connector config for connector steps. */
+  const sqlBlock = `
+      <div class="form-group" style="margin:0">
+        <label>${t.startsWith('sink:') ? 'Что выгружать (SQL)' : t === 'matchrules' ? 'Набор кандидатов (SQL)' : t === 'scd2' ? 'Источник — срез данных (SQL)' : lang === 'sql' ? 'SQL-трансформация' : 'Входные данные (SQL → df)'}</label>
+        <textarea class="mono-textarea" rows="4"
+                  placeholder="SELECT * FROM {@prev} WHERE ..."
+                  oninput="pbUpdateStep(${idx},'transform_sql',this.value)">${escHtml(step.transform_sql || '')}</textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                  onclick="event.stopPropagation();runStepSQL(${idx})"
+                  title="Выполнить только этот SQL (без upstream-шагов)">▶ Выполнить</button>
+        </div>
+      </div>`;
   div.innerHTML = `
     <div class="step-header">
       <span class="step-num">${idx + 1}</span>
@@ -1616,62 +1815,50 @@ function makeStepCard(step, idx) {
           <label>Тип шага <span class="label-hint">= какое поле заполнено</span></label>
           <select onchange="pbChangeStepType(${idx}, this.value)">
             <optgroup label="Трансформации">
-              <option value="sql"    ${t==='sql'   ?'selected':''}>SQL-трансформация</option>
-              <option value="python" ${t==='python'?'selected':''}>Python (pandas)</option>
-              <option value="scala"  ${t==='scala' ?'selected':''}>Scala (Spark)</option>
-              <option value="scd2"   ${t==='scd2'  ?'selected':''}>SCD2 (историзация)</option>
-              <option value="match"  ${t==='match' ?'selected':''}>Match (fuzzy SQL)</option>
-              <option value="matchrules" ${t==='matchrules'?'selected':''}>Match-rules (движок)</option>
+              <option value="transform" ${['sql','python','scala'].includes(t)?'selected':''}>Трансформация</option>
+              <option value="scd2"   ${t==='scd2'  ?'selected':''}>Историзация изменений</option>
+              <option value="match"  ${(t==='match'||t==='matchrules')?'selected':''}>Сопоставление</option>
             </optgroup>
-            <optgroup label="Источники (коннекторы)">
-              <option value="csv"        ${t==='csv'       ?'selected':''}>CSV файл</option>
-              <option value="parquet"    ${t==='parquet'   ?'selected':''}>Parquet файл</option>
-              <option value="json_http"  ${t==='json_http' ?'selected':''}>HTTP / REST API (JSON)</option>
-              <option value="postgresql" ${t==='postgresql'?'selected':''}>PostgreSQL (БД)</option>
-              <option value="greenplum"  ${t==='greenplum' ?'selected':''}>Greenplum (MPP)</option>
-              <option value="oracle"     ${t==='oracle'    ?'selected':''}>Oracle (ODPI-C)</option>
-              <option value="s3"         ${t==='s3'        ?'selected':''}>S3 / MinIO</option>
-              <option value="kafka"      ${t==='kafka'     ?'selected':''}>Kafka</option>
-              <option value="airbyte"    ${t==='airbyte'   ?'selected':''}>Airbyte (любой источник)</option>
+            <optgroup label="Загрузка данных">
+              <option value="source" ${CONNECTOR_TYPES.includes(t)?'selected':''}>Источник</option>
             </optgroup>
-            <optgroup label="Приёмники (запись наружу)">
-              <option value="sink:csv"        ${t==='sink:csv'       ?'selected':''}>CSV файл</option>
-              <option value="sink:json_http"  ${t==='sink:json_http' ?'selected':''}>HTTP / Webhook (JSON)</option>
-              <option value="sink:postgresql" ${t==='sink:postgresql'?'selected':''}>PostgreSQL (БД)</option>
-              <option value="sink:s3"         ${t==='sink:s3'        ?'selected':''}>S3 / MinIO</option>
-              <option value="sink:kafka"      ${t==='sink:kafka'     ?'selected':''}>Kafka</option>
+            <optgroup label="Выгрузка данных">
+              <option value="sink" ${t.startsWith('sink:')?'selected':''}>Приёмник</option>
             </optgroup>
           </select>
         </div>
       </div>
+      ${isTransform ? `
+      <div style="display:flex;gap:.4rem;margin-top:.6rem">
+        ${[['sql','SQL'],['python','Python'],['scala','Scala']].map(([L,name]) => `
+          <button type="button" class="btn btn-sm${lang===L?' btn-primary':''}"
+                  onclick="pbSetTransformLang(${idx},'${L}')">${name}</button>`).join('')}
+      </div>` : ''}
+      ${isMatch ? `
+      <div style="display:flex;gap:.4rem;margin-top:.6rem">
+        ${[['match','Нечёткое'],['matchrules','По правилам']].map(([m,name]) => `
+          <button type="button" class="btn btn-sm${matchMethod===m?' btn-primary':''}"
+                  onclick="pbSetMatchMethod(${idx},'${m}')">${name}</button>`).join('')}
+      </div>` : ''}
+      ${isSource ? `
+      <div style="display:flex;gap:.4rem;margin-top:.6rem;flex-wrap:wrap">
+        ${SOURCE_OPTIONS.map(([v,name]) => `
+          <button type="button" class="btn btn-sm${t===v?' btn-primary':''}"
+                  onclick="pbChangeStepType(${idx},'${v}')">${name}</button>`).join('')}
+      </div>` : ''}
+      ${isSink ? `
+      <div style="display:flex;gap:.4rem;margin-top:.6rem;flex-wrap:wrap">
+        ${SINK_OPTIONS.map(([v,name]) => `
+          <button type="button" class="btn btn-sm${sinkType===v?' btn-primary':''}"
+                  onclick="pbChangeStepType(${idx},'sink:${v}')">${name}</button>`).join('')}
+      </div>` : ''}
+      ${isTransform ? sqlBlock : ''}
       <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(step, idx)}</div>
       ${t.startsWith('sink:') ? makeSinkFieldsHTML(step, idx) : ''}
       ${t === 'scd2'  ? makeScd2FieldsHTML(step, idx)  : ''}
       ${t === 'match' ? makeMatchFieldsHTML(step, idx) : ''}
       ${t === 'matchrules' ? makeMatchRulesFieldsHTML(step, idx) : ''}
-      ${['postgresql','greenplum','oracle'].includes(t) ? '' : `
-      <div class="form-group" style="margin:0">
-        <label style="display:flex;align-items:center;gap:.5rem">
-          SQL-трансформация
-          <span class="label-hint">{@prev} = вывод предыдущего шага</span>
-          <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
-                  onclick="event.stopPropagation();runStepSQL(${idx})"
-                  title="Выполнить только этот SQL (без upstream-шагов)">▶ SQL</button>
-        </label>
-        <textarea class="mono-textarea" rows="4"
-                  placeholder="SELECT * FROM {@prev} WHERE ..."
-                  oninput="pbUpdateStep(${idx},'transform_sql',this.value)">${escHtml(step.transform_sql || '')}</textarea>
-      </div>
-      <div class="form-group" style="margin:.5rem 0 0">
-        <label>SQL-шаблон из файла <span class="label-hint">.sql под sql_templates_dir; перекрывает SQL выше (см. docs/SQL_TEMPLATES.md)</span></label>
-        <input type="text" value="${escAttr(step.sql_template || '')}" placeholder="merge_scd2.sql"
-               oninput="pbUpdateStep(${idx},'sql_template',this.value)">
-      </div>
-      <div class="form-group" style="margin:.4rem 0 0">
-        <label>Параметры шаблона (JSON) <span class="label-hint">{"name":"Bob"} → 'Bob'; число → как есть; имя_raw → идентификатор; {@now}/{@last_run}/{@step:&lt;id&gt;:&lt;col&gt;}</span></label>
-        <textarea class="mono-textarea" rows="2" placeholder='{"table_raw":"scores","min_score":50}'
-                  oninput="pbUpdateStep(${idx},'sql_params',this.value)">${escHtml(step.sql_params || '')}</textarea>
-      </div>`}
+      ${(isTransform || isSource || t === 'match') ? '' : sqlBlock}
     </div>
   `;
   return div;
@@ -1681,41 +1868,23 @@ function makeConnectorConfigHTML(step, idx) {
   const type = step.connector_type;
   const cfg  = safeParse(step.connector_config, {});
 
+  /* Pure SQL transform: no connector / python / scala → nothing to configure
+     here (the SQL editor itself is rendered by makeStepCard). */
+  if (!type && !step.python_code && !step.python_file && !step.scala_code) return '';
+
   /* Python step (no connector_type, but has python_code or python_file) */
   if (!type && (step.python_code || step.python_file)) {
     return `
       <div class="form-group" style="margin:0">
-        <label style="display:flex;align-items:center;gap:.5rem">
-          Python-код
-          <span class="label-hint">df = pandas DataFrame из transform_sql; результат — в target_table${step.python_file ? '; игнорируется если задан python_file' : ''}</span>
-          <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
-                  onclick="event.stopPropagation();runStepPython(${idx})"
-                  title="Выполнить только этот Python (без upstream-шагов)">▶ Python</button>
-        </label>
+        <label>Код Python</label>
         <textarea class="mono-textarea" rows="8"
           oninput="pb.steps[${idx}].python_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code || '')}</textarea>
-      </div>
-      <div class="step-row-2" style="margin-top:.4rem">
-        <div class="form-group" style="margin:0;flex:2">
-          <label>python_file <span class="label-hint">путь .py на хосте gateway (≤512КБ; перекрывает код выше)</span></label>
-          <input type="text" value="${escAttr(step.python_file || '')}" placeholder="/opt/tsmdm/scripts/connector.py"
-                 oninput="pbUpdateStep(${idx},'python_file',this.value)">
+        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                  onclick="event.stopPropagation();runStepPython(${idx})"
+                  title="Выполнить только этот Python (без предыдущих шагов)">▶ Выполнить</button>
         </div>
-        <div class="form-group" style="margin:0">
-          <label>Timeout (сек)</label>
-          <input type="number" min="1" max="3600"
-                 value="${step.python_timeout_sec || 300}"
-                 oninput="pb.steps[${idx}].python_timeout_sec=parseInt(this.value,10)||300">
-        </div>
-      </div>
-      <div class="form-group" style="margin:.4rem 0 0">
-        <label>python_context_dir <span class="label-hint">опц.: общая папка для state между шагами → DFO_CONTEXT_DIR в subprocess</span></label>
-        <input type="text" value="${escAttr(step.python_context_dir || '')}" placeholder="/tmp/dfo_run_{{ pipeline_id }}"
-               oninput="pbUpdateStep(${idx},'python_context_dir',this.value)">
-      </div>
-      <div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">
-        Требуется <code>python3</code> + <code>pandas</code> на сервере. Один subprocess на запуск шага.
       </div>`;
   }
 
@@ -1723,103 +1892,155 @@ function makeConnectorConfigHTML(step, idx) {
   if (!type && step.scala_code) {
     return `
       <div class="form-group" style="margin:0">
-        <label style="display:flex;align-items:center;gap:.5rem">
-          Scala-код
-          <span class="label-hint">df = Spark DataFrame из transform_sql; результат — в target_table</span>
-          <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
-                  onclick="event.stopPropagation();runStepScala(${idx})"
-                  title="Выполнить только этот Scala (без upstream-шагов)">▶ Scala</button>
-        </label>
+        <label>Код Scala</label>
         <textarea class="mono-textarea" rows="8"
           oninput="pb.steps[${idx}].scala_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.scala_code)}</textarea>
-      </div>
-      <div class="step-row-2" style="margin-top:.4rem">
-        <div class="form-group" style="margin:0">
-          <label>Timeout (сек)</label>
-          <input type="number" min="1" max="3600"
-                 value="${step.scala_timeout_sec || 600}"
-                 oninput="pb.steps[${idx}].scala_timeout_sec=parseInt(this.value,10)||600">
-        </div>
-        <div style="font-size:.7rem;color:var(--muted);align-self:end">
-          Требуется <code>scala-cli</code> на сервере (Spark тянется при первом запуске).
-          Один subprocess на запуск шага.
+        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                  onclick="event.stopPropagation();runStepScala(${idx})"
+                  title="Выполнить только этот Scala (без предыдущих шагов)">▶ Выполнить</button>
         </div>
       </div>`;
   }
 
   if (!type) return '';
 
-  if (type === 'csv') return `
-    <div class="step-row-2">
-      <div class="form-group" style="margin:0">
-        <label>Путь к файлу</label>
-        <input type="text" value="${escAttr(cfg.path || '')}"
-               oninput="pbUpdateConnConfig(${idx},'path',this.value)"
-               placeholder="/data/input.csv">
+  if (type === 'csv') {
+    const hdr = cfg.header === 'false' ? 'false' : 'true';
+    return `
+    <div class="conn-group">
+      <div class="conn-group-title">CSV-файл</div>
+      <div class="step-row-2" style="align-items:end">
+        ${step.is_sink ? '' : `
+        <div class="form-group" style="margin:0;flex:2">
+          <label>Путь к файлу</label>
+          <input type="text" value="${escAttr(cfg.path || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'path',this.value)" placeholder="/data/input.csv">
+        </div>`}
+        <div class="form-group" style="margin:0">
+          <label>Разделитель</label>
+          <select onchange="pbUpdateConnConfig(${idx},'delimiter',this.value)">
+            <option value=","  ${(cfg.delimiter||',')===',' ?'selected':''}>Запятая (,)</option>
+            <option value=";"  ${cfg.delimiter===';'       ?'selected':''}>Точка с запятой (;)</option>
+            <option value="\t" ${cfg.delimiter==='\t'      ?'selected':''}>Табуляция (TSV)</option>
+          </select>
+        </div>
+        ${step.is_sink ? '' : `
+        <div class="form-group" style="margin:0">
+          <label>Первая строка</label>
+          <select onchange="pbUpdateConnConfig(${idx},'header',this.value)">
+            <option value="true"  ${hdr==='true' ?'selected':''}>Заголовок</option>
+            <option value="false" ${hdr==='false'?'selected':''}>Данные</option>
+          </select>
+        </div>`}
       </div>
-      <div class="form-group" style="margin:0">
-        <label>Разделитель</label>
-        <select onchange="pbUpdateConnConfig(${idx},'delimiter',this.value)">
-          <option value=","  ${(cfg.delimiter||',')===',' ?'selected':''}>Запятая (,)</option>
-          <option value=";"  ${cfg.delimiter===';'       ?'selected':''}>Точка с запятой (;)</option>
-          <option value="\t" ${cfg.delimiter==='\t'      ?'selected':''}>Табуляция (TSV)</option>
-        </select>
+      ${step.is_sink ? '' : `
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Файл доступен' : 'Подключиться'}</button>
       </div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
     </div>`;
+  }
 
   if (type === 'parquet') return `
-    <div class="step-row-2">
-      <div class="form-group" style="margin:0;flex:3">
+    <div class="conn-group">
+      <div class="conn-group-title">Parquet-файл</div>
+      <div class="form-group" style="margin:0">
         <label>Путь или glob-паттерн</label>
         <input type="text" value="${escAttr(cfg.path || '')}"
                oninput="pbUpdateConnConfig(${idx},'path',this.value)"
                placeholder="/data/exports/*.parquet">
       </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Файл доступен' : 'Подключиться'}</button>
+      </div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>
     </div>`;
 
-  if (type === 'json_http') return `
-    <div class="step-row-2">
-      <div class="form-group" style="margin:0;flex:3">
-        <label>Адрес (URL)</label>
-        <input type="text" value="${escAttr(cfg.url || '')}"
-               oninput="pbUpdateConnConfig(${idx},'url',this.value)"
-               placeholder="https://api.example.com/data">
-      </div>
-      <div class="form-group" style="margin:0;flex:1">
-        <label>Метод</label>
-        <select onchange="pbUpdateConnConfig(${idx},'method',this.value)">
-          <option ${(cfg.method||'GET')==='GET'?'selected':''}>GET</option>
-          <option ${cfg.method==='POST'?'selected':''}>POST</option>
-        </select>
-      </div>
-    </div>
-    <div class="step-row-2">
-      <div class="form-group" style="margin:0">
-        <label>Авторизация</label>
-        <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value)">
-          <option value="none"    ${(cfg.auth_type||'none')==='none'   ?'selected':''}>Нет</option>
-          <option value="bearer"  ${cfg.auth_type==='bearer'           ?'selected':''}>Bearer Token</option>
-          <option value="api_key" ${cfg.auth_type==='api_key'          ?'selected':''}>API Key</option>
-        </select>
-      </div>
-      <div class="form-group" style="margin:0;flex:2" ${(cfg.auth_type||'none')==='none'?'style="display:none"':''}>
-        <label>Токен / ключ</label>
-        <input type="text" value="${escAttr(cfg.auth_token || '')}"
-               oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)"
-               placeholder="sk-...">
-      </div>
-      <div class="form-group" style="margin:0;flex:2">
-        <label>Путь к массиву (data_path)</label>
+  if (type === 'json_http') {
+    const method = cfg.method || 'GET';
+    const auth = cfg.auth_type || 'none';
+    const ptype = cfg.page_type || 'offset';
+    const reRender = `document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})`;
+    /* Только активные поля → раскладываем в 2 колонки (grid), без пустых ячеек;
+       при нечётном числе последнее поле растягивается на всю ширину. */
+    const fields = [];
+    fields.push(`<label>Адрес (URL)</label>
+      <input type="text" value="${escAttr(cfg.url || '')}"
+             oninput="pbUpdateConnConfig(${idx},'url',this.value)" placeholder="https://api.example.com/data">`);
+    if (!step.is_sink) fields.push(`<label>Метод</label>
+      <select onchange="pbUpdateConnConfig(${idx},'method',this.value);${reRender}">
+        <option value="GET"  ${method==='GET' ?'selected':''}>GET</option>
+        <option value="POST" ${method==='POST'?'selected':''}>POST</option>
+      </select>`);
+    fields.push(`<label>Авторизация</label>
+      <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value);${reRender}">
+        <option value="none"    ${auth==='none'   ?'selected':''}>Нет</option>
+        <option value="bearer"  ${auth==='bearer' ?'selected':''}>Bearer-токен</option>
+        <option value="api_key" ${auth==='api_key'?'selected':''}>API-ключ</option>
+      </select>`);
+    if (auth !== 'none') fields.push(`<label>${auth==='bearer' ? 'Токен' : 'Значение ключа'}</label>
+      <input type="text" value="${escAttr(cfg.auth_token || '')}"
+             oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="sk-...">`);
+    if (auth === 'api_key') fields.push(`<label>Имя заголовка</label>
+      <input type="text" value="${escAttr(cfg.auth_header || '')}"
+             oninput="pbUpdateConnConfig(${idx},'auth_header',this.value)" placeholder="X-API-Key">`);
+    if (!step.is_sink) {   /* источниковые поля: куда писать данные, не нужны приёмнику */
+      fields.push(`<label>Путь к массиву в ответе</label>
         <input type="text" value="${escAttr(cfg.data_path || '')}"
-               oninput="pbUpdateConnConfig(${idx},'data_path',this.value)"
-               placeholder="data.items">
+               oninput="pbUpdateConnConfig(${idx},'data_path',this.value)" placeholder="data.items">`);
+      fields.push(`<label>Параметр пагинации</label>
+        <input type="text" value="${escAttr(cfg.page_param || '')}"
+               oninput="pbUpdateConnConfig(${idx},'page_param',this.value)" placeholder="пусто = без пагинации">`);
+      fields.push(`<label>Тип пагинации</label>
+        <select onchange="pbUpdateConnConfig(${idx},'page_type',this.value);${reRender}">
+          <option value="offset" ${ptype==='offset'?'selected':''}>По смещению (offset)</option>
+          <option value="cursor" ${ptype==='cursor'?'selected':''}>По курсору</option>
+        </select>`);
+      fields.push(`<label>Размер страницы</label>
+        <input type="number" min="1" value="${escAttr(cfg.page_size || 100)}"
+               oninput="pbUpdateConnConfig(${idx},'page_size',parseInt(this.value,10)||100)" placeholder="100">`);
+      if (ptype !== 'cursor') fields.push(`<label>Поле общего числа</label>
+        <input type="text" value="${escAttr(cfg.total_field || '')}"
+               oninput="pbUpdateConnConfig(${idx},'total_field',this.value)" placeholder="total">`);
+    }
+    const grid = fields.map((f, i) =>
+      `<div class="form-group" style="margin:0${(i === fields.length - 1 && fields.length % 2 === 1) ? ';grid-column:1/-1' : ''}">${f}</div>`
+    ).join('');
+    return `
+    <div class="conn-group">
+      <div class="conn-group-title">Подключение к REST API</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">${grid}</div>
+      ${(!step.is_sink && method==='POST') ? `
+      <div class="form-group" style="margin:.5rem 0 0">
+        <label>Тело запроса (JSON)</label>
+        <textarea class="mono-textarea" rows="3" placeholder='{"query":"..."}'
+                  oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body || '')}</textarea>
+      </div>` : ''}
+      ${step.is_sink ? '' : `
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
     </div>`;
+  }
 
   if (type === 'postgresql') return `
     <div class="conn-group">
-      <div class="conn-group-title">Подключение к БД</div>
+      <div class="conn-group-title">Подключение к PostgreSQL</div>
       <div style="display:flex;gap:.75rem 1rem;align-items:flex-start;flex-wrap:wrap">
         <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem">
           <div class="form-group" style="margin:0">
@@ -1854,16 +2075,7 @@ function makeConnectorConfigHTML(step, idx) {
                   onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
         </div>
       </div>
-      <div class="form-group" style="margin:.6rem 0 0">
-        <label>Запрос к источнику</label>
-        <textarea class="mono-textarea" rows="3"
-                  placeholder="orders   или   SELECT * FROM orders WHERE active = true"
-                  oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                  onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
-        </div>
-      </div>
+      ${step.is_sink ? '' : `
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
@@ -1886,198 +2098,264 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'cdc_slot',this.value)" placeholder="dfo_cdc">
         </div>` : ''}
       </div>
-      <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>
+      <div class="form-group" style="margin:.6rem 0 0">
+        <label>Запрос к источнику</label>
+        <textarea class="mono-textarea" rows="3"
+                  placeholder="orders   или   SELECT * FROM orders WHERE active = true"
+                  oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                  onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
+        </div>
+      </div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
     </div>`;
 
   if (type === 'greenplum') return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к Greenplum</div>
-      <div class="step-row-2">
-        <div class="form-group" style="margin:0">
-          <label>Хост (мастер)</label>
-          <input type="text" value="${escAttr(cfg.host || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="gp-master.prod.internal">
+      <div style="display:flex;gap:.75rem 1rem;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem">
+          <div class="form-group" style="margin:0">
+            <label>База данных</label>
+            <input type="text" value="${escAttr(cfg.dbname || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'dbname',this.value)" placeholder="postgres">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Хост</label>
+            <input type="text" value="${escAttr(cfg.host || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="localhost">
+          </div>
+          <div class="form-group" style="margin:0;max-width:90px">
+            <label>Порт</label>
+            <input type="text" value="${escAttr(cfg.port || '5432')}"
+                   oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="5432">
+          </div>
         </div>
-        <div class="form-group" style="margin:0;flex:0 0 90px">
-          <label>Порт</label>
-          <input type="text" value="${escAttr(cfg.port || '5432')}"
-                 oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="5432">
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>База данных</label>
-          <input type="text" value="${escAttr(cfg.dbname || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'dbname',this.value)" placeholder="tsmdm">
+        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem;align-self:stretch">
+          <div class="form-group" style="margin:0">
+            <label>Пользователь</label>
+            <input type="text" value="${escAttr(cfg.user || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="postgres">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Схема</label>
+            <input type="text" value="${escAttr(cfg.schema || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="public">
+          </div>
+          <div class="form-group" style="margin:0;width:50%;align-self:flex-start">
+            <label>Пароль</label>
+            <input type="password" value="${escAttr(cfg.password || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
+          </div>
+          <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                  style="white-space:nowrap;align-self:flex-end;margin-top:auto;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                  onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
         </div>
       </div>
-      <div class="step-row-2" style="margin-top:.6rem">
+      ${step.is_sink ? '' : `
+      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
-          <label>Схема <span class="label-hint">search_path + discovery</span></label>
-          <input type="text" value="${escAttr(cfg.schema || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="tsmdm_cdh">
+          <label>Режим чтения</label>
+          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
+            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
+          </select>
         </div>
-        <div class="form-group" style="margin:0;flex:0 0 110px">
-          <label>GP версия <span class="label-hint">авто</span></label>
-          <input type="text" value="${escAttr(cfg.gp_version || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'gp_version',this.value)" placeholder="6">
-        </div>
-        <div class="form-group" style="margin:0;flex:0 0 130px">
-          <label>sslmode</label>
-          <input type="text" value="${escAttr(cfg.sslmode || 'disable')}"
-                 oninput="pbUpdateConnConfig(${idx},'sslmode',this.value)" placeholder="disable">
-        </div>
-      </div>
-      <div class="step-row-2" style="margin-top:.6rem">
-        <div class="form-group" style="margin:0">
-          <label>Пользователь</label>
-          <input type="text" value="${escAttr(cfg.user || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="tsmdm_rw">
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>Пароль</label>
-          <input type="password" value="${escAttr(cfg.password || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
-        </div>
+        ${cfg.read_mode==='cursor' ? `
         <div class="form-group" style="margin:0;flex:2">
-          <label>cursor_column <span class="label-hint">пусто = OFFSET; поле = инкремент</span></label>
+          <label>Поле-отметка</label>
           <input type="text" value="${escAttr(cfg.cursor_column || '')}"
                  oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)" placeholder="last_upd_ts">
+        </div>` : ''}
+      </div>
+      <div class="form-group" style="margin:.6rem 0 0">
+        <label>Запрос к источнику</label>
+        <textarea class="mono-textarea" rows="3"
+                  placeholder="orders   или   SELECT * FROM orders WHERE active = true"
+                  oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                  onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
         </div>
       </div>
-      <div style="font-size:.7rem;color:var(--muted);margin-top:.5rem">Таблицу-источник укажи в поле «SQL-трансформация» ниже.</div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
     </div>`;
 
   if (type === 'oracle') return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к Oracle</div>
-      <div class="step-row-2">
-        <div class="form-group" style="margin:0">
-          <label>Хост</label>
-          <input type="text" value="${escAttr(cfg.host || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="oracle.prod.internal">
+      <div style="display:flex;gap:.75rem 1rem;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem">
+          <div class="form-group" style="margin:0">
+            <label>Имя сервиса</label>
+            <input type="text" value="${escAttr(cfg.service_name || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'service_name',this.value)" placeholder="ORCL">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Хост</label>
+            <input type="text" value="${escAttr(cfg.host || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="localhost">
+          </div>
+          <div class="form-group" style="margin:0;max-width:90px">
+            <label>Порт</label>
+            <input type="text" value="${escAttr(cfg.port || '1521')}"
+                   oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="1521">
+          </div>
         </div>
-        <div class="form-group" style="margin:0;flex:0 0 90px">
-          <label>Порт</label>
-          <input type="text" value="${escAttr(cfg.port || '1521')}"
-                 oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="1521">
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>Service name <span class="label-hint">Easy Connect</span></label>
-          <input type="text" value="${escAttr(cfg.service_name || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'service_name',this.value)" placeholder="ORCL">
+        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem;align-self:stretch">
+          <div class="form-group" style="margin:0">
+            <label>Пользователь</label>
+            <input type="text" value="${escAttr(cfg.user || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="oracle">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Схема</label>
+            <input type="text" value="${escAttr(cfg.schema || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="TSMDM_IN">
+          </div>
+          <div class="form-group" style="margin:0;width:50%;align-self:flex-start">
+            <label>Пароль</label>
+            <input type="password" value="${escAttr(cfg.password || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
+          </div>
+          <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                  style="white-space:nowrap;align-self:flex-end;margin-top:auto;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                  onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
         </div>
       </div>
-      <div class="step-row-2" style="margin-top:.6rem">
+      ${step.is_sink ? '' : `
+      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
-          <label>Схема (OWNER)</label>
-          <input type="text" value="${escAttr(cfg.schema || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="TSMDM_IN">
+          <label>Режим чтения</label>
+          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
+            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
+          </select>
         </div>
-        <div class="form-group" style="margin:0;flex:0 0 130px">
-          <label>Oracle версия <span class="label-hint">дефолт 12</span></label>
-          <input type="text" value="${escAttr(cfg.oracle_version || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'oracle_version',this.value)" placeholder="19">
-        </div>
-      </div>
-      <div class="step-row-2" style="margin-top:.6rem">
-        <div class="form-group" style="margin:0">
-          <label>Пользователь</label>
-          <input type="text" value="${escAttr(cfg.user || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="tsmdm_user">
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>Пароль</label>
-          <input type="password" value="${escAttr(cfg.password || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
-        </div>
+        ${cfg.read_mode==='cursor' ? `
         <div class="form-group" style="margin:0;flex:2">
-          <label>cursor_column <span class="label-hint">пусто = OFFSET; поле = инкремент</span></label>
+          <label>Поле-отметка</label>
           <input type="text" value="${escAttr(cfg.cursor_column || '')}"
                  oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)" placeholder="LAST_UPD">
+        </div>` : ''}
+      </div>
+      <div class="form-group" style="margin:.6rem 0 0">
+        <label>Запрос к источнику</label>
+        <textarea class="mono-textarea" rows="3"
+                  placeholder="ORDERS   или   SELECT * FROM orders WHERE active = 1"
+                  oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                  onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
         </div>
       </div>
-      <div style="font-size:.7rem;color:var(--muted);margin-top:.5rem">Нужен Instant Client на сервере. Таблицу-источник укажи в «SQL-трансформация» ниже.</div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
     </div>`;
-
-  if (type === 'airbyte') {
-    /* Step 2 (connector): pick from AIRBYTE_CATALOG, then a JSON pane for
-     * the source-specific config (each Airbyte source has its own schema). */
-    const sources = Object.entries(AIRBYTE_CATALOG)
-      .sort((a,b) => a[1].category.localeCompare(b[1].category) ||
-                     a[0].localeCompare(b[0]));
-    const optsByCat = {};
-    sources.forEach(([name, m]) => {
-      (optsByCat[m.category] ||= []).push({name, image: m.image});
-    });
-    let groups = '';
-    for (const cat of Object.keys(optsByCat).sort()) {
-      groups += `<optgroup label="${escAttr(cat)}">`;
-      for (const s of optsByCat[cat]) {
-        groups += `<option value="${escAttr(s.image)}" ${cfg.image===s.image?'selected':''}>${escHtml(s.name)} — ${escHtml(s.image)}</option>`;
-      }
-      groups += '</optgroup>';
-    }
-    const innerCfg = cfg.config ? JSON.stringify(cfg.config, null, 2) : '{}';
-    return `
-      <div class="form-group" style="margin:0">
-        <label>Airbyte source image <span class="label-hint">whitelisted; см. AIRBYTE_CATALOG</span></label>
-        <select onchange="pbUpdateAirbyteImage(${idx}, this.value)">
-          <option value="">— выбери источник —</option>
-          ${groups}
-        </select>
-      </div>
-      <div class="form-group" style="margin:.4rem 0 0">
-        <label>Source config (JSON) <span class="label-hint">соответствует spec выбранного образа</span></label>
-        <textarea class="mono-textarea" rows="4" placeholder='{"start_date":"...", "api_token":"..."}'
-                  oninput="pbUpdateAirbyteConfig(${idx}, this.value)">${escHtml(innerCfg)}</textarea>
-      </div>`;
-  }
 
   if (type === 'kafka') {
     const fmt = cfg.data_format || 'json';
+    const sec = cfg.security_protocol || '';
+    const needsSasl = sec.indexOf('SASL') === 0;
+    const off = cfg.offset_reset || 'earliest';
     return `
-    <div style="font-size:.72rem;color:var(--muted);margin-bottom:.5rem">
-      📨 Kafka. Топик-источник + формат сообщений. Для Avro укажи Schema Registry
-      (см. docs/KAFKA_AVRO.md).</div>
-    <div class="step-row-2">
-      <div class="form-group" style="margin:0;flex:2">
-        <label>Brokers</label>
-        <input type="text" value="${escAttr(cfg.brokers || '')}" placeholder="localhost:9092"
-               oninput="pbUpdateConnConfig(${idx},'brokers',this.value)">
+    <div class="conn-group">
+      <div class="conn-group-title">Подключение к Kafka</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">
+        <div class="form-group" style="margin:0">
+          <label>Брокеры</label>
+          <input type="text" value="${escAttr(cfg.brokers || '')}" placeholder="localhost:9092"
+                 oninput="pbUpdateConnConfig(${idx},'brokers',this.value)">
+        </div>
+        ${step.is_sink ? '' : `
+        <div class="form-group" style="margin:0">
+          <label>Группа консьюмера</label>
+          <input type="text" value="${escAttr(cfg.group_id || '')}" placeholder="dfo_consumer"
+                 oninput="pbUpdateConnConfig(${idx},'group_id',this.value)">
+        </div>`}
+        <div class="form-group" style="margin:0">
+          <label>Топик${step.is_sink ? ' (назначение)' : ''}</label>
+          <input type="text" value="${escAttr(cfg.topic || '')}" placeholder="orders"
+                 oninput="pbUpdateConnConfig(${idx},'topic',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Защита соединения</label>
+          <select onchange="pbUpdateConnConfig(${idx},'security_protocol',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+            <option value=""               ${sec===''              ?'selected':''}>Без авторизации</option>
+            <option value="SASL_SSL"       ${sec==='SASL_SSL'       ?'selected':''}>SASL + TLS</option>
+            <option value="SASL_PLAINTEXT" ${sec==='SASL_PLAINTEXT' ?'selected':''}>SASL без TLS</option>
+            <option value="SSL"            ${sec==='SSL'            ?'selected':''}>Только TLS</option>
+          </select>
+        </div>
       </div>
-      <div class="form-group" style="margin:0">
-        <label>Топик</label>
-        <input type="text" value="${escAttr(cfg.topic || '')}" placeholder="cdi_physical_party"
-               oninput="pbUpdateConnConfig(${idx},'topic',this.value)">
+      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
+        <div class="form-group" style="margin:0">
+          <label>Формат сообщений</label>
+          <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+            <option value="json" ${fmt==='json'?'selected':''}>JSON</option>
+            <option value="csv"  ${fmt==='csv' ?'selected':''}>CSV</option>
+            <option value="avro" ${fmt==='avro'?'selected':''}>Avro (реестр схем)</option>
+          </select>
+        </div>
+        ${step.is_sink ? '' : `
+        <div class="form-group" style="margin:0">
+          <label>С какого места читать</label>
+          <select onchange="pbUpdateConnConfig(${idx},'offset_reset',this.value)">
+            <option value="earliest" ${off==='earliest'?'selected':''}>С начала топика</option>
+            <option value="latest"   ${off==='latest'  ?'selected':''}>Только новые сообщения</option>
+          </select>
+        </div>`}
       </div>
-    </div>
-    <div class="step-row-2" style="margin-top:.4rem">
-      <div class="form-group" style="margin:0">
-        <label>group_id</label>
-        <input type="text" value="${escAttr(cfg.group_id || '')}" placeholder="dfo_consumer"
-               oninput="pbUpdateConnConfig(${idx},'group_id',this.value)">
+      ${needsSasl ? `
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0">
+          <label>Механизм SASL</label>
+          <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value)">
+            <option value="PLAIN"         ${(cfg.sasl_mechanism||'PLAIN')==='PLAIN' ?'selected':''}>PLAIN</option>
+            <option value="SCRAM-SHA-256" ${cfg.sasl_mechanism==='SCRAM-SHA-256'    ?'selected':''}>SCRAM-SHA-256</option>
+            <option value="SCRAM-SHA-512" ${cfg.sasl_mechanism==='SCRAM-SHA-512'    ?'selected':''}>SCRAM-SHA-512</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пользователь</label>
+          <input type="text" value="${escAttr(cfg.sasl_username || '')}" placeholder="api-key"
+                 oninput="pbUpdateConnConfig(${idx},'sasl_username',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пароль</label>
+          <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder=""
+                 oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
+        </div>
+      </div>` : ''}
+      ${fmt==='avro' ? `
+      <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0;flex:2">
+          <label>Адрес Schema Registry</label>
+          <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="http://registry:8081"
+                 oninput="pbUpdateConnConfig(${idx},'schema_registry_url',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Авторизация реестра</label>
+          <input type="text" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="user:pass"
+                 oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
+        </div>
+      </div>` : ''}
+      ${step.is_sink ? '' : `
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewKafka(${idx})">▶ Показать сообщения</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
-      <div class="form-group" style="margin:0">
-        <label>Формат сообщений</label>
-        <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
-          <option value="json" ${fmt==='json'?'selected':''}>JSON</option>
-          <option value="csv"  ${fmt==='csv' ?'selected':''}>CSV</option>
-          <option value="avro" ${fmt==='avro'?'selected':''}>Avro (Schema Registry)</option>
-        </select>
-      </div>
-    </div>
-    ${fmt==='avro' ? `
-    <div class="step-row-2" style="margin-top:.4rem">
-      <div class="form-group" style="margin:0;flex:2">
-        <label>Schema Registry URL <span class="label-hint">обязательно для Avro</span></label>
-        <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="http://registry:8081"
-               oninput="pbUpdateConnConfig(${idx},'schema_registry_url',this.value)">
-      </div>
-      <div class="form-group" style="margin:0">
-        <label>Registry auth <span class="label-hint">опц. user:pass</span></label>
-        <input type="text" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="user:pass"
-               oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
-      </div>
-    </div>` : ''}`;
+      <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
+      ${step.is_sink ? `
+      <div style="display:flex;justify-content:flex-end;margin-top:.6rem">
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
+      </div>` : ''}
+    </div>`;
   }
 
   /* fallback: raw JSON */
@@ -2089,20 +2367,6 @@ function makeConnectorConfigHTML(step, idx) {
     </div>`;
 }
 
-/* Airbyte connector_config = {"image": "...", "config": {…}} */
-function pbUpdateAirbyteImage(idx, image) {
-  const cfg = safeParse(pb.steps[idx].connector_config, {});
-  cfg.image = image;
-  if (!cfg.config) cfg.config = {};
-  pb.steps[idx].connector_config = JSON.stringify(cfg);
-}
-function pbUpdateAirbyteConfig(idx, jsonText) {
-  const cfg = safeParse(pb.steps[idx].connector_config, {});
-  let inner = {};
-  try { inner = JSON.parse(jsonText); } catch (_) { return; /* invalid JSON — wait for valid */ }
-  cfg.config = inner;
-  pb.steps[idx].connector_config = JSON.stringify(cfg);
-}
 
 /* ── Save pipeline ── */
 /* Persist the current builder state to the server. Returns true on success. */

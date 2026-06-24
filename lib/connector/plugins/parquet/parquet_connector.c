@@ -139,6 +139,7 @@ typedef struct {
 
 typedef struct {
     int64_t data_page_offset;
+    int64_t dict_page_offset;   /* 0 = none; points to the dictionary page */
     int64_t num_values;
     int64_t total_compressed;
     int     pq_type;
@@ -265,6 +266,7 @@ static void pq_parse_col_meta(TBuf *b, PqColMeta *cm) {
             case 7: cm->total_compressed=tc_i(b); break;
             case 8: tc_skip(b,ft); break; /* kv_metadata */
             case 9: cm->data_page_offset=tc_i(b); break;
+            case 11: cm->dict_page_offset=tc_i(b); break;
             default: tc_skip(b,ft); break;
         }
     }
@@ -406,8 +408,15 @@ static void pq_parse_page_hdr(TBuf *b, PageHdr *ph) {
                 }
                 break;
             }
-            case 8: { /* DictionaryPageHeader — skip */
-                int l2=0,ft2; while(tc_next(b,&l2,&ft2)) tc_skip(b,ft2);
+            case 8: { /* DictionaryPageHeader */
+                int l2=0,ft2;
+                while(tc_next(b,&l2,&ft2)) {
+                    switch(l2) {
+                        case 1: ph->num_values=(int32_t)tc_i(b); break; /* dict entry count */
+                        case 2: ph->encoding=(int)tc_i(b); break;
+                        default: tc_skip(b,ft2); break;
+                    }
+                }
                 break;
             }
             default: tc_skip(b,ft); break;
@@ -476,6 +485,92 @@ static const uint8_t *write_plain_val(const uint8_t *p, const uint8_t *end,
     }
 }
 
+/* ── Snappy decompression (self-contained; libsnappy not required) ──
+ * Implements the raw Snappy block format: leading varint length, then a stream
+ * of literal/copy elements. Used because pandas/pyarrow/Spark default to snappy. */
+static int snappy_uncompress(const uint8_t *src, size_t slen, uint8_t *dst, size_t dcap) {
+    size_t sp = 0, dp = 0;
+    int shift = 0;                              /* skip the uncompressed length varint */
+    while (sp < slen) { uint8_t c = src[sp++]; (void)shift; shift += 7; if (!(c & 0x80)) break; }
+    while (sp < slen) {
+        uint8_t tag = src[sp++];
+        if ((tag & 3) == 0) {                   /* literal */
+            uint32_t len = (uint32_t)(tag >> 2) + 1;
+            if (len > 60) {
+                int nb = (int)len - 60; len = 0;
+                for (int i = 0; i < nb && sp < slen; i++) len |= (uint32_t)src[sp++] << (i * 8);
+                len += 1;
+            }
+            if (sp + len > slen || dp + len > dcap) return -1;
+            memcpy(dst + dp, src + sp, len); dp += len; sp += len;
+        } else {                                /* copy */
+            uint32_t len, off;
+            int t = tag & 3;
+            if (t == 1)      { len = ((uint32_t)(tag >> 2) & 7) + 4; if (sp >= slen) return -1;
+                               off = ((uint32_t)(tag >> 5) << 8) | src[sp++]; }
+            else if (t == 2) { len = (uint32_t)(tag >> 2) + 1; if (sp + 2 > slen) return -1;
+                               off = src[sp] | ((uint32_t)src[sp+1] << 8); sp += 2; }
+            else             { len = (uint32_t)(tag >> 2) + 1; if (sp + 4 > slen) return -1;
+                               off = src[sp] | ((uint32_t)src[sp+1]<<8) | ((uint32_t)src[sp+2]<<16) | ((uint32_t)src[sp+3]<<24); sp += 4; }
+            if (off == 0 || off > dp || dp + len > dcap) return -1;
+            for (uint32_t i = 0; i < len; i++) { dst[dp] = dst[dp - off]; dp++; }  /* may overlap */
+        }
+    }
+    return (int)dp;
+}
+
+/* Decompress a page body by codec into dst (capacity dlen). Returns 0 on success. */
+static int pq_decompress(int codec, const uint8_t *src, size_t slen, uint8_t *dst, size_t dlen) {
+    if (codec == PQ_GZIP)   return gzip_decomp(src, slen, dst, dlen);
+    if (codec == PQ_SNAPPY) return snappy_uncompress(src, slen, dst, dlen) >= 0 ? 0 : -1;
+    return -1;
+}
+
+/* General RLE/bit-packed hybrid decoder → int32 values (dictionary indices).
+ * Unlike rle_bp_dec (def levels, bit_width==1 only) this handles any bit_width. */
+static int rle_dict_dec(const uint8_t *data, size_t dlen, int bw, int32_t *out, int nmax) {
+    if (bw <= 0) { for (int i = 0; i < nmax; i++) out[i] = 0; return nmax; }
+    TBuf b = { data, 0, dlen };
+    int n = 0;
+    while (b.pos < b.len && n < nmax) {
+        uint64_t hdr = tc_uv(&b);
+        if (hdr & 1) {                          /* bit-packed: (hdr>>1) groups of 8 */
+            int groups = (int)(hdr >> 1);
+            for (int g = 0; g < groups && n < nmax; g++) {
+                if (b.pos + (size_t)bw > b.len) { b.pos = b.len; break; }
+                const uint8_t *gp = &b.d[b.pos];
+                for (int v = 0; v < 8 && n < nmax; v++) {
+                    int bitpos = v * bw; int32_t val = 0;
+                    for (int k = 0; k < bw; k++) { int bp = bitpos + k; val |= ((gp[bp >> 3] >> (bp & 7)) & 1) << k; }
+                    out[n++] = val;
+                }
+                b.pos += (size_t)bw;
+            }
+        } else {                                /* RLE run */
+            int cnt = (int)(hdr >> 1), vb = (bw + 7) / 8; uint32_t val = 0;
+            for (int i = 0; i < vb && b.pos < b.len; i++) val |= (uint32_t)b.d[b.pos++] << (i * 8);
+            for (int i = 0; i < cnt && n < nmax; i++) out[n++] = (int32_t)val;
+        }
+    }
+    return n;
+}
+
+/* Write dictionary entry `di` (typed parallel arrays) into the batch cell. */
+static void write_dict_val(ColBatch *batch, int slot, int row, int pq_type,
+                           const int64_t *di64, const double *did, const char **dis,
+                           int dict_n, int di) {
+    if (di < 0 || di >= dict_n) { batch->null_bitmap[slot][row/8] |= (uint8_t)(1u<<(row%8)); return; }
+    switch (pq_type) {
+        case PQ_INT32: case PQ_INT64: case PQ_INT96: case PQ_BOOLEAN:
+            ((int64_t*)batch->values[slot])[row] = di64[di]; break;
+        case PQ_FLOAT: case PQ_DOUBLE:
+            ((double*)batch->values[slot])[row] = did[di]; break;
+        case PQ_BYTEARRAY:
+            ((const char**)batch->values[slot])[row] = dis[di]; break;
+        default: ((const char**)batch->values[slot])[row] = ""; break;
+    }
+}
+
 /* ── Основная функция чтения одной колонки ── */
 /* Читает [start_row, start_row+nrows) из row group rg_idx, колонка col_idx.
  * Записывает в batch->values[slot] начиная с batch_start. */
@@ -488,11 +583,16 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
 
     if (nrows<=0) return;
 
-    fseek(f->fp,cm->data_page_offset,SEEK_SET);
+    /* Dictionary page (when present) precedes the data pages. */
+    int64_t start_off = cm->dict_page_offset > 0 ? cm->dict_page_offset : cm->data_page_offset;
+    fseek(f->fp,start_off,SEEK_SET);
 
-    int64_t rows_seen=0;   /* строки в уже обработанных страницах */
+    int64_t rows_seen=0;   /* строки в уже обработанных data-страницах */
     int     rows_written=0;/* записано в batch */
     int     bool_bit=0;    /* для BOOLEAN: бит в потоке нон-нулл значений */
+
+    /* Декодированный словарь (параллельные типизированные массивы). */
+    int dict_n=0; int64_t *di64=NULL; double *did=NULL; const char **dis=NULL;
 
     while (rows_written<nrows && rows_seen<cm->num_values) {
         /* Читаем заголовок страницы */
@@ -504,44 +604,50 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
         PageHdr ph; pq_parse_page_hdr(&tb,&ph);
         fseek(f->fp,hdr_pos+(long)ph.hdr_bytes,SEEK_SET);
 
+        /* Распаковщик тела V1-страницы (data/dict целиком сжаты). */
+        #define PQ_LOAD_BODY(BODY,BLEN) \
+            uint8_t *comp=arena_alloc(a,(size_t)ph.compressed_size); \
+            if (fread(comp,1,(size_t)ph.compressed_size,f->fp)!=(size_t)ph.compressed_size) break; \
+            const uint8_t *BODY=comp; size_t BLEN=(size_t)ph.compressed_size; \
+            if ((cm->codec==PQ_GZIP||cm->codec==PQ_SNAPPY) && ph.page_type!=PQ_DATA_V2) { \
+                uint8_t *dd=arena_alloc(a,(size_t)ph.uncompressed_size+1); \
+                if (pq_decompress(cm->codec,comp,(size_t)ph.compressed_size,dd,(size_t)ph.uncompressed_size)==0) { \
+                    BODY=dd; BLEN=(size_t)ph.uncompressed_size; } }
+
         if (ph.page_type==PQ_DICT_PAGE) {
-            fseek(f->fp,ph.compressed_size,SEEK_CUR); continue;
+            PQ_LOAD_BODY(body,blen)
+            dict_n=ph.num_values;
+            const uint8_t *q=body, *qe=body+blen;
+            if (cm->pq_type==PQ_BYTEARRAY) dis=arena_alloc(a,(size_t)(dict_n>0?dict_n:1)*sizeof(char*));
+            else if (cm->pq_type==PQ_FLOAT||cm->pq_type==PQ_DOUBLE) did=arena_alloc(a,(size_t)(dict_n>0?dict_n:1)*sizeof(double));
+            else di64=arena_alloc(a,(size_t)(dict_n>0?dict_n:1)*sizeof(int64_t));
+            for (int i=0;i<dict_n && q<qe;i++) {
+                switch (cm->pq_type) {
+                    case PQ_INT32:  if(q+4<=qe){di64[i]=(int64_t)(int32_t)le32r(q);q+=4;} break;
+                    case PQ_INT64:  if(q+8<=qe){di64[i]=(int64_t)le64r(q);q+=8;} break;
+                    case PQ_INT96:  if(q+12<=qe){di64[i]=(int64_t)le64r(q);q+=12;} break;
+                    case PQ_FLOAT:  if(q+4<=qe){did[i]=(double)lef32(q);q+=4;} break;
+                    case PQ_DOUBLE: if(q+8<=qe){did[i]=lef64(q);q+=8;} break;
+                    case PQ_BYTEARRAY: if(q+4<=qe){uint32_t sl=le32r(q);q+=4;if(q+sl>qe)sl=(uint32_t)(qe-q);dis[i]=arena_strndup(a,(const char*)q,sl);q+=sl;} break;
+                    default: break;
+                }
+            }
+            continue;
         }
         if (ph.page_type!=PQ_DATA_PAGE && ph.page_type!=PQ_DATA_V2) {
             fseek(f->fp,ph.compressed_size,SEEK_CUR); continue;
         }
-
-        /* Страница полностью до start_row — пропускаем */
+        /* Страница полностью до start_row — пропускаем без чтения тела */
         if (rows_seen+ph.num_values <= start_row) {
-            rows_seen+=ph.num_values;
-            fseek(f->fp,ph.compressed_size,SEEK_CUR);
-            continue;
+            rows_seen+=ph.num_values; fseek(f->fp,ph.compressed_size,SEEK_CUR); continue;
         }
 
-        /* Читаем данные страницы */
-        uint8_t *comp=arena_alloc(a,(size_t)ph.compressed_size);
-        fread(comp,1,(size_t)ph.compressed_size,f->fp);
-
-        /* Распаковка */
-        const uint8_t *page_data; size_t page_len;
-        uint8_t *decomp=NULL;
-        bool v2_data_compressed=(ph.page_type==PQ_DATA_V2&&ph.v2_compressed&&cm->codec==PQ_GZIP);
-
-        if (cm->codec==PQ_GZIP && ph.page_type==PQ_DATA_PAGE) {
-            decomp=arena_alloc(a,(size_t)ph.uncompressed_size+1);
-            if (gzip_decomp(comp,(size_t)ph.compressed_size,
-                            decomp,(size_t)ph.uncompressed_size)!=0) break;
-            page_data=decomp; page_len=(size_t)ph.uncompressed_size;
-        } else {
-            page_data=comp; page_len=(size_t)ph.compressed_size;
-        }
-
+        PQ_LOAD_BODY(page_data,page_len)
+        #undef PQ_LOAD_BODY
         const uint8_t *p=page_data, *end=page_data+page_len;
 
         /* V2: уровни повторения (для плоской схемы = 0 байт) */
-        if (ph.page_type==PQ_DATA_V2) {
-            p+=ph.rep_bytes; if(p>end)p=end;
-        }
+        if (ph.page_type==PQ_DATA_V2) { p+=ph.rep_bytes; if(p>end)p=end; }
 
         /* Уровни определения для опциональных колонок */
         uint8_t *def_lvls=NULL;
@@ -550,12 +656,11 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
                 def_lvls=arena_alloc(a,(size_t)ph.num_values);
                 rle_bp_dec(p,(size_t)ph.def_bytes,1,def_lvls,ph.num_values);
                 p+=ph.def_bytes; if(p>end)p=end;
-                /* V2: тело значений может быть сжато отдельно */
-                if (v2_data_compressed) {
+                if (cm->codec!=PQ_UNCOMP && ph.v2_compressed) {
                     size_t val_clen=(size_t)(end-p);
                     size_t val_ulen=(size_t)(ph.uncompressed_size-ph.def_bytes-ph.rep_bytes);
                     uint8_t *dv=arena_alloc(a,val_ulen+1);
-                    if (gzip_decomp(p,val_clen,dv,val_ulen)==0) { p=dv; end=dv+val_ulen; }
+                    if (pq_decompress(cm->codec,p,val_clen,dv,val_ulen)==0) { p=dv; end=dv+val_ulen; }
                 }
             } else if (page_len>=4) {
                 uint32_t def_len=le32r(p); p+=4; if(p+def_len>end) def_len=(uint32_t)(end-p);
@@ -565,37 +670,43 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
             }
         }
 
-        /* Сколько строк пропустить в начале этой страницы */
         int skip_in_page=(int)(start_row>rows_seen ? start_row-rows_seen : 0);
         int avail=ph.num_values-skip_in_page;
         int take=(avail<nrows-rows_written)?avail:nrows-rows_written;
 
-        /* Пропускаем нон-нулл значений до skip_in_page */
         int nn_skip=0;
-        if (def_lvls) {
-            for (int i=0;i<skip_in_page;i++) if(def_lvls[i]) nn_skip++;
-        } else {
-            nn_skip=skip_in_page;
-        }
-        p=skip_plain(p,end,cm->pq_type,nn_skip);
-        /* Для BOOLEAN: nn_skip уже проинициализирован */
-        bool_bit=nn_skip;
+        if (def_lvls) { for (int i=0;i<skip_in_page;i++) if(def_lvls[i]) nn_skip++; }
+        else nn_skip=skip_in_page;
 
-        /* Записываем 'take' строк в batch */
-        int nn_written=0;
-        for (int i=0;i<take&&rows_written<nrows;i++) {
-            int r=batch_start+rows_written;
-            bool is_null=cd->optional&&def_lvls&&(def_lvls[skip_in_page+i]==0);
-            if (is_null) {
-                batch->null_bitmap[slot][r/8]|=(uint8_t)(1u<<(r%8));
-            } else {
-                p=write_plain_val(p,end,cm->pq_type,bool_bit,batch,slot,r,a);
-                if (cm->pq_type==PQ_BOOLEAN) bool_bit++;
-                nn_written++;
+        bool is_dict = (ph.encoding==2 || ph.encoding==8);  /* PLAIN_DICTIONARY | RLE_DICTIONARY */
+        if (is_dict && dict_n>0) {
+            /* секция значений: 1 байт bit-width, затем RLE/bit-packed индексы */
+            int bw=(p<end)?*p++:0;
+            int nn_total=0;
+            if (def_lvls) { for (int i=0;i<ph.num_values;i++) if(def_lvls[i]) nn_total++; }
+            else nn_total=ph.num_values;
+            int32_t *idx=arena_alloc(a,(size_t)(nn_total>0?nn_total:1)*sizeof(int32_t));
+            rle_dict_dec(p,(size_t)(end-p),bw,idx,nn_total);
+            int ipos=nn_skip;
+            for (int i=0;i<take&&rows_written<nrows;i++) {
+                int r=batch_start+rows_written;
+                bool is_null=cd->optional&&def_lvls&&(def_lvls[skip_in_page+i]==0);
+                if (is_null) batch->null_bitmap[slot][r/8]|=(uint8_t)(1u<<(r%8));
+                else write_dict_val(batch,slot,r,cm->pq_type,di64,did,dis,dict_n,idx[ipos++]);
+                rows_written++;
             }
-            rows_written++;
+        } else {
+            /* PLAIN-значения */
+            p=skip_plain(p,end,cm->pq_type,nn_skip);
+            bool_bit=nn_skip;
+            for (int i=0;i<take&&rows_written<nrows;i++) {
+                int r=batch_start+rows_written;
+                bool is_null=cd->optional&&def_lvls&&(def_lvls[skip_in_page+i]==0);
+                if (is_null) batch->null_bitmap[slot][r/8]|=(uint8_t)(1u<<(r%8));
+                else { p=write_plain_val(p,end,cm->pq_type,bool_bit,batch,slot,r,a); if (cm->pq_type==PQ_BOOLEAN) bool_bit++; }
+                rows_written++;
+            }
         }
-        (void)nn_written;
         rows_seen+=ph.num_values;
     }
 }
@@ -772,6 +883,122 @@ static int pq_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     return (batch_row>0)?0:1;
 }
 
+/* ── write_batch(): запись parquet-файла (sink) ──
+ * Минимальный валидный parquet: одна row-group, по одной DATA_PAGE на колонку,
+ * все колонки REQUIRED BYTE_ARRAY(UTF8), PLAIN, UNCOMPRESSED. Значения — строки
+ * (числа форматируются, null → пустая строка). Метаданные — thrift compact. */
+typedef struct { uint8_t *d; size_t len, cap; } WBuf;
+static void wb_init(WBuf *b){ b->cap=4096; b->d=malloc(b->cap); b->len=0; }
+static void wb_ensure(WBuf *b,size_t n){ if(b->len+n>b->cap){ while(b->len+n>b->cap)b->cap*=2; b->d=realloc(b->d,b->cap);} }
+static void wb_u8(WBuf *b,uint8_t v){ wb_ensure(b,1); b->d[b->len++]=v; }
+static void wb_raw(WBuf *b,const void *p,size_t n){ wb_ensure(b,n); memcpy(b->d+b->len,p,n); b->len+=n; }
+static void wb_uv(WBuf *b,uint64_t v){ while(v>=0x80){ wb_u8(b,(uint8_t)(v|0x80)); v>>=7;} wb_u8(b,(uint8_t)v); }
+static void wb_zz32(WBuf *b,int32_t v){ wb_uv(b,((uint32_t)v<<1)^(uint32_t)(v>>31)); }
+static void wb_zz64(WBuf *b,int64_t v){ wb_uv(b,((uint64_t)v<<1)^(uint64_t)(v>>63)); }
+static void wb_le32(WBuf *b,uint32_t v){ uint8_t t[4]={(uint8_t)v,(uint8_t)(v>>8),(uint8_t)(v>>16),(uint8_t)(v>>24)}; wb_raw(b,t,4); }
+/* thrift compact types */
+#define TW_I32 5
+#define TW_I64 6
+#define TW_BIN 8
+#define TW_LIST 9
+#define TW_STRUCT 12
+static void tw_field(WBuf *b,int *last,int fid,int ct){
+    int d=fid-*last;
+    if (d>0&&d<=15) wb_u8(b,(uint8_t)((d<<4)|ct)); else { wb_u8(b,(uint8_t)ct); wb_zz32(b,fid); }
+    *last=fid;
+}
+static void tw_i32(WBuf *b,int *last,int fid,int32_t v){ tw_field(b,last,fid,TW_I32); wb_zz32(b,v); }
+static void tw_i64(WBuf *b,int *last,int fid,int64_t v){ tw_field(b,last,fid,TW_I64); wb_zz64(b,v); }
+static void tw_str(WBuf *b,int *last,int fid,const char *s){ tw_field(b,last,fid,TW_BIN); size_t n=strlen(s); wb_uv(b,n); wb_raw(b,s,n); }
+static void tw_lh(WBuf *b,int size,int ect){ if(size<15) wb_u8(b,(uint8_t)((size<<4)|ect)); else { wb_u8(b,(uint8_t)(0xF0|ect)); wb_uv(b,(uint64_t)size);} }
+static void tw_stop(WBuf *b){ wb_u8(b,0); }
+
+static int pq_write_batch(void *vctx, Arena *a, const char *entity,
+                          const Schema *schema, const ColBatch *batch, int mode) {
+    (void)vctx; (void)a; (void)mode;   /* sink всегда пишет файл целиком */
+    if (!entity || !entity[0]) { LOG_ERROR("parquet sink: empty target path"); return -1; }
+    int ncols=batch->ncols, nrows=batch->nrows;
+    FILE *f=fopen(entity,"wb");
+    if (!f) { LOG_ERROR("parquet sink: cannot open %s", entity); return -1; }
+    fwrite("PAR1",1,4,f);
+
+    int64_t *coff=malloc((size_t)ncols*sizeof(int64_t));
+    int64_t *csz =malloc((size_t)ncols*sizeof(int64_t));
+    char numbuf[64];
+    for (int c=0;c<ncols;c++) {
+        coff[c]=(int64_t)ftell(f);
+        WBuf vals; wb_init(&vals);
+        for (int r=0;r<nrows;r++) {
+            const uint8_t *bm=batch->null_bitmap[c];
+            const char *v="";
+            if (!(bm&&((bm[r/8]>>(r%8))&1u))) {
+                switch (schema->cols[c].type) {
+                    case COL_INT64: snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
+                    case COL_DOUBLE:snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
+                    default: v=((char**)batch->values[c])[r]; if(!v)v=""; break;
+                }
+            }
+            uint32_t L=(uint32_t)strlen(v); wb_le32(&vals,L); wb_raw(&vals,v,L);
+        }
+        WBuf hdr; wb_init(&hdr); int last=0;
+        tw_i32(&hdr,&last,1,0);                 /* type = DATA_PAGE */
+        tw_i32(&hdr,&last,2,(int32_t)vals.len); /* uncompressed_page_size */
+        tw_i32(&hdr,&last,3,(int32_t)vals.len); /* compressed_page_size */
+        tw_field(&hdr,&last,5,TW_STRUCT);       /* data_page_header */
+        { int l2=0; tw_i32(&hdr,&l2,1,nrows); tw_i32(&hdr,&l2,2,0); /* PLAIN */
+          tw_i32(&hdr,&l2,3,3); tw_i32(&hdr,&l2,4,3); tw_stop(&hdr); }
+        tw_stop(&hdr);
+        fwrite(hdr.d,1,hdr.len,f); fwrite(vals.d,1,vals.len,f);
+        csz[c]=(int64_t)(hdr.len+vals.len);
+        free(hdr.d); free(vals.d);
+    }
+
+    /* FileMetaData */
+    WBuf m; wb_init(&m); int last=0;
+    tw_i32(&m,&last,1,1);                        /* version */
+    tw_field(&m,&last,2,TW_LIST);                /* schema list */
+    tw_lh(&m,ncols+1,TW_STRUCT);
+    { int l2=0; tw_str(&m,&l2,4,"schema"); tw_i32(&m,&l2,5,ncols); tw_stop(&m); }  /* root */
+    for (int c=0;c<ncols;c++){ int l2=0;
+        tw_i32(&m,&l2,1,6);                      /* type = BYTE_ARRAY */
+        tw_i32(&m,&l2,3,0);                      /* repetition = REQUIRED */
+        tw_str(&m,&l2,4,schema->cols[c].name);
+        tw_i32(&m,&l2,6,0);                      /* converted_type = UTF8 */
+        tw_stop(&m); }
+    tw_i64(&m,&last,3,(int64_t)nrows);           /* num_rows */
+    tw_field(&m,&last,4,TW_LIST);                /* row_groups list (1) */
+    tw_lh(&m,1,TW_STRUCT);
+    { int rg=0;
+      tw_field(&m,&rg,1,TW_LIST);                /* columns */
+      tw_lh(&m,ncols,TW_STRUCT);
+      int64_t total=0;
+      for (int c=0;c<ncols;c++){ int cc=0;
+          tw_i64(&m,&cc,2,coff[c]);              /* file_offset */
+          tw_field(&m,&cc,3,TW_STRUCT);          /* meta_data */
+          { int md=0;
+            tw_i32(&m,&md,1,6);                  /* type = BYTE_ARRAY */
+            tw_field(&m,&md,2,TW_LIST); tw_lh(&m,1,TW_I32); wb_zz32(&m,0);   /* encodings=[PLAIN] */
+            tw_field(&m,&md,3,TW_LIST); tw_lh(&m,1,TW_BIN);
+            { size_t n=strlen(schema->cols[c].name); wb_uv(&m,n); wb_raw(&m,schema->cols[c].name,n); } /* path */
+            tw_i32(&m,&md,4,0);                  /* codec = UNCOMPRESSED */
+            tw_i64(&m,&md,5,(int64_t)nrows);     /* num_values */
+            tw_i64(&m,&md,6,csz[c]);             /* total_uncompressed_size */
+            tw_i64(&m,&md,7,csz[c]);             /* total_compressed_size */
+            tw_i64(&m,&md,9,coff[c]);            /* data_page_offset */
+            tw_stop(&m); }
+          tw_stop(&m);                           /* ColumnChunk stop */
+          total+=csz[c]; }
+      tw_i64(&m,&rg,2,total); tw_i64(&m,&rg,3,(int64_t)nrows); tw_stop(&m); }  /* RowGroup */
+    tw_stop(&m);                                 /* FileMetaData stop */
+    fwrite(m.d,1,m.len,f);
+    uint32_t mlen=(uint32_t)m.len;
+    uint8_t lb[4]={(uint8_t)mlen,(uint8_t)(mlen>>8),(uint8_t)(mlen>>16),(uint8_t)(mlen>>24)};
+    fwrite(lb,1,4,f); fwrite("PAR1",1,4,f);
+    free(m.d); free(coff); free(csz); fclose(f);
+    LOG_INFO("parquet sink: %d rows × %d cols → %s", nrows, ncols, entity);
+    return nrows;
+}
+
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "parquet",
@@ -785,4 +1012,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_start    = NULL,
     .cdc_stop     = NULL,
     .ping         = pq_ping,
+    .write_batch  = pq_write_batch,
 };
