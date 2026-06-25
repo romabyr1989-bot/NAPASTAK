@@ -31,6 +31,9 @@ typedef struct {
 /* ── Буфер для libcurl write callback ── */
 typedef struct { char *data; size_t len, cap; } CurlBuf;
 
+/* libcurl write callback: дописывает порцию ответа в CurlBuf, удваивая
+ * ёмкость по мере роста. Также используется как ручной аппендер при сборке
+ * JSON-тела (см. jh_write_batch). Возврат != n => libcurl прервёт передачу. */
 static size_t curl_write(void *ptr, size_t size, size_t nmemb, void *ud) {
     CurlBuf *b=ud;
     size_t n=size*nmemb;
@@ -48,6 +51,9 @@ static size_t curl_write(void *ptr, size_t size, size_t nmemb, void *ud) {
 }
 
 /* ── HTTP запрос ── */
+/* Выполняет один GET/POST к ctx->url, добавляя page_param=cursor_or_offset
+ * (если заданы), и возвращает тело ответа, скопированное в арену a (NULL при
+ * ошибке транспорта или коде вне 2xx; причина пишется в ctx->last_err). */
 static char *jh_fetch(JHCtx *ctx, const char *cursor_or_offset, Arena *a) {
     CURL *curl=curl_easy_init();
     if (!curl) return NULL;
@@ -134,6 +140,7 @@ static JVal *jh_navigate(JVal *root, const char *path) {
 static ColType infer_col_type(JVal *arr, int col_idx) {
     if (!arr||arr->type!=JV_ARRAY) return COL_TEXT;
     ColType t=COL_NULL;
+    /* семплируем до 10 первых строк; при конфликте типов откатываемся к TEXT */
     int samples=(int)arr->nitems<10?(int)arr->nitems:10;
     for (int i=0;i<samples;i++) {
         JVal *row=arr->items[i];
@@ -143,7 +150,7 @@ static ColType infer_col_type(JVal *arr, int col_idx) {
         ColType ct;
         switch(v->type) {
             case JV_NUMBER: {
-                /* double vs int64: целое число? */
+                /* double vs int64: целое число без дробной части → INT64 */
                 double d=v->n; int64_t iv=(int64_t)d;
                 ct=(d==(double)iv)?COL_INT64:COL_DOUBLE;
                 break;
@@ -174,6 +181,9 @@ static Schema *jh_infer_schema(JVal *arr, Arena *a) {
 }
 
 /* ── Заполнение ColBatch из массива JVal ── */
+/* Переносит до nmax строк (начиная с start_item) в колоночные массивы batch
+ * согласно типам схемы; отсутствующие/NULL-поля отмечаются в null_bitmap.
+ * Возвращает число заполненных строк. */
 static int jh_fill_batch(JVal *arr, Schema *sc, ColBatch *batch,
                           int start_item, int nmax, Arena *a) {
     if (!arr||arr->type!=JV_ARRAY) return 0;
@@ -206,6 +216,10 @@ static int jh_fill_batch(JVal *arr, Schema *sc, ColBatch *batch,
 }
 
 /* ── cfg_get ── */
+/* Мини-парсер конфига: вытаскивает значение поля key из JSON-строки в out
+ * (строковое в кавычках либо «голый» токен до , } пробела). При отсутствии
+ * поля сохраняется def. Не полноценный JSON-парсер — достаточно для плоского
+ * конфига коннектора. */
 static void cfg_get(const char *json, const char *key,
                      char *out, size_t outsz, const char *def) {
     if (def) { strncpy(out,def,outsz-1); out[outsz-1]='\0'; }
@@ -231,6 +245,8 @@ static void cfg_get(const char *json, const char *key,
 
 /* ── Lifecycle ── */
 
+/* create(): аллоцирует JHCtx в арене и заполняет его из cfg значениями
+ * по умолчанию. */
 static void *jh_create(const char *cfg, Arena *a) {
     JHCtx *ctx=arena_calloc(a,sizeof(JHCtx));
     ctx->arena=a;
@@ -251,6 +267,7 @@ static void *jh_create(const char *cfg, Arena *a) {
 
 static void jh_destroy(void *ctx) { (void)ctx; }
 
+/* ping(): пробный запрос к URL во временной арене; 0 если ответ получен. */
 static int jh_ping(void *vctx) {
     JHCtx *ctx=vctx;
     if (!ctx||!ctx->url[0]) return -1;
@@ -266,6 +283,8 @@ static const char *jh_last_error(void *vctx) {
     return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
 }
 
+/* list_entities(): у REST-эндпоинта одна «сущность»; имя выводим из последнего
+ * сегмента пути URL (без query string). */
 static int jh_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     JHCtx *ctx=vctx;
     out->items=arena_calloc(a,sizeof(DfoEntity));
@@ -281,6 +300,8 @@ static int jh_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     return 0;
 }
 
+/* describe(): тянет первую страницу, навигирует к массиву и выводит схему из
+ * его первого элемента. Парсинг — во временной арене pa, схема — в арене a. */
 static int jh_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     (void)entity;
     JHCtx *ctx=vctx;
@@ -329,6 +350,7 @@ static int jh_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     int nrows=(int)arr->nitems;
     if (nrows>BATCH_SIZE) nrows=BATCH_SIZE;
 
+    /* Выделяем колоночные массивы и null-битмапы под выведённые типы */
     ColBatch *batch=arena_calloc(a,sizeof(ColBatch));
     batch->schema=sc; batch->ncols=ncols;
     for (int c=0;c<ncols;c++) {
@@ -371,6 +393,7 @@ static void jh_json_escape(CurlBuf *b, const char *s) {
  * "url". Auth headers (bearer / api_key) from config are reused. Returns rows
  * written on HTTP 2xx, -1 otherwise. mode is ignored (every call POSTs its own
  * batch; the remote endpoint decides append vs replace). */
+/* Проверка NULL по битмапу: возвращает "" (sentinel) если ячейка NULL, иначе NULL. */
 static const char *bit_isnull(const ColBatch *b, int c, int r) {
     const uint8_t *bm = b->null_bitmap[c];
     return (bm && ((bm[r/8] >> (r%8)) & 1u)) ? "" : NULL; /* "" sentinel = null */
@@ -383,7 +406,8 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
                       ? entity : ctx->url;
     if (!url || !url[0]) return -1;
 
-    /* Build JSON body: [{"col":"val",...},...] (cells are TEXT). */
+    /* Build JSON body: [{"col":"val",...},...] (cells are TEXT).
+     * Собираем вручную через curl_write в растущий буфер; строки экранируем. */
     CurlBuf body = {NULL,0,0};
     curl_write((void*)"[", 1, 1, &body);
     char tmp[64];
@@ -447,6 +471,7 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
     return batch->nrows;
 }
 
+/* Таблица экспорта плагина: точка входа, по которой загрузчик находит коннектор. */
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "json_http",

@@ -1,8 +1,11 @@
 #pragma once
+/* Тонкая обёртка над TLS: серверный контекст и соединение поверх сокета.
+   Даёт read/write с тем же интерфейсом, что и обычные системные вызовы. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
 
+/* Непрозрачные типы: контекст (cert/key, общий на сервер) и одно соединение. */
 typedef struct TlsCtx TlsCtx;
 typedef struct TlsConn TlsConn;
 

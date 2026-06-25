@@ -26,6 +26,7 @@
 
 typedef uint8_t Page[BT_PAGE_SIZE];
 
+/* Дескриптор открытого дерева в памяти: fd файла + кэш полей заголовка. */
 struct BTree {
     int     fd;
     int32_t root;    /* номер страницы текущего корня */
@@ -344,6 +345,7 @@ BTree *btree_open(const char *path) {
     return t;
 }
 
+/* Закрытие дерева: сбрасываем заголовок, закрываем fd и освобождаем дескриптор. */
 void btree_close(BTree *t) {
     if (!t) return;
     flush_hdr(t);

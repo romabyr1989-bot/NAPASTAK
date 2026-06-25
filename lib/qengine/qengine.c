@@ -1,3 +1,13 @@
+/*
+ * qengine.c — векторизованный (батчевый) исполнитель запросов DataFlow OS.
+ *
+ * Содержит: вычислитель выражений (eval_expr/eval_bool) со строковыми и
+ * fuzzy-match builtin'ами для MDM (levenshtein/jaro_winkler/normalize_*),
+ * и набор физических операторов с единым pull-интерфейсом OpVtable
+ * (open/next/close): scan, filter, limit, window, hash-agg, sort, join.
+ * qengine_build() собирает дерево операторов из логического плана,
+ * qengine_exec_json() прогоняет его и отдаёт строки результата в JSON.
+ */
 #include "qengine.h"
 #include "../core/log.h"
 #include "../core/json.h"
@@ -161,6 +171,8 @@ const char *qe_normalize_name(const char *s, Arena *a) {
     return out;
 }
 
+/* Рекурсивно вычисляет выражение для текущей строки (ctx->row) и возвращает
+ * скаляр. NULL распространяется по правилам SQL; неизвестные операции дают NULL. */
 Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
     Scalar s = {SV_NULL};
     if (!e) return s;
@@ -408,6 +420,8 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
     }
 }
 
+/* Вычисляет выражение и приводит результат к булеву (для WHERE/HAVING/ON).
+ * SQL NULL трактуется как false. */
 bool eval_bool(Expr *e, EvalCtx *ctx, Arena *a) {
     Scalar s = eval_expr(e, ctx, a);
     if (s.type == SV_BOOL)   return s.val.bval;
@@ -429,6 +443,7 @@ typedef struct {
     int    ncols;
 } ScanState;
 
+/* Читает schema.json таблицы (имена/типы/nullable колонок) в Schema. NULL при ошибке. */
 static Schema *scan_load_schema(Arena *a, const char *data_dir, const char *table_name) {
     char path[700];
     snprintf(path, sizeof(path), "%s/%s/schema.json", data_dir, table_name);
@@ -469,6 +484,8 @@ static int scan_open(Operator *op) {
     return 0;
 }
 
+/* Читает из WAL до BATCH_SIZE строк, разбирает CSV-значения по типам колонок
+ * и заполняет один ColBatch. Возвращает 1 (EOF) когда строк больше нет. */
 static int scan_next(Operator *op, ColBatch **out) {
     ScanState *st = op->state;
     if (st->done || !st->wal_file) return 1; /* EOF */
@@ -548,6 +565,8 @@ typedef struct { Expr *predicate; } FilterState;
 
 static int filter_open(Operator *op) { return op->left->vt->open(op->left); }
 
+/* Тянет батчи из дочернего оператора и оставляет строки, прошедшие predicate.
+ * Пустые после фильтрации батчи пропускаются — берём следующий из ребёнка. */
 static int filter_next(Operator *op, ColBatch **out) {
     FilterState *st = op->state;
     for (;;) {
@@ -604,6 +623,8 @@ typedef struct { int64_t limit, offset, emitted, skipped; } LimitState;
 
 static int limit_open(Operator *op) { return op->left->vt->open(op->left); }
 
+/* Применяет OFFSET/LIMIT: пропускает offset строк, затем отдаёт не более limit.
+ * limit < 0 означает «без ограничения». */
 static int limit_next(Operator *op, ColBatch **out) {
     LimitState *st = op->state;
     if (st->limit >= 0 && st->emitted >= st->limit) return 1;
@@ -666,6 +687,8 @@ typedef struct {
 
 static int window_open(Operator *op) { return op->left->vt->open(op->left); }
 
+/* Блокирующий: при первом вызове материализует все строки ребёнка в один
+ * буфер, затем отдаёт их чанками по BATCH_SIZE. */
 static int window_next(Operator *op, ColBatch **out) {
     WindowState *st = op->state;
 
@@ -785,6 +808,8 @@ Operator *op_window(Arena *a, Operator *src, Expr **window_exprs, int nwexprs) {
 
 /* ── Aggregate / sort / project helpers ── */
 
+/* Является ли выражение агрегатом (count/sum/avg/min/max). Опционально
+ * возвращает имя функции и её первый аргумент. Разворачивает EXPR_ALIAS. */
 static bool is_agg_func(Expr *e, const char **fn_out, Expr **arg_out) {
     if (!e) return false;
     if (e->type == EXPR_ALIAS) return is_agg_func(e->expr, fn_out, arg_out);
@@ -839,6 +864,9 @@ typedef struct {
     Schema  *out_schema;
 } AggState;
 
+/* Линейный поиск группы по значениям ключей; при отсутствии создаёт новую
+ * (текстовые ключи копируются в арену). Возвращает индекс группы или -1 при
+ * переполнении AGG_MAX_GROUPS. */
 static int agg_find_group(AggState *st, Scalar *keys, Arena *a) {
     for (int g = 0; g < st->ngroups; g++) {
         bool match = true;
@@ -858,6 +886,8 @@ static int agg_find_group(AggState *st, Scalar *keys, Arena *a) {
     return g;
 }
 
+/* Обновляет аккумуляторы группы g для выходного выражения oi одним значением:
+ * счётчик строк, сумму (для sum/avg) и текущие min/max. */
 static void agg_accumulate(AggState *st, int g, int oi, const char *fn, Scalar val, Arena *a) {
     int idx = g * st->nout + oi;
     st->cnt_acc[idx]++;
@@ -911,6 +941,8 @@ static void agg_accumulate(AggState *st, int g, int oi, const char *fn, Scalar v
 
 static int agg_open(Operator *op) { return op->left->vt->open(op->left); }
 
+/* Блокирующий: при первом вызове прогоняет всего ребёнка, группирует и считает
+ * агрегаты, выводит схему результата; затем отдаёт по одной строке на группу. */
 static int agg_next(Operator *op, ColBatch **out_batch) {
     AggState *st = op->state;
     Arena *a = op->arena;
@@ -1078,6 +1110,8 @@ typedef struct {
 /* qsort context (not thread-safe, but single-threaded here) */
 static SortState *g_sort_ctx = NULL;
 
+/* Компаратор qsort над индексами строк: сравнивает по ключам ORDER BY
+ * (учитывая ASC/DESC) через g_sort_ctx. */
 static int sort_cmp(const void *va, const void *vb) {
     int ia = *(const int*)va, ib = *(const int*)vb;
     SortState *st = g_sort_ctx;
@@ -1104,6 +1138,8 @@ static int sort_cmp(const void *va, const void *vb) {
 
 static int sort_open(Operator *op) { return op->left->vt->open(op->left); }
 
+/* Блокирующий: материализует все строки, сортирует массив индексов qsort'ом,
+ * переставляет колонки в новый батч и отдаёт весь результат за один вызов. */
 static int sort_next(Operator *op, ColBatch **out) {
     SortState *st = op->state;
     Arena *a = op->arena;
@@ -1233,6 +1269,7 @@ Operator *op_project(Arena *a, Operator *src, Expr **exprs, int nexprs, Schema *
     return src;
 }
 
+/* Есть ли где-то ниже по левой ветви плана узел агрегации. */
 static bool plan_has_agg(PlanNode *p) {
     if (!p) return false;
     if (p->type == PLAN_AGG) return true;
@@ -1253,6 +1290,7 @@ typedef struct {
     Schema   *out_schema;
 } JoinState;
 
+/* Конкатенирует схемы левой и правой сторон джойна (колонки left, затем right). */
 static Schema *join_schema(Arena *a, Schema *ls, Schema *rs) {
     if (!ls || !rs) return ls ? ls : rs;
     int nc = ls->ncols + rs->ncols;
@@ -1270,6 +1308,8 @@ static int join_open(Operator *op) {
     return 0;
 }
 
+/* Nested-loop джойн: один раз материализует правую сторону, затем для каждой
+ * левой строки перебирает правые, проверяя ON, и отдаёт по одной склеенной строке. */
 static int join_next(Operator *op, ColBatch **out) {
     JoinState *st = op->state;
     Arena *a = op->arena;
@@ -1414,6 +1454,7 @@ Operator *op_hash_join(Arena *a, Operator *left, Operator *right,
 }
 
 /* ── Build from logical plan ── */
+/* Рекурсивно собирает дерево физических операторов из логического плана. */
 Operator *qengine_build(Arena *a, PlanNode *plan, const char *data_dir) {
     if (!plan) return NULL;
     switch (plan->type) {
@@ -1469,6 +1510,8 @@ static void scalar_to_json(Scalar *s, JBuf *jb) {
     }
 }
 
+/* Прогоняет дерево операторов (open→next*→close), сериализует каждую строку в
+ * JSON-объект и отдаёт через колбэк cb. В rows_out — число строк. */
 int qengine_exec_json(Operator *root, Arena *a, RowJsonCb cb, void *ud, int *rows_out) {
     if (!root) { if(rows_out)*rows_out=0; return 0; }
     root->vt->open(root);

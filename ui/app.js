@@ -60,17 +60,30 @@ document.querySelectorAll('.nav-item').forEach(a => {
   a.addEventListener('click', e => { e.preventDefault(); switchView(a.dataset.view); });
 });
 
-const VALID_VIEWS = new Set(['pipelines','builder','analytics','matviews','security','metrics','settings']);
+const VALID_VIEWS = new Set(['pipelines','builder','analytics','matviews','security','metrics','settings','admin']);
+const ADMIN_TABS  = ['settings','security'];   /* grouped under «Администрирование» (порядок вкладок) */
+let _adminTab = 'settings';                    /* какая вкладка открывается при входе */
 
 function switchView(name, { pushState = true } = {}) {
+  if (name === 'admin') name = ADMIN_TABS[0];    /* клик по «Администрирование» → всегда первая вкладка (Настройки) */
   if (!VALID_VIEWS.has(name)) name = 'pipelines';
+  const isAdmin = ADMIN_TABS.includes(name);
+  if (isAdmin) _adminTab = name;
 
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  const navEl = document.querySelector(`[data-view="${name}"]`);
+  const navEl = document.querySelector(`[data-view="${isAdmin ? 'admin' : name}"]`);
   if (navEl) navEl.classList.add('active');
   const viewEl = document.getElementById('view-' + name);
   if (viewEl) viewEl.classList.add('active');
+
+  /* admin tab bar: visible only under Администрирование, active tab synced */
+  const tb = document.getElementById('admin-tabbar');
+  if (tb) {
+    tb.style.display = isAdmin ? '' : 'none';
+    tb.querySelectorAll('.ingest-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.admintab === name));
+  }
 
   /* hide builder nav item when not editing */
   const nb = document.getElementById('nav-builder');
@@ -79,12 +92,23 @@ function switchView(name, { pushState = true } = {}) {
   if (name === 'pipelines') loadPipelinesView();
   if (name === 'analytics') loadAnalyticsModule();
   if (name === 'matviews')  loadMatviews();
-  if (name === 'security')  { loadRbacPolicies(); }
+  if (name === 'security')  restoreSecTab();
   if (name === 'metrics')   loadMetrics();
   if (name === 'settings')  loadSettings();
 
+  /* Запоминаем вид — чтобы перезагрузка (F5) оставляла на той же странице
+   * даже если URL-хэш потерян. Билдер не сохраняем (нужен id конкретного конвейера). */
+  if (name !== 'builder') { try { localStorage.setItem('dfo_view', name); } catch (_) {} }
+
   if (pushState && location.hash !== '#' + name)
     history.pushState({ view: name }, '', '#' + name);
+}
+
+/* Восстанавливает сохранённую под-вкладку раздела «Безопасность» (RBAC/Аудит). */
+function restoreSecTab() {
+  let st;
+  try { st = localStorage.getItem('dfo_sec_tab'); } catch (_) {}
+  switchSecTab(['rbac', 'audit', 'apikeys'].includes(st) ? st : 'rbac');
 }
 
 /* Pipelines view now also hosts the tables panel (formerly a separate view). */
@@ -227,7 +251,7 @@ function makeTableCard(t) {
   card.innerHTML = `
     <div class="table-card-head">
       <h3>${escHtml(t.name)}${sourceBadge}</h3>
-      <button class="btn btn-sm btn-danger" title="Удалить таблицу">Удалить</button>
+      <button class="btn btn-sm btn-danger" title="Удалить таблицу">✕</button>
     </div>
     <div class="meta">${fmtNum(t.rows || 0)} строк · ${(t.columns || []).length} столбцов <button class="btn btn-sm idx-btn" onclick="openIndexManager('${escAttr(t.name)}', event)" title="Индексы">⚡ Индексы</button></div>
     <div class="col-list">${cols || '<span class="col-pill">—</span>'}</div>
@@ -711,6 +735,10 @@ async function applyYaml() {
 /* ═══════════════════════════════════════════════════
    PIPELINE LIST
 ═══════════════════════════════════════════════════ */
+let _pipelinesPerPage = 10;   /* page size (Infinity = «Все») */
+let _pipelinesAll = [];
+let _pipelinesPage = 0;
+
 async function loadPipelines() {
   const list = document.getElementById('pipelines-list');
   list.innerHTML = '<div style="color:var(--muted);padding:.5rem">Загрузка…</div>';
@@ -718,6 +746,7 @@ async function loadPipelines() {
     const pipelines = await apiFetch('/api/pipelines');
     if (!pipelines) return;
     if (!pipelines.length) {
+      _pipelinesAll = [];
       list.innerHTML = `
         <div class="empty-state">
           Конвейеров пока нет.<br>
@@ -727,11 +756,57 @@ async function loadPipelines() {
         </div>`;
       return;
     }
-    list.innerHTML = '';
-    pipelines.forEach(p => list.appendChild(makePipelineRow(p)));
+    _pipelinesAll  = pipelines;
+    _pipelinesPage = 0;
+    renderPipelinesPage();
   } catch (err) {
     list.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(String(err))}</div>`;
   }
+}
+
+/* Render the current page of pipelines + pager controls (page nav + page size). */
+function renderPipelinesPage() {
+  const list = document.getElementById('pipelines-list');
+  if (!list) return;
+  const total   = _pipelinesAll.length;
+  const perPage = _pipelinesPerPage;
+  const all     = perPage === Infinity;
+  const pages   = all ? 1 : Math.max(1, Math.ceil(total / perPage));
+  if (_pipelinesPage > pages - 1) _pipelinesPage = pages - 1;
+  if (_pipelinesPage < 0) _pipelinesPage = 0;
+  const start = all ? 0 : _pipelinesPage * perPage;
+  const end   = all ? total : Math.min(start + perPage, total);
+  const slice = all ? _pipelinesAll : _pipelinesAll.slice(start, end);
+  list.innerHTML = '';
+  slice.forEach(p => list.appendChild(makePipelineRow(p)));
+  if (total > 0) {
+    const nav = document.createElement('div');
+    nav.className = 'pager';
+    const navBtns = pages > 1 ? `
+      <button class="btn btn-sm" ${_pipelinesPage === 0 ? 'disabled' : ''} onclick="pipelinesGoPage(${_pipelinesPage - 1})">← Назад</button>
+      <span class="pager-info">${start + 1}–${end} из ${total} · стр. ${_pipelinesPage + 1}/${pages}</span>
+      <button class="btn btn-sm" ${_pipelinesPage >= pages - 1 ? 'disabled' : ''} onclick="pipelinesGoPage(${_pipelinesPage + 1})">Вперёд →</button>`
+      : `<span class="pager-info">всего: ${total}</span>`;
+    const opts = [10, 25, 50].map(n => `<option value="${n}" ${perPage === n ? 'selected' : ''}>${n}</option>`).join('')
+               + `<option value="all" ${all ? 'selected' : ''}>Все</option>`;
+    nav.innerHTML = navBtns +
+      `<label class="pager-size">На странице:
+         <select onchange="pipelinesSetPerPage(this.value)">${opts}</select>
+       </label>`;
+    list.appendChild(nav);
+  }
+}
+
+function pipelinesGoPage(p) {
+  _pipelinesPage = p;
+  renderPipelinesPage();
+  document.getElementById('pipelines-list').scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+function pipelinesSetPerPage(v) {
+  _pipelinesPerPage = (v === 'all') ? Infinity : parseInt(v, 10);
+  _pipelinesPage = 0;
+  renderPipelinesPage();
 }
 
 const STATUS_LABELS = ['ожидание','выполняется','успех','ошибка','отменён'];
@@ -806,21 +881,35 @@ async function showPipelineRuns(id, name) {
     const runs = await apiFetch(`/api/pipelines/${id}/runs`);
     const list = Array.isArray(runs) ? runs : [];
     if (!list.length) { body.innerHTML = '<div style="color:var(--muted);padding:.5rem">Запусков пока нет.</div>'; return; }
-    let html = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Повторы</th><th>Ошибка</th></tr></thead><tbody>';
+    /* per-pipeline metric summary */
+    const okN  = list.filter(r => r.status === 0).length;
+    const durs = list.filter(r => r.started && r.finished).map(r => r.finished - r.started);
+    const avgD = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : 0;
+    const maxD = durs.length ? Math.max(...durs) : 0;
+    const summary = `<div style="margin-bottom:.85rem">
+      <div class="mstat-row"><span class="mstat-k">Запусков</span><span class="mstat-v">${list.length}</span></div>
+      <div class="mstat-row"><span class="mstat-k">Успешных</span><span class="mstat-v ok">${okN}</span></div>
+      <div class="mstat-row"><span class="mstat-k">Ошибок</span><span class="mstat-v ${list.length - okN ? 'err' : ''}">${list.length - okN}</span></div>
+      <div class="mstat-row"><span class="mstat-k">Средняя длительность</span><span class="mstat-v">${avgD.toFixed(1)} с</span></div>
+      <div class="mstat-row"><span class="mstat-k">Макс. длительность</span><span class="mstat-v">${maxD} с</span></div>
+    </div>`;
+    let html = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Длит.</th><th>Повторы</th><th>Ошибка</th></tr></thead><tbody>';
     list.forEach(r => {
       const statusLabel = r.status === 0 ? '<span class="badge badge-ok">успех</span>'
         : '<span class="badge badge-err">ошибка</span>';
+      const dur = (r.started && r.finished) ? (r.finished - r.started) + ' с' : '—';
       html += `<tr>
         <td>${r.id}</td>
         <td>${r.started ? new Date(r.started*1000).toLocaleString() : '—'}</td>
         <td>${r.finished ? new Date(r.finished*1000).toLocaleString() : '—'}</td>
         <td>${statusLabel}</td>
-        <td>${typeof r.retries === 'number' ? r.retries : 0}</td>
+        <td>${dur}</td>
+        <td>${typeof r.retry_count === 'number' ? r.retry_count : 0}</td>
         <td>${escHtml(r.error || '')}</td>
       </tr>`;
     });
     html += '</tbody></table>';
-    body.innerHTML = html;
+    body.innerHTML = summary + html;
   } catch (err) { body.innerHTML = `<div style="color:var(--red)">${escHtml(String(err))}</div>`; }
 }
 
@@ -2437,70 +2526,157 @@ async function savePipeline() {
 /* ═══════════════════════════════════════════════════
    METRICS
 ═══════════════════════════════════════════════════ */
+
+/* Paginated per-entity lists inside the metrics view. */
+let _mPipesAll = [], _mPipesPage = 0, _mPipesPerPage = 10;
+let _mMvAll    = [], _mMvPage    = 0, _mMvPerPage    = 10;
+
+function metricsPagerHTML(total, start, end, pages, page, all, perPage, goFn, sizeFn) {
+  const navBtns = pages > 1 ? `
+      <button class="btn btn-sm" ${page === 0 ? 'disabled' : ''} onclick="${goFn}(${page - 1})">← Назад</button>
+      <span class="pager-info">${start + 1}–${end} из ${total} · стр. ${page + 1}/${pages}</span>
+      <button class="btn btn-sm" ${page >= pages - 1 ? 'disabled' : ''} onclick="${goFn}(${page + 1})">Вперёд →</button>`
+    : `<span class="pager-info">всего: ${total}</span>`;
+  const opts = [10, 25, 50].map(n => `<option value="${n}" ${perPage === n ? 'selected' : ''}>${n}</option>`).join('')
+             + `<option value="all" ${all ? 'selected' : ''}>Все</option>`;
+  return `<div class="pager">${navBtns}<label class="pager-size">На странице:
+            <select onchange="${sizeFn}(this.value)">${opts}</select></label></div>`;
+}
+
+function metricPipeCardHTML(p) {
+  const st    = p.status || 0;
+  const last  = p.last_run ? new Date(p.last_run * 1000).toLocaleString() : 'не запускался';
+  const sched = p.cron ? `расписание: ${escHtml(p.cron)}` : 'вручную';
+  return `<div class="pipeline-item pipeline-item-clickable" title="Метрики конвейера"
+               onclick="showPipelineRuns('${escAttr(p.id)}','${escAttr(p.name || p.id)}')">
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <span class="pipeline-name">${escHtml(p.name || p.id)}</span>
+        <span class="badge ${STATUS_BADGE[st] || ''}">${STATUS_LABELS[st] || ''}</span>
+        ${!p.enabled ? '<span class="badge badge-warn">отключён</span>' : ''}
+      </div>
+      <div class="pipeline-meta">последний запуск: ${last} &nbsp;·&nbsp; ${sched}</div>
+    </div>
+    <div class="pipeline-actions"><span class="pipeline-meta">метрики →</span></div>
+  </div>`;
+}
+
+function metricMvCardHTML(v) {
+  const badge = v.last_error ? 'badge-err' : (v.is_stale ? 'badge-warn' : 'badge-ok');
+  const lbl   = v.last_error ? 'ошибка' : (v.is_stale ? 'устарело' : 'актуально');
+  const when  = v.last_refreshed_at ? new Date(v.last_refreshed_at * 1000).toLocaleString() : 'не обновлялась';
+  return `<div class="pipeline-item pipeline-item-clickable" title="Метрики витрины"
+               onclick="showMatviewMetrics('${escAttr(v.name)}')">
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <span class="pipeline-name">${escHtml(v.name)}</span>
+        <span class="badge ${badge}">${lbl}</span>
+      </div>
+      <div class="pipeline-meta">строк: ${fmtNum(v.row_count || 0)} &nbsp;·&nbsp; обновление: ${v.refresh_duration_ms ?? 0} мс &nbsp;·&nbsp; обновлена: ${when}</div>
+    </div>
+    <div class="pipeline-actions"><span class="pipeline-meta">метрики →</span></div>
+  </div>`;
+}
+
+function renderMetricsPipes() {
+  const list = document.getElementById('metrics-pipelines-list');
+  if (!list) return;
+  const total = _mPipesAll.length;
+  if (!total) { list.innerHTML = '<div class="empty-state">Нет конвейеров</div>'; return; }
+  const perPage = _mPipesPerPage, all = perPage === Infinity;
+  const pages = all ? 1 : Math.max(1, Math.ceil(total / perPage));
+  if (_mPipesPage > pages - 1) _mPipesPage = pages - 1;
+  if (_mPipesPage < 0) _mPipesPage = 0;
+  const start = all ? 0 : _mPipesPage * perPage;
+  const end   = all ? total : Math.min(start + perPage, total);
+  const slice = all ? _mPipesAll : _mPipesAll.slice(start, end);
+  list.innerHTML = slice.map(metricPipeCardHTML).join('') +
+    metricsPagerHTML(total, start, end, pages, _mPipesPage, all, perPage, 'mPipesGoPage', 'mPipesSetPerPage');
+}
+function mPipesGoPage(p)     { _mPipesPage = p; renderMetricsPipes(); }
+function mPipesSetPerPage(v) { _mPipesPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _mPipesPage = 0; renderMetricsPipes(); }
+
+function renderMetricsMv() {
+  const list = document.getElementById('metrics-matviews-list');
+  if (!list) return;
+  const total = _mMvAll.length;
+  if (!total) { list.innerHTML = '<div class="empty-state">Нет витрин</div>'; return; }
+  const perPage = _mMvPerPage, all = perPage === Infinity;
+  const pages = all ? 1 : Math.max(1, Math.ceil(total / perPage));
+  if (_mMvPage > pages - 1) _mMvPage = pages - 1;
+  if (_mMvPage < 0) _mMvPage = 0;
+  const start = all ? 0 : _mMvPage * perPage;
+  const end   = all ? total : Math.min(start + perPage, total);
+  const slice = all ? _mMvAll : _mMvAll.slice(start, end);
+  list.innerHTML = slice.map(metricMvCardHTML).join('') +
+    metricsPagerHTML(total, start, end, pages, _mMvPage, all, perPage, 'mMvGoPage', 'mMvSetPerPage');
+}
+function mMvGoPage(p)     { _mMvPage = p; renderMetricsMv(); }
+function mMvSetPerPage(v) { _mMvPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _mMvPage = 0; renderMetricsMv(); }
+
 async function loadMetrics() {
   try {
-    const [raw, tables, pipelines] = await Promise.all([
+    const [raw, tables, pipelines, matviews] = await Promise.all([
       apiFetch('/api/metrics').catch(() => null),
       apiFetch('/api/tables').catch(() => []),
       apiFetch('/api/pipelines').catch(() => []),
+      apiFetch('/api/matviews').catch(() => []),
     ]);
     if (!raw) return; /* logged out or network error */
-    const m = raw.metrics ?? raw; /* /api/metrics wraps in {metrics:{...}} */
+    const m = raw.metrics ?? raw; /* /api/metrics returns a flat object */
 
     /* ── Stat cards ── */
     const grid = document.getElementById('metrics-detail');
     grid.innerHTML = '';
-    const fields = [
-      ['uptime',                  'Аптайм',                    v => fmtUptime(v)],
-      ['total_rows',              'Строк загружено',           v => fmtNum(v)],
-      ['total_queries',           'Запросов выполнено',        v => fmtNum(v)],
-      ['total_pipelines_run',     'Запусков конвейеров',       v => fmtNum(v)],
-      ['avg_query_latency_ms',    'Задержка запроса, мс',      v => v.toFixed(1)],
-      ['avg_pipeline_latency_ms', 'Задержка конвейера, мс',   v => v.toFixed(1)],
+    const num = v => fmtNum(v ?? 0);
+    const ms  = v => (v ?? 0).toFixed(1);
+    const e5xx = m.http_errors_5xx ?? 0, e4xx = m.http_errors_4xx ?? 0;
+    const storageRows = tables.reduce((s, t) => s + (t.rows || 0), 0);   /* объём данных */
+    /* [label, value, warn?, tooltip?] */
+    const cards = [
+      ['Аптайм',                 fmtUptime(m.uptime ?? 0), false, 'Время работы сервера с момента запуска'],
+      ['Таблиц',                 num(tables.length), false, 'Сколько таблиц сейчас в движке (источники + результаты конвейеров + витрины)'],
+      ['Строк в хранилище',      num(storageRows), false, 'Суммарно строк во всех таблицах движка — объём данных платформы'],
+      ['Строк/мин',              num(Math.round(m.avg_ingest_rows_1min ?? 0)), false, 'Скорость загрузки строк из источников за последнюю минуту'],
+      ['Запросов',               num(m.total_queries), false, 'Всего SQL-запросов выполнено с момента запуска'],
+      ['Задержка запроса, мс',   ms(m.avg_query_latency_ms), false, 'Средняя длительность SQL-запроса (последняя минута)'],
+      ['Запусков конвейеров',    num(m.total_pipelines_run), false, 'Всего запусков конвейеров с момента запуска'],
+      ['Задержка конвейера, мс', ms(m.avg_pipeline_latency_ms), false, 'Средняя длительность прогона конвейера (последняя минута)'],
+      ['HTTP-латенси, мс',       ms(m.avg_http_latency_ms), false, 'Среднее время ответа API (последняя минута)'],
+      ['Ошибки сервера (5xx)',   num(e5xx), e5xx > 0, 'Внутренние ошибки сервера (HTTP 5xx) — сбои/баги. В норме 0'],
+      ['Ошибки клиента (4xx)',   num(e4xx), false, 'Отклонённые запросы клиента (HTTP 4xx) — напр. 401 (нет доступа), 404 (не найдено). Обычно не проблема'],
     ];
-    fields.forEach(([key, label, fmt]) => {
-      const v    = m[key] ?? 0;
+    cards.forEach(([label, val, warn, tip]) => {
       const card = document.createElement('div');
       card.className = 'stat-card';
-      card.innerHTML = `<div class="stat-val">${fmt(v)}</div><div class="stat-label">${label}</div>`;
+      if (tip) card.title = tip;
+      card.innerHTML = `<div class="stat-val"${warn ? ' style="color:var(--red)"' : ''}>${val}</div>` +
+                       `<div class="stat-label">${label}</div>`;
       grid.appendChild(card);
     });
 
-    /* ── Tables bar chart ── */
-    const barList = document.getElementById('metrics-bar-list');
-    const sorted  = [...tables].sort((a, b) => (b.rows || 0) - (a.rows || 0)).slice(0, 10);
-    const maxRows = Math.max(...sorted.map(t => t.rows || 0), 1);
-    if (!sorted.length) {
-      barList.innerHTML = '<div class="metrics-empty">Нет таблиц</div>';
-    } else {
-      barList.innerHTML = sorted.map(t => {
-        const pct  = Math.max(2, Math.round(((t.rows || 0) / maxRows) * 100));
-        const rows = fmtNum(t.rows || 0);
-        return `<div class="mbar-row">
-          <div class="mbar-label" title="${escHtml(t.name)}">${escHtml(t.name)}</div>
-          <div class="mbar-track"><div class="mbar-fill" style="width:${pct}%"></div></div>
-          <div class="mbar-val">${rows}</div>
-        </div>`;
-      }).join('');
-    }
+    /* ── Pipelines — list of plashki (как раздел «Конвейеры»), клик → метрики ── */
+    const pEnabled   = pipelines.filter(p => p.enabled).length;
+    const pScheduled = pipelines.filter(p => p.cron).length;
+    const pSuccess   = pipelines.filter(p => (p.status || 0) === 2).length;
+    const pFailed    = pipelines.filter(p => (p.status || 0) === 3).length;
+    document.getElementById('metrics-pipelines-sum').textContent = pipelines.length
+      ? `всего ${pipelines.length} · включено ${pEnabled} · по расписанию ${pScheduled} · запусков ${m.total_pipelines_run ?? 0} · успех ${pSuccess} / ошибка ${pFailed}`
+      : '';
+    _mPipesAll = pipelines;
+    renderMetricsPipes();   /* пагинация сохраняет текущую страницу между авто-обновлениями */
 
-    /* ── Pipelines summary ── */
-    const plList = document.getElementById('metrics-pipeline-list');
-    if (!pipelines.length) {
-      plList.innerHTML = '<div class="metrics-empty">Нет конвейеров</div>';
-    } else {
-      plList.innerHTML = pipelines.map(p => {
-        const st   = p.status || 0;
-        const badge= STATUS_BADGE[st]  || '';
-        const lbl  = STATUS_LABELS[st] || '';
-        const last = p.last_run ? new Date(p.last_run * 1000).toLocaleString() : 'не запускался';
-        return `<div class="mpl-row">
-          <span class="mpl-name">${escHtml(p.name || p.id)}</span>
-          <span class="badge ${badge}" style="flex-shrink:0">${lbl}</span>
-          <span class="mpl-meta">${last}</span>
-        </div>`;
-      }).join('');
-    }
+    /* ── Datamarts — list of plashki, клик → метрики ── */
+    _metricsMv = matviews;
+    const mvStale  = matviews.filter(v => v.is_stale && !v.last_error).length;
+    const mvError  = matviews.filter(v => v.last_error).length;
+    const mvActual = matviews.filter(v => !v.is_stale && !v.last_error).length;
+    const mvRows   = matviews.reduce((s, v) => s + (v.row_count || 0), 0);
+    document.getElementById('metrics-matviews-sum').textContent = matviews.length
+      ? `всего ${matviews.length} · актуальных ${mvActual} · устаревших ${mvStale} · с ошибкой ${mvError} · строк ${fmtNum(mvRows)}`
+      : '';
+    _mMvAll = matviews;
+    renderMetricsMv();
 
   } catch (err) {
     document.getElementById('metrics-detail').innerHTML =
@@ -2517,6 +2693,70 @@ function restartMetricsTimer() {
         loadMetrics();
     }, ms);
   }
+}
+
+/* Last datamarts list loaded by the metrics view — for the per-datamart drill-down. */
+let _metricsMv = [];
+
+/* Per-datamart metrics modal (reuses the generic runs-modal): aggregate summary
+   computed from the collected refresh history + a row per refresh. */
+async function showMatviewMetrics(name) {
+  const mv   = _metricsMv.find(v => v.name === name);
+  const body = document.getElementById('runs-modal-body');
+  document.getElementById('runs-modal-title').textContent = `Метрики витрины — ${name}`;
+  document.getElementById('runs-modal').classList.remove('hidden');
+  body.innerHTML = '<div style="color:var(--muted)">Загрузка…</div>';
+
+  let runs = [];
+  try { runs = await apiFetch(`/api/matviews/${encodeURIComponent(name)}/runs`); } catch (e) { /* пусто */ }
+  if (!Array.isArray(runs)) runs = [];
+
+  const okN  = runs.filter(r => r.status === 0).length;
+  const durs = runs.map(r => r.duration_ms || 0);
+  const avgD = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : 0;
+  const maxD = durs.length ? Math.max(...durs) : 0;
+  const lastRows = runs.length ? runs[0].row_count : (mv ? mv.row_count : 0);
+  const when = (mv && mv.last_refreshed_at) ? new Date(mv.last_refreshed_at * 1000).toLocaleString()
+             : (runs.length && runs[0].finished ? new Date(runs[0].finished * 1000).toLocaleString() : 'не обновлялась');
+  const status = (mv && mv.last_error) ? '<span class="badge badge-err">ошибка</span>'
+    : (mv && mv.is_stale ? '<span class="badge badge-warn">устарело</span>' : '<span class="badge badge-ok">актуально</span>');
+
+  const summary = `<div style="margin-bottom:.85rem">
+    <div class="mstat-row"><span class="mstat-k">Статус</span><span class="mstat-v">${status}</span></div>
+    <div class="mstat-row"><span class="mstat-k">Обновлений</span><span class="mstat-v">${runs.length}</span></div>
+    <div class="mstat-row"><span class="mstat-k">Успешных</span><span class="mstat-v ok">${okN}</span></div>
+    <div class="mstat-row"><span class="mstat-k">С ошибкой</span><span class="mstat-v ${runs.length - okN ? 'err' : ''}">${runs.length - okN}</span></div>
+    <div class="mstat-row"><span class="mstat-k">Строк (последнее)</span><span class="mstat-v">${fmtNum(lastRows || 0)}</span></div>
+    <div class="mstat-row"><span class="mstat-k">Средняя длительность</span><span class="mstat-v">${avgD.toFixed(1)} мс</span></div>
+    <div class="mstat-row"><span class="mstat-k">Макс. длительность</span><span class="mstat-v">${maxD} мс</span></div>
+    <div class="mstat-row"><span class="mstat-k">Обновлена</span><span class="mstat-v">${when}</span></div>
+  </div>`;
+
+  let table;
+  if (runs.length) {
+    table = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Строк</th><th>Длит., мс</th><th>Ошибка</th></tr></thead><tbody>'
+      + runs.map(r => {
+          const st = r.status === 0 ? '<span class="badge badge-ok">успех</span>' : '<span class="badge badge-err">ошибка</span>';
+          return `<tr>
+            <td>${r.id}</td>
+            <td>${r.started ? new Date(r.started * 1000).toLocaleString() : '—'}</td>
+            <td>${r.finished ? new Date(r.finished * 1000).toLocaleString() : '—'}</td>
+            <td>${st}</td>
+            <td>${fmtNum(r.row_count || 0)}</td>
+            <td>${r.duration_ms ?? 0}</td>
+            <td>${escHtml(r.error || '')}</td>
+          </tr>`;
+        }).join('')
+      + '</tbody></table>';
+  } else {
+    table = '<div style="color:var(--muted);margin-top:.5rem">Обновлений ещё не было</div>';
+  }
+
+  const sqlBlock = mv ? `<details style="margin-top:.75rem"><summary style="cursor:pointer;color:var(--muted);font-size:.8rem">SQL определения</summary>
+       <pre style="white-space:pre-wrap;font-size:.78rem;font-family:var(--mono);background:var(--surface2);border:1px solid var(--border);padding:.5rem;border-radius:6px;margin-top:.4rem;overflow:auto;max-height:200px">${escHtml(mv.definition_sql || '')}</pre>
+     </details>` : '';
+
+  body.innerHTML = summary + table + sqlBlock;
 }
 
 
@@ -2840,7 +3080,7 @@ function renderChartCardHtml(cfg) {
            oninput="analyticsState.charts.find(c=>c.id==='${id}').title=this.value">
     <div class="an-chart-card-btns">
       <button class="btn btn-sm" onclick="downloadChartById('${id}')" title="Скачать PNG">⬇</button>
-      <button class="btn btn-sm" onclick="removeAnalyticsChart('${id}')" title="Удалить">✕</button>
+      <button class="btn btn-sm btn-danger" onclick="removeAnalyticsChart('${id}')" title="Удалить">✕</button>
     </div>
   </div>
   <div class="an-chart-controls-row">
@@ -3696,11 +3936,16 @@ function runStatMethod() {
   }
 }
 
+/* ── Статистические примитивы (чистые функции над массивами чисел) ──────────
+ * Используются методами вкладки «Статистика» (runStatMethod). */
+
+/* Колонка таблицы → массив только конечных чисел (нечисловые/пустые отброшены). */
 function numericCol(rows, col) {
   if (!col) return [];
   return rows.map(r => Number(r[col])).filter(Number.isFinite);
 }
 
+/* p-й перцентиль отсортированного массива с линейной интерполяцией (p в 0..100). */
 function pctOf(sorted, p) {
   if (!sorted.length) return 0;
   const idx = (p / 100) * (sorted.length - 1);
@@ -3708,6 +3953,8 @@ function pctOf(sorted, p) {
   return sorted[lo] + (idx - lo) * ((sorted[hi] ?? sorted[lo]) - sorted[lo]);
 }
 
+/* Полная описательная статистика: среднее, медиана, мода, дисперсия/σ (по выборке),
+ * квартили/IQR, асимметрия и эксцесс. Возвращает null для пустого массива. */
 function descExt(arr) {
   if (!arr || !arr.length) return null;
   const n = arr.length;
@@ -3730,6 +3977,7 @@ function descExt(arr) {
 /* Keep desc as alias for backward compat with old callers */
 function desc(arr) { return descExt(arr) || { n: 0, mean: 0, sd: 0, min: 0, max: 0 }; }
 
+/* Коэффициент корреляции Пирсона по парам (a[i], b[i]); 0 при < 2 пар. */
 function pearson(a, b) {
   const n = Math.min(a.length, b.length);
   if (n < 2) return 0;
@@ -3744,6 +3992,7 @@ function pearson(a, b) {
   return dx && dy ? num / Math.sqrt(dx * dy) : 0;
 }
 
+/* Выборочная ковариация двух рядов (делитель n-1). */
 function covarianceCalc(a, b) {
   const n = Math.min(a.length, b.length);
   if (n < 2) return 0;
@@ -3752,6 +4001,8 @@ function covarianceCalc(a, b) {
   return a.slice(0,n).reduce((s,v,i) => s + (v-mx)*(b[i]-my), 0) / (n-1);
 }
 
+/* Простая линейная регрессия y = a + b·x методом наименьших квадратов;
+ * возвращает {a: пересечение, b: наклон, r2: коэф. детерминации, n}. */
 function linreg(a, b) {
   const n = Math.min(a.length, b.length);
   if (n < 2) return { a: 0, b: 0, r2: 0, n };
@@ -3766,6 +4017,7 @@ function linreg(a, b) {
   return { a: a0, b: b1, r2: r * r, n };
 }
 
+/* Скользящее среднее с окном win (по предыдущим win значениям включительно). */
 function movingAvg(arr, win) {
   return arr.map((_, i) => {
     const sl = arr.slice(Math.max(0, i - win + 1), i + 1);
@@ -3773,6 +4025,7 @@ function movingAvg(arr, win) {
   });
 }
 
+/* Экспоненциальное сглаживание с коэффициентом al (0..1). */
 function expSmooth(arr, al) {
   if (!arr.length) return [];
   const r = [arr[0]];
@@ -3780,6 +4033,8 @@ function expSmooth(arr, al) {
   return r;
 }
 
+/* Однофакторный дисперсионный анализ (one-way ANOVA): группирует valCol по
+ * groupCol, считает SS/MS между и внутри групп, F-статистику и p-value. */
 function oneWayAnova(rows, groupCol, valCol) {
   if (!groupCol || !valCol) return null;
   const groups = new Map();
@@ -3817,6 +4072,7 @@ function oneWayAnova(rows, groupCol, valCol) {
   };
 }
 
+/* Берёт первые две группы (по groupCol) с >1 значением — вход для welchT. */
 function splitGroups(rows, groupCol, valCol) {
   if (!groupCol || !valCol) return null;
   const m = new Map();
@@ -3833,6 +4089,8 @@ function splitGroups(rows, groupCol, valCol) {
   return { a: { name: a, values: m.get(a) }, b: { name: b, values: m.get(b) } };
 }
 
+/* t-критерий Уэлча для двух выборок с неравными дисперсиями; p — двусторонний
+ * (нормальное приближение через normalCdf). */
 function welchT(a, b) {
   const da = descExt(a) || {mean:0,sd:0,n:0}, db = descExt(b) || {mean:0,sd:0,n:0};
   const se = Math.sqrt((da.sd ** 2 / (da.n||1)) + (db.sd ** 2 / (db.n||1)));
@@ -3841,10 +4099,12 @@ function welchT(a, b) {
   return { t, p };
 }
 
+/* Функция распределения стандартного нормального закона N(0,1). */
 function normalCdf(x) {
   return 0.5 * (1 + erf(x / Math.SQRT2));
 }
 
+/* Функция ошибок erf(x) — приближение Абрамовица–Стиган (max. ошибка ~1.5e-7). */
 function erf(x) {
   const s = x < 0 ? -1 : 1;
   const ax = Math.abs(x);
@@ -4127,14 +4387,16 @@ async function loadApiKeys() {
       const keyId = escAttr(k.key || '');
       const created = k.created_at ? new Date(k.created_at * 1000).toLocaleDateString('ru') : '—';
       return `
-        <div class="settings-row" id="akrow-${keyId}">
-          <div class="settings-row-label">
-            <div class="settings-row-title" style="font-family:var(--mono);font-size:.85rem">${escHtml(k.key || '—')}</div>
-            <div class="settings-row-desc">
+        <div class="pipeline-item" id="akrow-${keyId}">
+          <div style="flex:1;min-width:0">
+            <div class="pipeline-name" style="font-family:var(--mono);font-size:.85rem">${escHtml(k.key || '—')}</div>
+            <div class="pipeline-meta">
               user: <b>${escHtml(k.user_id || '—')}</b> · роль: <b>${escHtml(k.role || '—')}</b> · создан: ${escHtml(created)}
             </div>
           </div>
-          <button class="btn btn-sm btn-danger" onclick="deleteApiKey('${keyId}')">Удалить</button>
+          <div class="pipeline-actions">
+            <button class="btn btn-sm btn-danger" title="Удалить ключ" onclick="deleteApiKey('${keyId}')">✕</button>
+          </div>
         </div>`;
     }).join('');
   } catch(err) {
@@ -4175,164 +4437,7 @@ async function deleteApiKey(key) {
 ═══════════════════════════════════════════════════ */
 async function loadSettings() {
   applyPrefsToSettingsForm();
-
-  /* ── Server stat cards ── */
-  const grid = document.getElementById('server-info-grid');
-  try {
-    const h = await apiFetch('/health');
-    const m = h.metrics || {};
-    const cards = [
-      ['Статус',              `<span class="badge badge-ok">${escHtml(h.status||'ok')}</span>`],
-      ['Версия',              escHtml(h.version || '1.0.0')],
-      ['Аптайм',              fmtUptime(m.uptime || 0)],
-      ['Строк загружено',     fmtNum(m.total_rows || 0)],
-      ['Запросов выполнено',  fmtNum(m.total_queries || 0)],
-      ['Запусков конвейеров', fmtNum(m.total_pipelines_run || 0)],
-    ];
-    grid.innerHTML = cards.map(([label, val]) =>
-      `<div class="stat-card"><div class="stat-val" style="font-size:1.25rem">${val}</div><div class="stat-label">${label}</div></div>`
-    ).join('');
-  } catch (err) {
-    grid.innerHTML = `<div class="settings-loading" style="color:var(--red)">Нет связи с сервером</div>`;
-  }
-
-  /* ── Tables management ── */
-  const tbl = document.getElementById('settings-tables-list');
-  try {
-    const tables = await apiFetch('/api/tables');
-    if (!tables.length) {
-      tbl.innerHTML = '<div class="settings-loading">Таблиц нет</div>';
-    } else {
-      tbl.innerHTML = tables.map(t => `
-        <div class="settings-row" id="strow-${escAttr(t.name)}">
-          <div class="settings-row-label">
-            <div class="settings-row-title">${escHtml(t.name)}</div>
-            <div class="settings-row-desc">${fmtNum(t.rows||0)} строк · ${(t.columns||[]).length} столбцов ·
-              <span class="source-badge ${t.source==='ingest'?'ingest':'pipeline'}">${t.source==='ingest'?'загрузка':'конвейер'}</span>
-            </div>
-          </div>
-          <button class="btn btn-sm btn-danger" onclick="settingsDropTable('${escAttr(t.name)}')">Удалить</button>
-        </div>`).join('');
-    }
-  } catch (err) {
-    tbl.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
-  }
-  loadApiKeys();
-  loadClusterStatus();
-  renderConnectionsPanel();
 }
-
-/* ── External protocol connections panel ────────────────────────
- * Lists the four protocols DataFlow OS exposes: HTTP REST, Arrow
- * Flight (gRPC), PostgreSQL wire, MCP (stdio). Connection strings
- * are templated against the current location.host. The actual
- * runtime status of each (whether the pgwire / Flight / MCP
- * server is started) isn't exposed by the gateway today, so we
- * present them as documented endpoints with copy-to-clipboard. */
-function _connectionCard(opts) {
-  const { icon, title, status, body, docs } = opts;
-  return `<div class="settings-row" style="display:block;padding:.75rem 0;border-bottom:1px solid var(--border)">
-    <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem">
-      <span style="font-size:1.2rem">${icon}</span>
-      <strong>${title}</strong>
-      ${status ? `<span class="badge badge-ok" style="font-size:.65rem">${status}</span>` : ''}
-      ${docs ? `<a href="${docs}" target="_blank" style="margin-left:auto;font-size:.7rem;color:var(--muted)">docs ↗</a>` : ''}
-    </div>
-    ${body}
-  </div>`;
-}
-
-function _copyableLine(label, code) {
-  const id = 'cp_' + Math.random().toString(36).slice(2, 9);
-  return `<div style="display:flex;align-items:center;gap:.4rem;margin:.25rem 0;font-size:.75rem">
-    <span style="min-width:90px;color:var(--muted)">${label}</span>
-    <code id="${id}" style="flex:1;background:var(--surface2);padding:.2rem .4rem;border-radius:3px;overflow:auto;white-space:pre-wrap;word-break:break-all">${escHtml(code)}</code>
-    <button class="btn btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('${id}').textContent);showToast('Скопировано','ok')">⧉</button>
-  </div>`;
-}
-
-function renderConnectionsPanel() {
-  const el = document.getElementById('settings-connections');
-  if (!el) return;
-  const h = location.hostname || 'localhost';
-  const port = location.port || '8080';
-  const base = `${location.protocol}//${h}:${port}`;
-
-  const cards = [];
-
-  /* 1. HTTP REST */
-  cards.push(_connectionCard({
-    icon: '🌐',
-    title: 'HTTP REST API',
-    status: 'always on',
-    body:
-      _copyableLine('Base URL',  base) +
-      _copyableLine('curl test', `curl -X POST ${base}/api/auth/token -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin"}'`) +
-      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">JSON ввод/вывод. Auth: JWT через POST /api/auth/token. Используется UI и SDK.</div>`,
-    docs: 'docs/API.md',
-  }));
-
-  /* 2. PostgreSQL wire */
-  cards.push(_connectionCard({
-    icon: '🐘',
-    title: 'PostgreSQL wire-protocol',
-    status: 'opt-in (pgwire_port в config)',
-    body:
-      _copyableLine('psql',  `PGPASSWORD=admin psql -h ${h} -p 5432 -U admin -d dataflow`) +
-      _copyableLine('psycopg2', `psycopg2.connect("host=${h} port=5432 user=admin password=admin dbname=dataflow")`) +
-      _copyableLine('JDBC', `jdbc:postgresql://${h}:5432/dataflow?user=admin&password=admin`) +
-      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">Включи в config: <code>"pgwire_enabled":1, "pgwire_port":5432</code>. Поддержано: Simple+Extended Query, pg_catalog, type inference. БЕЗ TLS — для loopback/VPN.</div>`,
-    docs: 'docs/POSTGRES_WIRE.md',
-  }));
-
-  /* 3. Arrow Flight */
-  cards.push(_connectionCard({
-    icon: '✈️',
-    title: 'Apache Arrow Flight (gRPC)',
-    status: 'отдельный бинарь dfo_flight_server',
-    body:
-      _copyableLine('grpc URL', `grpc://${h}:8815`) +
-      _copyableLine('PyArrow', `pyarrow.flight.FlightClient("grpc://${h}:8815").do_get(pyarrow.flight.Ticket(b"sql:SELECT 1"))`) +
-      _copyableLine('запуск', `dfo_flight_server --gateway ${base} --api-key $TOKEN --port 8815`) +
-      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">Zero-JSON Arrow IPC — ~10× быстрее REST для больших query. Ставится через <code>conda install -c conda-forge libarrow-all</code>, потом <code>make flight</code>.</div>`,
-    docs: 'docs/ARROW_FLIGHT.md',
-  }));
-
-  /* 4. MCP (Model Context Protocol) */
-  cards.push(_connectionCard({
-    icon: '🤖',
-    title: 'MCP (Model Context Protocol)',
-    status: 'для AI-агентов',
-    body:
-      _copyableLine('бинарь', `dfo_mcp_server --gateway ${base} --api-key $TOKEN`) +
-      _copyableLine('Claude Desktop', `~/Library/Application Support/Claude/claude_desktop_config.json`) +
-      `<pre style="background:var(--surface2);padding:.4rem;border-radius:3px;font-size:.7rem;margin:.3rem 0">{
-  "mcpServers": {
-    "dataflow-os": {
-      "command": "dfo_mcp_server",
-      "args": ["--gateway", "${base}", "--api-key", "&lt;JWT&gt;"]
-    }
-  }
-}</pre>` +
-      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">10 tools: query / list_tables / describe_table / ingest_csv / list_pipelines / get_metrics / analyze / + ещё 3. Подключается к Claude Desktop, Cursor, Cline.</div>`,
-    docs: 'docs/MCP.md',
-  }));
-
-  el.innerHTML = cards.join('');
-}
-
-async function settingsDropTable(name) {
-  if (!confirm(`Удалить таблицу "${name}"? Это действие необратимо.`)) return;
-  try {
-    await apiFetch(`/api/tables/${encodeURIComponent(name)}`, 'DELETE');
-    showToast(`Таблица "${name}" удалена`, 'ok');
-    const row = document.getElementById(`strow-${name}`);
-    if (row) row.remove();
-  } catch (err) {
-    showToast(`Ошибка: ${err}`, 'error');
-  }
-}
-
 
 /* ── Saved Results ── */
 async function loadSavedResults() {
@@ -4341,32 +4446,26 @@ async function loadSavedResults() {
     const el = document.getElementById('an-saved-list');
     if (!el) return;
     if (!list.length) {
-      el.innerHTML = '<div class="qs-empty">Нет сохранённых результатов.<br>Нажмите «+ Добавить аналитику» чтобы создать первый анализ.</div>';
+      el.innerHTML = '<div class="empty-state">Нет сохранённых результатов.<br>Нажмите «+ Добавить аналитику» чтобы создать первый анализ.</div>';
       return;
     }
-    el.innerHTML = '';
-    list.forEach(r => {
-      const card = document.createElement('div');
-      card.className = 'table-card';
-      card.id = `sr_${r.id}`;
+    el.innerHTML = list.map(r => {
       const cols = Array.isArray(r.columns_json) ? r.columns_json
         : (r.columns_json ? JSON.parse(r.columns_json) : []);
-      const pills = cols.map(c => `<span class="col-pill">${escHtml(c)}</span>`).join('');
-      card.innerHTML = `
-        <div class="table-card-head">
-          <h3>${escHtml(r.name)}</h3>
-          <button class="btn btn-sm btn-danger" title="Удалить">✕</button>
+      const pills = cols.map(c => `<span class="step-badge">${escHtml(c)}</span>`).join('');
+      return `<div class="pipeline-item pipeline-item-clickable" id="sr_${r.id}" onclick="openSavedResult(${r.id})">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+            <span class="pipeline-name">${escHtml(r.name)}</span>
+          </div>
+          <div class="pipeline-meta">${r.row_count} строк · ${new Date(r.created_at*1000).toLocaleDateString('ru')}</div>
+          ${pills ? `<div class="step-list">${pills}</div>` : ''}
         </div>
-        <div class="meta">${r.row_count} строк · ${new Date(r.created_at*1000).toLocaleDateString('ru')}</div>
-        ${pills ? `<div class="col-list">${pills}</div>` : ''}
-      `;
-      card.querySelector('button').addEventListener('click', ev => {
-        ev.stopPropagation();
-        deleteSavedResult(r.id);
-      });
-      card.onclick = () => openSavedResult(r.id);
-      el.appendChild(card);
-    });
+        <div class="pipeline-actions">
+          <button class="btn btn-sm btn-danger" title="Удалить" onclick="event.stopPropagation();deleteSavedResult(${r.id})">✕</button>
+        </div>
+      </div>`;
+    }).join('');
   } catch(e) { console.error('loadSavedResults', e); }
 }
 
@@ -4530,6 +4629,9 @@ async function deleteSavedResult(id) {
 /* ═══════════════════════════════════════════════════
    API HELPERS
 ═══════════════════════════════════════════════════ */
+/* ── HTTP-обёртки над fetch ──────────────────────────────────────────────
+ * Все добавляют JWT (если есть), а на 401 разлогинивают и возвращают undefined
+ * вместо выброса — поэтому вызывающий код проверяет результат на falsy. */
 async function apiFetch(path, method = 'GET', body = null) {
   const headers = {};
   if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
@@ -4671,7 +4773,8 @@ function initApp() {
     /* '#builder/<id>' — fetch the pipeline and reopen the builder on it. */
     restoreBuilderFromHash(id);
   } else {
-    const v = VALID_VIEWS.has(view) ? view : 'pipelines';
+    let stored; try { stored = localStorage.getItem('dfo_view'); } catch (_) {}
+    const v = VALID_VIEWS.has(view) ? view : (VALID_VIEWS.has(stored) ? stored : 'pipelines');
     /* '#builder' without an id is a stale URL — go to list. */
     const fallback = (v === 'builder') ? 'pipelines' : v;
     switchView(fallback, { pushState: false });
@@ -4711,42 +4814,216 @@ function splitCSVLine(line) { return splitCSVLineDelim(line, ','); }
 /* ═══════════════════════════════════════════════════
    MATERIALIZED VIEWS
 ═══════════════════════════════════════════════════ */
-const MV_REFRESH = ['Вручную', 'По расписанию'];
+const MV_REFRESH = ['Вручную', 'При изменении источника', 'По расписанию'];
+let _mvList = [];   /* last loaded datamarts — used to prefill the edit form */
+let _mvPerPage = 10;   /* page size (Infinity = «Все») */
+let _mvPage = 0;
 
 async function loadMatviews() {
   const el = document.getElementById('matviews-list');
+  el.innerHTML = '<div style="color:var(--muted);padding:.5rem">Загрузка…</div>';
   try {
     const list = await apiFetch('/api/matviews');
-    if (!list || !list.length) {
-      el.innerHTML = '<div class="settings-loading">Нет представлений. Создайте первое.</div>';
+    _mvList = list || [];
+    if (!_mvList.length) {
+      el.innerHTML = `
+        <div class="empty-state">
+          Витрин пока нет.<br>
+          <button class="btn btn-primary" style="margin-top:.75rem" onclick="openCreateMatview()">
+            + Создать первую витрину
+          </button>
+        </div>`;
       return;
     }
-    el.innerHTML = list.map(mv => `
-      <div class="settings-row">
-        <div class="settings-row-label">
-          <div class="settings-row-title">${escHtml(mv.name)}
-            ${mv.is_stale ? '<span class="badge badge-warn" style="margin-left:.4rem;font-size:.7rem">устарело</span>' : ''}
-          </div>
-          <div class="settings-row-desc">
-            ${MV_REFRESH[mv.refresh_mode] || 'Вручную'} ·
-            ${fmtNum(mv.row_count || 0)} строк ·
-            ${mv.last_refreshed_at ? 'обновлено ' + new Date(mv.last_refreshed_at * 1000).toLocaleString('ru') : 'ещё не обновлялось'}
-          </div>
-        </div>
-        <div style="display:flex;gap:.4rem">
-          <button class="btn btn-sm" onclick="queryMatview('${escAttr(mv.name)}')">Запрос</button>
-          <button class="btn btn-sm" onclick="refreshMatview('${escAttr(mv.name)}')">↻ Обновить</button>
-          <button class="btn btn-sm btn-danger" onclick="dropMatview('${escAttr(mv.name)}')">Удалить</button>
-        </div>
-      </div>`).join('');
+    _mvPage = 0;
+    renderMatviewsPage();
   } catch (err) {
     el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
   }
 }
 
+/* Render the current page of datamarts + pager (page nav + page size). */
+function renderMatviewsPage() {
+  const el = document.getElementById('matviews-list');
+  if (!el) return;
+  const total   = _mvList.length;
+  const perPage = _mvPerPage;
+  const all     = perPage === Infinity;
+  const pages   = all ? 1 : Math.max(1, Math.ceil(total / perPage));
+  if (_mvPage > pages - 1) _mvPage = pages - 1;
+  if (_mvPage < 0) _mvPage = 0;
+  const start = all ? 0 : _mvPage * perPage;
+  const end   = all ? total : Math.min(start + perPage, total);
+  const slice = all ? _mvList : _mvList.slice(start, end);
+  el.innerHTML = '';
+  slice.forEach(mv => el.appendChild(makeMatviewRow(mv)));
+  if (total > 0) {
+    const nav = document.createElement('div');
+    nav.className = 'pager';
+    const navBtns = pages > 1 ? `
+      <button class="btn btn-sm" ${_mvPage === 0 ? 'disabled' : ''} onclick="mvGoPage(${_mvPage - 1})">← Назад</button>
+      <span class="pager-info">${start + 1}–${end} из ${total} · стр. ${_mvPage + 1}/${pages}</span>
+      <button class="btn btn-sm" ${_mvPage >= pages - 1 ? 'disabled' : ''} onclick="mvGoPage(${_mvPage + 1})">Вперёд →</button>`
+      : `<span class="pager-info">всего: ${total}</span>`;
+    const opts = [10, 25, 50].map(n => `<option value="${n}" ${perPage === n ? 'selected' : ''}>${n}</option>`).join('')
+               + `<option value="all" ${all ? 'selected' : ''}>Все</option>`;
+    nav.innerHTML = navBtns +
+      `<label class="pager-size">На странице:
+         <select onchange="mvSetPerPage(this.value)">${opts}</select>
+       </label>`;
+    el.appendChild(nav);
+  }
+}
+
+function mvGoPage(p) {
+  _mvPage = p;
+  renderMatviewsPage();
+  document.getElementById('matviews-list').scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+function mvSetPerPage(v) {
+  _mvPerPage = (v === 'all') ? Infinity : parseInt(v, 10);
+  _mvPage = 0;
+  renderMatviewsPage();
+}
+
+/* Datamart card — same visual chrome as a pipeline row (makePipelineRow). */
+function makeMatviewRow(mv) {
+  const div = document.createElement('div');
+  div.className = 'pipeline-item pipeline-item-clickable';
+  div.title = 'Открыть данные витрины';
+  div.onclick = (e) => {
+    /* ignore clicks on the action buttons and on the «SQL определения» disclosure */
+    if (e.target.closest('button') || e.target.closest('details')) return;
+    queryMatview(mv.name);
+  };
+  const dur  = (mv.refresh_duration_ms != null && mv.refresh_duration_ms >= 0) ? `${mv.refresh_duration_ms} мс` : '—';
+  const when = mv.last_refreshed_at ? new Date(mv.last_refreshed_at * 1000).toLocaleString('ru') : 'ещё не обновлялась';
+  const badge = mv.last_error
+    ? '<span class="badge badge-err">ошибка</span>'
+    : (mv.is_stale ? '<span class="badge badge-warn">устарело</span>'
+                   : '<span class="badge badge-ok">актуально</span>');
+  div.innerHTML = `
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <span class="pipeline-name">${escHtml(mv.name)}</span>
+        ${badge}
+      </div>
+      <div class="pipeline-meta">
+        строк: ${fmtNum(mv.row_count || 0)}
+        &nbsp;·&nbsp; обновлена: ${when}
+        &nbsp;·&nbsp; ${dur}
+      </div>
+      ${mv.last_error ? `<div class="pipeline-meta" style="color:var(--red)">⚠ ${escHtml(mv.last_error)}</div>` : ''}
+      <details style="margin-top:.5rem">
+        <summary style="cursor:pointer;font-size:.72rem;color:var(--muted)">SQL определения</summary>
+        <pre style="margin:.35rem 0 0;white-space:pre-wrap;font-size:.75rem;font-family:var(--mono);background:var(--surface2);border:1px solid var(--border);padding:.5rem;border-radius:6px;overflow:auto;max-height:220px">${escHtml(mv.definition_sql || '')}</pre>
+      </details>
+    </div>
+    <div class="pipeline-actions">
+      <button class="btn btn-sm btn-primary" onclick="refreshMatview('${escAttr(mv.name)}')">↻ Обновить</button>
+      <button class="btn btn-sm" onclick="editMatview('${escAttr(mv.name)}')">Изменить</button>
+      <button class="btn btn-sm btn-danger" onclick="dropMatview('${escAttr(mv.name)}')">✕</button>
+    </div>`;
+  return div;
+}
+
+/* Refresh every datamart sequentially. */
+async function refreshAllMatviews() {
+  if (!_mvList.length) return;
+  showToast(`Обновляю ${_mvList.length} витрин…`, 'ok');
+  for (const mv of _mvList) {
+    try { await apiPost(`/api/matviews/${encodeURIComponent(mv.name)}/refresh`, {}); } catch (e) {}
+  }
+  showToast('Витрины обновлены', 'ok');
+  loadMatviews();
+}
+
+/* Open the form pre-filled with an existing datamart for editing (UPSERT by name). */
+function editMatview(name) {
+  const mv = _mvList.find(m => m.name === name);
+  if (!mv) return;
+  openCreateMatview();
+  document.getElementById('mv-form-title').textContent = 'Изменить витрину';
+  document.getElementById('mv-name').value    = mv.name;
+  document.getElementById('mv-name').readOnly  = true;   /* name is the identity — don't rename here */
+  document.getElementById('mv-sql').value      = mv.definition_sql || '';
+}
+
 function openCreateMatview() {
   document.getElementById('matview-create-form').style.display = '';
-  document.getElementById('mv-name').focus();
+  document.getElementById('mv-form-title').textContent = 'Новая витрина';
+  const nm = document.getElementById('mv-name');
+  nm.readOnly = false; nm.value = '';
+  document.getElementById('mv-sql').value = '';
+  document.getElementById('mv-status').textContent = '';
+  loadMvTablesHint();
+  nm.focus();
+}
+
+/* Show the engine tables a datamart can be built from; click a chip → insert its
+ * name into the SQL editor at the cursor. */
+async function loadMvTablesHint() {
+  const el = document.getElementById('mv-tables-hint');
+  if (!el) return;
+  const cw = document.getElementById('mv-cols-wrap'); if (cw) cw.style.display = 'none';
+  el.innerHTML = '<span style="font-size:.75rem;color:var(--muted)">Загрузка…</span>';
+  try {
+    let tables = await apiFetch('/api/tables');
+    tables = (tables || []).filter(t => !(t.name || '').startsWith('__'));
+    if (!tables.length) {
+      el.innerHTML = '<span style="font-size:.75rem;color:var(--muted)">Таблиц пока нет — наполните данные конвейерами.</span>';
+      return;
+    }
+    el.innerHTML = tables.map(t => {
+      const rows = t.rows ?? t.row_count ?? t.nrows;
+      const cnt  = (rows != null) ? ` <span style="color:var(--muted)">· ${fmtNum(rows)}</span>` : '';
+      return `<button type="button" class="step-badge" style="cursor:pointer;font-family:inherit;line-height:1.4"
+                 onclick="mvPickTable('${escAttr(t.name)}')" title="Показать колонки и вставить имя">${escHtml(t.name)}${cnt}</button>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = `<span style="font-size:.75rem;color:var(--red)">${escHtml(String(e))}</span>`;
+  }
+}
+
+/* Click a table chip: insert its name into the SQL and reveal its columns. */
+function mvPickTable(name) {
+  mvInsertSql(name);
+  loadMvColumns(name);
+}
+
+/* Fetch a table's columns and show them as clickable chips (click → insert name). */
+async function loadMvColumns(table) {
+  const wrap = document.getElementById('mv-cols-wrap');
+  const el   = document.getElementById('mv-cols-hint');
+  const lbl  = document.getElementById('mv-cols-table');
+  if (!wrap || !el) return;
+  wrap.style.display = '';
+  lbl.textContent = table;
+  el.innerHTML = '<span style="font-size:.75rem;color:var(--muted)">Загрузка…</span>';
+  try {
+    const sch = await apiFetch(`/api/tables/${encodeURIComponent(table)}/schema`);
+    const cols = (sch && sch.columns) || [];
+    if (!cols.length) { el.innerHTML = '<span style="font-size:.75rem;color:var(--muted)">Нет колонок</span>'; return; }
+    el.innerHTML = cols.map(c =>
+      `<button type="button" class="step-badge" style="cursor:pointer;font-family:inherit;line-height:1.4"
+          onclick="mvInsertSql('${escAttr(c.name)}')" title="${escAttr(c.type || '')}">${escHtml(c.name)}<span style="color:var(--muted)"> · ${escHtml(c.type || '')}</span></button>`
+    ).join('');
+  } catch (e) {
+    el.innerHTML = `<span style="font-size:.75rem;color:var(--red)">${escHtml(String(e))}</span>`;
+  }
+}
+
+/* Insert text into the SQL editor at the caret. */
+function mvInsertSql(text) {
+  const ta = document.getElementById('mv-sql');
+  if (!ta) return;
+  const a = ta.selectionStart ?? ta.value.length;
+  const b = ta.selectionEnd   ?? a;
+  ta.value = ta.value.slice(0, a) + text + ta.value.slice(b);
+  ta.focus();
+  const pos = a + text.length;
+  ta.setSelectionRange(pos, pos);
 }
 
 function closeCreateMatview() {
@@ -4754,27 +5031,20 @@ function closeCreateMatview() {
   document.getElementById('mv-status').textContent = '';
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  const sel = document.getElementById('mv-refresh-mode');
-  if (sel) sel.addEventListener('change', () => {
-    document.getElementById('mv-cron-group').style.display = sel.value === '1' ? '' : 'none';
-  });
-});
-
 async function createMatview() {
   const name = document.getElementById('mv-name').value.trim();
   const sql  = document.getElementById('mv-sql').value.trim();
   const status = document.getElementById('mv-status');
   if (!name || !sql) { status.textContent = 'Укажите название и SQL'; return; }
-  const sources = document.getElementById('mv-sources').value.split(',').map(s => s.trim()).filter(Boolean);
-  const refresh_mode = parseInt(document.getElementById('mv-refresh-mode').value);
-  const refresh_cron = document.getElementById('mv-cron').value.trim();
+  const sources = [];          /* derived from SQL on the backend; no manual field */
+  const refresh_mode = 0;      /* manual refresh only */
+  const refresh_cron = '';
   try {
     await apiPost('/api/matviews', { name, definition_sql: sql, source_tables: sources, refresh_mode, refresh_cron });
     status.textContent = '';
     closeCreateMatview();
     loadMatviews();
-    showToast(`Представление ${name} создано`, 'ok');
+    showToast(`Витрина ${name} сохранена и материализована`, 'ok');
   } catch (err) {
     status.textContent = String(err);
   }
@@ -4809,15 +5079,31 @@ function queryMatview(name) {
    SECURITY — RBAC + AUDIT
 ═══════════════════════════════════════════════════ */
 const RBAC_ROLES   = ['Admin', 'Analyst', 'Viewer'];
-const RBAC_ACTIONS = ['', 'Чтение', 'Запись', 'Чтение + Запись'];
-const AUDIT_TYPES  = ['', 'QUERY', 'INGEST', 'PIPELINE_RUN', 'AUTH_LOGIN', 'AUTH_FAIL', 'SCHEMA_CHANGE', 'POLICY_CHANGE'];
+/* event_type (lib/auth/audit.h) → человекопонятное русское действие */
+const AUDIT_TYPES  = ['', 'SQL-запрос', 'Загрузка данных', 'Запуск конвейера', 'Вход в систему',
+                      'Неудачный вход', 'Изменение схемы', 'Изменение прав доступа'];
+
+/* allowed_actions — битовая маска (lib/auth/rbac.h). Декодируем в читаемый список. */
+const RBAC_ACTION_BITS = [
+  [1, 'Чтение'], [2, 'Запись'], [4, 'Создание'], [8, 'Удаление'],
+  [16, 'Запуск конв.'], [32, 'Правка конв.'], [64, 'Админ'], [128, 'Метрики'],
+];
+function rbacActionsLabel(mask) {
+  mask = mask | 0;
+  if (mask === 0) return '—';
+  if ((mask & 255) === 255) return 'Все права';
+  return RBAC_ACTION_BITS.filter(([b]) => mask & b).map(([, l]) => l).join(', ');
+}
 
 function switchSecTab(tab) {
-  ['rbac','audit'].forEach(t => {
+  ['rbac','audit','apikeys'].forEach(t => {
     document.getElementById(`sec-tab-${t}`).classList.toggle('active', t === tab);
     document.getElementById(`sec-pane-${t}`).style.display = t === tab ? '' : 'none';
   });
-  if (tab === 'audit') loadAuditLog();
+  try { localStorage.setItem('dfo_sec_tab', tab); } catch (_) {}
+  if (tab === 'audit')        loadAuditLog();
+  else if (tab === 'apikeys') loadApiKeys();
+  else                        loadRbacPolicies();
 }
 
 /* ── RBAC ── */
@@ -4835,9 +5121,9 @@ async function loadRbacPolicies() {
         <td>${p.id}</td>
         <td>${RBAC_ROLES[p.role] ?? p.role}</td>
         <td><code>${escHtml(p.table_pattern)}</code></td>
-        <td>${RBAC_ACTIONS[p.allowed_actions] ?? p.allowed_actions}</td>
+        <td>${rbacActionsLabel(p.allowed_actions)}</td>
         <td>${p.row_filter ? `<code>${escHtml(p.row_filter)}</code>` : '—'}</td>
-        <td><button class="btn btn-sm btn-danger" onclick="deleteRbacPolicy(${p.id})">Удалить</button></td>
+        <td><button class="btn btn-sm btn-danger" title="Удалить политику" onclick="deleteRbacPolicy(${p.id})">✕</button></td>
       </tr>`).join('')}</tbody></table>`;
   } catch (err) {
     el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
@@ -4874,79 +5160,81 @@ async function deleteRbacPolicy(id) {
   }
 }
 
-/* ── Audit ── */
+/* ── Audit ──
+   loadAuditLog: однократная загрузка окна событий с сервера в кэш _auditAll.
+   renderAuditFiltered: фильтрация кэша по всем полям + постраничный вывод (без сети). */
+let _auditAll = [], _auditPage = 0, _auditPerPage = 25;
+
 async function loadAuditLog() {
-  const el    = document.getElementById('audit-log-list');
-  const user  = document.getElementById('audit-filter-user').value.trim();
-  const limit = document.getElementById('audit-filter-limit').value || 50;
-  const status = document.getElementById('audit-status');
+  const el = document.getElementById('audit-log-list');
   el.innerHTML = '<div class="settings-loading">Загрузка…</div>';
   try {
-    let qs = `limit=${limit}`;
-    if (user) qs += `&user_id=${encodeURIComponent(user)}`;
-    const list = await apiFetch(`/api/audit?${qs}`);
-    status.textContent = `${list.length} записей`;
-    if (!list.length) {
-      el.innerHTML = '<div class="settings-loading">Событий нет</div>';
-      return;
-    }
-    el.innerHTML = `<table class="result-table" style="width:100%;font-size:.8rem">
-      <thead><tr><th>Время</th><th>Тип</th><th>Пользователь</th><th>IP</th><th>Ресурс</th><th>Код</th><th>Детали</th></tr></thead>
-      <tbody>${list.map(e => `<tr>
-        <td style="white-space:nowrap">${new Date(e.ts * 1000).toLocaleString('ru')}</td>
-        <td><span class="badge ${e.event_type === 5 ? 'badge-danger' : 'badge-ok'}">${AUDIT_TYPES[e.event_type] ?? e.event_type}</span></td>
-        <td>${escHtml(e.user_id || '—')}</td>
-        <td>${escHtml(e.client_ip || '—')}</td>
-        <td>${escHtml(e.resource || '—')}</td>
-        <td>${e.result_code === 0 ? '✓' : '<span style="color:var(--red)">✗ ' + e.result_code + '</span>'}</td>
-        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(e.action_detail||'')}">${escHtml(e.action_detail || '—')}</td>
-      </tr>`).join('')}</tbody></table>`;
+    const all = await apiFetch('/api/audit?limit=1000');
+    _auditAll = Array.isArray(all) ? all : [];
+    _auditPage = 0;
+    renderAuditFiltered();
   } catch (err) {
     el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
-    status.textContent = '';
+    document.getElementById('audit-status').textContent = '';
   }
 }
 
-/* ═══════════════════════════════════════════════════
-   CLUSTER STATUS
-═══════════════════════════════════════════════════ */
-async function loadClusterStatus() {
-  const el = document.getElementById('settings-cluster-status');
-  if (!el) return;
-  try {
-    const s = await apiFetch('/api/cluster/status');
-    if (!s.cluster_mode && !s.is_leader && !s.replica_count) {
-      el.innerHTML = '<div class="settings-loading">Кластерный режим отключён</div>';
-      return;
-    }
-    const replicaRows = (s.replicas || []).map(r =>
-      `<div class="settings-row" style="padding:.3rem 0">
-        <div class="settings-row-label">
-          <div class="settings-row-title">${escHtml(r.host)}:${r.port}</div>
-        </div>
-        <span class="badge ${r.connected ? 'badge-ok' : 'badge-danger'}">${r.connected ? 'подключён' : 'недоступен'}</span>
-      </div>`).join('');
-    el.innerHTML = `
-      <div class="settings-row">
-        <div class="settings-row-label"><div class="settings-row-title">Роль</div></div>
-        <span class="badge ${s.is_leader ? 'badge-ok' : 'badge-warn'}">${s.is_leader ? 'Лидер' : 'Реплика'}</span>
-      </div>
-      <div class="settings-row">
-        <div class="settings-row-label"><div class="settings-row-title">Node ID</div></div>
-        <code>${escHtml(s.node_id || '—')}</code>
-      </div>
-      <div class="settings-row">
-        <div class="settings-row-label"><div class="settings-row-title">Последний LSN</div></div>
-        <span>${fmtNum(s.last_acked_lsn || 0)}</span>
-      </div>
-      <div class="settings-row">
-        <div class="settings-row-label"><div class="settings-row-title">Отставание (записей)</div></div>
-        <span>${fmtNum(s.lag_count || 0)}</span>
-      </div>
-      ${replicaRows || '<div class="settings-loading">Реплик нет</div>'}`;
-  } catch (err) {
-    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+/* смена любого фильтра → на первую страницу */
+function auditFilterChanged() { _auditPage = 0; renderAuditFiltered(); }
+function auditGoPage(p)       { _auditPage = p; renderAuditFiltered(); }
+function auditSetPerPage(v)   { _auditPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _auditPage = 0; renderAuditFiltered(); }
+
+function renderAuditFiltered() {
+  const el     = document.getElementById('audit-log-list');
+  const status = document.getElementById('audit-status');
+  const fAction = document.getElementById('audit-filter-action').value;
+  const fUser   = document.getElementById('audit-filter-user').value.trim().toLowerCase();
+  const fRole   = document.getElementById('audit-filter-role').value;
+  const fIp     = document.getElementById('audit-filter-ip').value.trim().toLowerCase();
+  const fRes    = document.getElementById('audit-filter-resource').value.trim().toLowerCase();
+  const fCode   = document.getElementById('audit-filter-code').value;
+  const isOk = c => c === 0 || (c >= 200 && c < 400);
+  const list = _auditAll.filter(e =>
+    (!fAction     || e.event_type === +fAction) &&
+    (!fUser       || (e.user_id   || '').toLowerCase().includes(fUser)) &&
+    (fRole === '' || e.role === +fRole) &&
+    (!fIp         || (e.client_ip || '').toLowerCase().includes(fIp)) &&
+    (!fRes        || (e.resource  || '').toLowerCase().includes(fRes)) &&
+    (!fCode       || (fCode === 'ok' ? isOk(e.result_code) : !isOk(e.result_code)))
+  );
+  status.textContent = `${list.length} из ${_auditAll.length}`;
+  if (!list.length) {
+    el.innerHTML = '<div class="settings-loading">Событий нет (по фильтрам)</div>';
+    return;
   }
+  /* пагинация вывода */
+  const total = list.length, perPage = _auditPerPage, all = perPage === Infinity;
+  const pages = all ? 1 : Math.max(1, Math.ceil(total / perPage));
+  if (_auditPage > pages - 1) _auditPage = pages - 1;
+  if (_auditPage < 0) _auditPage = 0;
+  const start = all ? 0 : _auditPage * perPage;
+  const end   = all ? total : Math.min(start + perPage, total);
+  const slice = all ? list : list.slice(start, end);
+
+  el.innerHTML = `<table class="result-table" style="width:100%;font-size:.8rem">
+    <thead><tr><th>Время</th><th>Действие</th><th>Пользователь</th><th>Роль</th><th>IP</th><th>Ресурс</th><th>Код</th><th>Длит.</th></tr></thead>
+    <tbody>${slice.map(e => {
+      const okCode = isOk(e.result_code);
+      const role   = (e.role >= 0 && RBAC_ROLES[e.role]) ? RBAC_ROLES[e.role] : '—';
+      return `<tr>
+      <td style="white-space:nowrap">${new Date(e.ts * 1000).toLocaleString('ru')}</td>
+      <td><span class="badge ${e.event_type === 5 ? 'badge-danger' : 'badge-ok'}">${AUDIT_TYPES[e.event_type] ?? e.event_type}</span></td>
+      <td>${escHtml(e.user_id || '—')}</td>
+      <td>${role}</td>
+      <td>${escHtml(e.client_ip || '—')}</td>
+      <td>${escHtml(e.resource || '—')}</td>
+      <td style="white-space:nowrap">${okCode
+          ? '<span style="color:var(--green)">✓ ' + e.result_code + '</span>'
+          : '<span style="color:var(--red)">✗ ' + e.result_code + '</span>'}</td>
+      <td style="white-space:nowrap">${e.duration_ms ?? 0} мс</td>
+    </tr>`;
+    }).join('')}</tbody></table>` +
+    metricsPagerHTML(total, start, end, pages, _auditPage, all, perPage, 'auditGoPage', 'auditSetPerPage');
 }
 
 /* ═══════════════════════════════════════════════════
@@ -4970,7 +5258,8 @@ restartMetricsTimer();
     /* leave URL alone; initApp will reopen the builder once logged in */
     return;
   }
-  let v = VALID_VIEWS.has(view) ? view : 'pipelines';
+  let stored; try { stored = localStorage.getItem('dfo_view'); } catch (_) {}
+  let v = VALID_VIEWS.has(view) ? view : (VALID_VIEWS.has(stored) ? stored : 'pipelines');
   if (v === 'builder') v = 'pipelines';
   history.replaceState({ view: v }, '', '#' + v);
   switchView(v, { pushState: false });

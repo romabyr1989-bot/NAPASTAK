@@ -1,4 +1,8 @@
 #pragma once
+/* compress.h — поколоночное сжатие батчей хранилища.
+ * Описывает форматы кодирования (RLE/Dictionary/Delta/Plain), структуры
+ * сжатой колонки и батча, а также API сжатия/распаковки и (де)сериализации
+ * для WAL. */
 #include "storage.h"
 #include "../core/arena.h"
 #include <stdint.h>
@@ -13,6 +17,8 @@ typedef enum {
 } Encoding;
 
 /* ── Compressed column ── */
+/* Одна сжатая колонка: активны только поля, относящиеся к выбранному enc;
+ * null_bitmap хранится отдельно и никогда не сжимается. */
 typedef struct {
     Encoding  enc;
     ColType   col_type;
@@ -42,6 +48,7 @@ typedef struct {
 } CompressedCol;
 
 /* ── Compressed batch ── */
+/* Сжатый батч: набор колонок плюс учёт размеров до/после для compress_ratio. */
 typedef struct {
     Schema        *schema;
     int            ncols;

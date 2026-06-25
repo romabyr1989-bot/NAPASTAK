@@ -254,6 +254,7 @@ static void *ora_create(const char *cfg, Arena *a) {
     return ctx;
 }
 
+/* ── destroy(): закрыть подключение (арена освобождается вызывающим) ── */
 static void ora_destroy(void *vctx) {
     OraCtx *ctx = vctx;
     if (ctx && ctx->conn) { dpiConn_release(ctx->conn); ctx->conn = NULL; }
@@ -628,6 +629,7 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 
 /* ── write_batch(): выгрузка строк в таблицу Oracle (sink) ── */
 #define ORA_INS_CHUNK 100
+/* Выполнить стейтмент с проверкой результата (для DDL/INSERT в sink). */
 static int ora_exec_chk(dpiConn *conn, const char *sql) {
     dpiStmt *st;
     if (dpiConn_prepareStmt(conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
@@ -640,6 +642,9 @@ static int ora_exec_chk(dpiConn *conn, const char *sql) {
     return rc == DPI_SUCCESS ? 0 : -1;
 }
 
+/* Создаёт целевую таблицу при необходимости (все колонки VARCHAR2(4000)),
+ * при OVERWRITE делает TRUNCATE, затем вставляет строки пачками по ORA_INS_CHUNK
+ * через INSERT ALL. Значения экранируются вручную (одинарная кавычка → ''). */
 static int ora_write_batch(void *vctx, Arena *a, const char *entity,
                            const Schema *schema, const ColBatch *batch, int mode) {
     (void)a;

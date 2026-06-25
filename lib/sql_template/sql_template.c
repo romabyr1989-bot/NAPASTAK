@@ -1,7 +1,16 @@
+/*
+ * sql_template.c — подстановка параметров в SQL-шаблоны.
+ *
+ * Шаблон содержит плейсхолдеры вида {name}: обычные параметры берутся из JSON,
+ * вычисляемые ({@...}) — через resolver, а {{ экранирует литеральную фигурную скобку.
+ * Значения экранируются/форматируются перед вставкой во избежание SQL-инъекций.
+ * Все буферы аллоцируются в Arena.
+ */
 #include "sql_template.h"
 #include <string.h>
 #include <stdio.h>
 
+/* Обернуть строку в одинарные кавычки как SQL-литерал, удваивая внутренние '. */
 char *sql_quote_literal(Arena *a, const char *s)
 {
     if (!s) s = "";
@@ -42,6 +51,12 @@ static char *format_number(Arena *a, JVal *pv)
     return arena_strdup(a, buf);
 }
 
+/*
+ * Подставить параметры в SQL-шаблон.
+ * Имена с суффиксом "_raw" вставляются дословно (идентификаторы), остальные
+ * строки экранируются как литералы; {@name} разрешается через resolver.
+ * При неразрешённом параметре пишет err и возвращает NULL.
+ */
 char *sql_substitute_params(Arena *a, const char *sql, JVal *params,
                             SqlComputedFn resolver, void *resolver_ctx,
                             char *err, size_t errsz)

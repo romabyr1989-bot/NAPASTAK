@@ -1,3 +1,12 @@
+/*
+ * sql.c — мини-движок SQL: лексер, рекурсивно-нисходящий парсер и планировщик.
+ *
+ * Преобразует текст запроса в AST (Stmt/Expr), а затем в дерево плана
+ * исполнения (PlanNode). Поддерживается подмножество SQL: SELECT с JOIN,
+ * WHERE/GROUP BY/HAVING/ORDER BY/LIMIT, оконные функции, CTE (WITH),
+ * множественные операции (UNION/INTERSECT/EXCEPT), а также UPDATE/DELETE
+ * и управление транзакциями. Все узлы AST/плана размещаются в Arena.
+ */
 #include "sql.h"
 #include <string.h>
 #include <stdlib.h>
@@ -30,8 +39,10 @@ typedef enum {
     TK_BEGIN, TK_COMMIT, TK_ROLLBACK, TK_TRANSACTION
 } TkType;
 
+/* Лексический токен: тип + ссылка на исходный текст (start/len, без копии) и числовое значение. */
 typedef struct { TkType type; const char *start; size_t len; int64_t ival; double fval; } Token;
 
+/* Состояние лексера: позиция в исходнике + один токен заглядывания вперёд (peek). */
 typedef struct {
     const char *src; size_t pos, len;
     Token       peek;
@@ -39,6 +50,7 @@ typedef struct {
     Arena      *a;
 } Lexer;
 
+/* Таблица ключевых слов (регистронезависимо); терминируется записью {NULL, TK_EOF}. */
 static struct { const char *kw; TkType tk; } KEYWORDS[] = {
     {"SELECT",TK_SELECT},{"FROM",TK_FROM},{"WHERE",TK_WHERE},{"GROUP",TK_GROUP},
     {"BY",TK_BY},{"HAVING",TK_HAVING},{"ORDER",TK_ORDER},{"LIMIT",TK_LIMIT},
@@ -63,6 +75,7 @@ static struct { const char *kw; TkType tk; } KEYWORDS[] = {
     {NULL,TK_EOF}
 };
 
+/* Считывает следующий токен из исходника, пропуская пробелы и комментарии. */
 static Token lex_next(Lexer *l) {
     while (l->pos < l->len && isspace((unsigned char)l->src[l->pos])) l->pos++;
     if (l->pos >= l->len) return (Token){TK_EOF};
@@ -166,14 +179,17 @@ static Token lex_next(Lexer *l) {
     l->pos++; return (Token){TK_ERROR};
 }
 
+/* Заглянуть на текущий токен, не сдвигая позицию (результат кэшируется). */
 static Token lex_peek(Lexer *l) {
     if (!l->has_peek) { l->peek = lex_next(l); l->has_peek = true; }
     return l->peek;
 }
+/* Вернуть текущий токен и продвинуться дальше. */
 static Token lex_consume(Lexer *l) {
     if (l->has_peek) { l->has_peek=false; return l->peek; }
     return lex_next(l);
 }
+/* Если текущий токен имеет тип t — поглотить его и вернуть true, иначе false. */
 static bool lex_eat(Lexer *l, TkType t) {
     if (lex_peek(l).type == t) { lex_consume(l); return true; }
     return false;
@@ -189,6 +205,8 @@ static WinFrameBound parse_frame_bound(Lexer *l);
 static WindowSpec   *parse_window_spec(Lexer *l);
 
 /* ── Window spec parser ── */
+/* Разбирает одну границу оконного фрейма: UNBOUNDED PRECEDING/FOLLOWING,
+   CURRENT ROW или «N PRECEDING/FOLLOWING». */
 static WinFrameBound parse_frame_bound(Lexer *l) {
     WinFrameBound b = {0};
     Token t = lex_peek(l);
@@ -209,6 +227,7 @@ static WinFrameBound parse_frame_bound(Lexer *l) {
     return b;
 }
 
+/* Разбирает содержимое OVER (...): PARTITION BY, ORDER BY и спецификацию фрейма ROWS/RANGE. */
 static WindowSpec *parse_window_spec(Lexer *l) {
     lex_eat(l, TK_LPAREN);
     WindowSpec *ws = arena_calloc(l->a, sizeof(WindowSpec));
@@ -283,6 +302,8 @@ static bool has_window_expr(Expr *e) {
 }
 
 /* ── Parser ── */
+/* Разбирает первичное выражение: CASE, EXISTS, CAST, литералы, унарные операторы,
+   скобки/подзапрос, идентификатор/обращение к столбцу или вызов функции (в т.ч. оконной). */
 static Expr *parse_primary(Lexer *l) {
     Token t = lex_peek(l);
     Expr *e = arena_calloc(l->a, sizeof(Expr));
@@ -436,6 +457,7 @@ static Expr *parse_primary(Lexer *l) {
     }
 }
 
+/* Приоритет бинарного оператора для алгоритма precedence climbing; -1 — не оператор. */
 static int binop_prec(TkType t) {
     switch(t) {
         case TK_OR:  return 1;
@@ -450,6 +472,7 @@ static int binop_prec(TkType t) {
     }
 }
 
+/* Сопоставляет тип токена-оператора с соответствующим OpType узла BINOP. */
 static OpType tktype_to_op(TkType t) {
     switch(t) {
         case TK_EQ:    return OP_EQ;   case TK_NE:    return OP_NE;
@@ -465,6 +488,9 @@ static OpType tktype_to_op(TkType t) {
     }
 }
 
+/* Разбирает выражение методом precedence climbing: начинает с первичного,
+   затем присоединяет бинарные операторы с приоритетом >= min_prec, а также
+   постфиксные конструкции IS [NOT] NULL, [NOT] LIKE/ILIKE/BETWEEN/IN. */
 static Expr *parse_expr(Lexer *l, int min_prec) {
     Expr *lhs = parse_primary(l);
     for (;;) {
@@ -580,12 +606,14 @@ static Expr *parse_expr(Lexer *l, int min_prec) {
     return lhs;
 }
 
+/* Поглощает идентификатор и возвращает его копию в Arena; "" при несовпадении типа. */
 static const char *consume_ident(Lexer *l) {
     Token t = lex_consume(l);
     if (t.type != TK_IDENT) return "";
     return arena_strndup(l->a, t.start, t.len);
 }
 
+/* Разбирает один элемент списка SELECT: *, table.*, либо выражение с необязательным алиасом (AS). */
 static Expr *parse_select_expr(Lexer *l) {
     if (lex_peek_is(l, TK_STAR)) {
         lex_consume(l);
@@ -607,7 +635,7 @@ static Expr *parse_select_expr(Lexer *l) {
         *l = save; /* put back */
     }
     Expr *base = parse_expr(l, 0);
-    /* optional alias */
+    /* optional alias — отсекаем ключевые слова-разделители, чтобы не принять их за алиас */
     TkType pk = lex_peek(l).type;
     if (pk == TK_AS || (pk == TK_IDENT &&
         pk != TK_FROM && pk != TK_WHERE && pk != TK_GROUP &&
@@ -632,6 +660,8 @@ no_alias:
 
 static SelectStmt parse_select(Lexer *l);
 
+/* Разбирает тело SELECT (после ключевого слова SELECT): список выборки, FROM/JOIN,
+   WHERE, GROUP BY, HAVING, ORDER BY и LIMIT/OFFSET. limit=-1 означает «без лимита». */
 static SelectStmt parse_select(Lexer *l) {
     SelectStmt s = {0}; s.limit = -1; s.offset = 0;
     if (lex_eat(l, TK_DISTINCT)) s.distinct = true;
@@ -762,7 +792,9 @@ static SelectStmt parse_select(Lexer *l) {
     return s;
 }
 
-/* Parse WITH CTEs then SELECT */
+/* Parse WITH CTEs then SELECT
+   Разбирает список общих табличных выражений (CTE), затем основной SELECT,
+   к которому прикрепляются собранные CTE. RECURSIVE распознаётся, но не обрабатывается особо. */
 static Stmt *parse_with(Lexer *l) {
     Stmt *s = arena_calloc(l->a, sizeof(Stmt));
     lex_eat(l, TK_RECURSIVE); /* optional */
@@ -804,6 +836,7 @@ static Stmt *parse_with(Lexer *l) {
     return s;
 }
 
+/* Разбирает UPDATE tbl SET col=val, ... [WHERE ...]; значения нормализуются в текст в s->dml. */
 static void parse_update(Lexer *l, Stmt *s) {
     s->type = STMT_UPDATE;
     Token tbl = lex_consume(l);
@@ -853,6 +886,7 @@ static void parse_update(Lexer *l, Stmt *s) {
     if (lex_eat(l, TK_WHERE)) s->dml.where = parse_expr(l, 0);
 }
 
+/* Разбирает DELETE [FROM] tbl [WHERE ...]. */
 static void parse_delete(Lexer *l, Stmt *s) {
     s->type = STMT_DELETE;
     lex_eat(l, TK_FROM);
@@ -864,6 +898,8 @@ static void parse_delete(Lexer *l, Stmt *s) {
     if (lex_eat(l, TK_WHERE)) s->dml.where = parse_expr(l, 0);
 }
 
+/* Точка входа парсера: распознаёт вид инструкции (WITH/SELECT/UPDATE/DELETE/
+   BEGIN/COMMIT/ROLLBACK) и для SELECT достраивает цепочку UNION/INTERSECT/EXCEPT. */
 static Stmt *parse_stmt(Lexer *l) {
     Stmt *s = arena_calloc(l->a, sizeof(Stmt));
     lex_eat(l, TK_SEMICOLON);
@@ -934,12 +970,15 @@ static Stmt *parse_stmt(Lexer *l) {
     return s;
 }
 
+/* Публичный API: разобрать SQL-запрос длиной len в AST (Stmt), размещённый в Arena a. */
 Stmt *sql_parse(Arena *a, const char *query, size_t len) {
     Lexer l = {query, 0, len, {0}, false, a};
     return parse_stmt(&l);
 }
 
 /* ── Planner ── */
+/* Строит дерево плана исполнения из AST: scan/join → filter → aggregate →
+   having → distinct → project → window → sort → limit (узлы навешиваются снизу вверх). */
 PlanNode *sql_plan(Arena *a, const Stmt *s) {
     if (!s) return NULL;
     if (s->type == STMT_SET_OP) {
@@ -1015,6 +1054,7 @@ PlanNode *sql_plan(Arena *a, const Stmt *s) {
     return root;
 }
 
+/* Отладочный вывод краткой сводки об инструкции (для диагностики/тестов). */
 void stmt_dump(const Stmt *s) {
     if (!s) { puts("(null stmt)"); return; }
     if (s->error) { printf("ERROR: %s\n", s->error); return; }

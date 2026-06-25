@@ -1,3 +1,10 @@
+/*
+ * rbac.c — хранилище и проверка RBAC-политик DataFlow OS.
+ *
+ * Политики хранятся в SQLite (таблица rbac_policies): для каждой роли —
+ * набор glob-паттернов имён таблиц, битовая маска разрешённых действий и
+ * опциональный row-level фильтр (RLS). Доступ к БД сериализуется мьютексом.
+ */
 #include "rbac.h"
 #include "../core/log.h"
 #include <sqlite3.h>
@@ -7,6 +14,7 @@
 #include <stdio.h>
 #include <time.h>
 
+/* DDL хранилища политик: уникальный индекс не даёт дублировать (role, pattern) */
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS rbac_policies ("
     "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -19,6 +27,7 @@ static const char *SCHEMA_SQL =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_rbac_role_pattern "
     "  ON rbac_policies(role, table_pattern);";
 
+/* Открывает БД политик, включает WAL, создаёт схему. NULL при ошибке. */
 RbacStore *rbac_store_create(const char *db_path, bool enabled) {
     RbacStore *s = calloc(1, sizeof(RbacStore));
     s->enabled = enabled;
@@ -38,6 +47,7 @@ RbacStore *rbac_store_create(const char *db_path, bool enabled) {
     return s;
 }
 
+/* Закрывает БД и освобождает хранилище (безопасно при s == NULL). */
 void rbac_store_destroy(RbacStore *s) {
     if (!s) return;
     pthread_mutex_destroy(&s->mu);
@@ -45,7 +55,8 @@ void rbac_store_destroy(RbacStore *s) {
     free(s);
 }
 
-/* Загружаем все политики для роли и проверяем по glob-паттерну */
+/* Загружаем все политики для роли и проверяем по glob-паттерну.
+ * Возврат: 0 — разрешено, -1 — запрещено/нет подходящей политики. */
 int rbac_check(RbacStore *s, const AuthClaims *claims,
                RbacAction action, const char *table_name) {
     if (!s || !s->enabled) return 0; /* RBAC выключен — всё разрешено */
@@ -69,6 +80,7 @@ int rbac_check(RbacStore *s, const AuthClaims *claims,
         uint32_t    allowed = (uint32_t)sqlite3_column_int(stmt, 1);
 
         const char *tname_check = table_name ? table_name : "*";
+        /* Совпадение по glob либо политика-wildcard; проверяем бит действия */
         if (fnmatch(pat, tname_check, 0) == 0 || strcmp(pat, "*") == 0) {
             if (allowed & (uint32_t)action) {
                 result = 0;
@@ -89,6 +101,8 @@ static bool safe_user_id(const char *uid) {
     return true;
 }
 
+/* Возвращает SQL-фрагмент row-level фильтра для первой подходящей политики
+ * (с подстановкой {user_id}) или NULL, если фильтра нет. Буфер из арены a. */
 const char *rbac_row_filter(RbacStore *s, const AuthClaims *claims,
                              const char *table_name, Arena *a) {
     if (!s || !s->enabled || !claims) return NULL;
@@ -122,6 +136,7 @@ const char *rbac_row_filter(RbacStore *s, const AuthClaims *claims,
                 char *buf = arena_alloc(a, 1024);
                 const char *p = filter;
                 int off = 0;
+                /* Посимвольное копирование с заменой токена {user_id}; лимит 1020 защищает буфер */
                 while (*p && off < 1020) {
                     if (strncmp(p, "{user_id}", 9) == 0) {
                         int ul = (int)strlen(claims->user_id);
@@ -147,6 +162,7 @@ const char *rbac_row_filter(RbacStore *s, const AuthClaims *claims,
     return result;
 }
 
+/* Upsert политики по ключу (role, table_pattern). Возврат 0 / -1. */
 int rbac_policy_set(RbacStore *s, AuthRole role, const char *table_pattern,
                     uint32_t actions, const char *row_filter) {
     pthread_mutex_lock(&s->mu);
@@ -172,6 +188,7 @@ int rbac_policy_set(RbacStore *s, AuthRole role, const char *table_pattern,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Удаляет политику по её id. Возврат 0 / -1. */
 int rbac_policy_del(RbacStore *s, int policy_id) {
     pthread_mutex_lock(&s->mu);
     const char *sql = "DELETE FROM rbac_policies WHERE id = ?;";
@@ -187,6 +204,8 @@ int rbac_policy_del(RbacStore *s, int policy_id) {
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Сериализует политики в JSON-массив (все при role == -1, иначе по роли).
+ * Результат пишется в *json_out из арены a. */
 int rbac_policy_list(RbacStore *s, AuthRole role, char **json_out, Arena *a) {
     pthread_mutex_lock(&s->mu);
     const char *sql;
@@ -228,6 +247,7 @@ int rbac_policy_list(RbacStore *s, AuthRole role, char **json_out, Arena *a) {
     return 0;
 }
 
+/* Засевает дефолтные политики (admin/analyst/viewer) при пустом хранилище. */
 void rbac_init_defaults(RbacStore *s) {
     /* Проверяем есть ли уже политики */
     pthread_mutex_lock(&s->mu);

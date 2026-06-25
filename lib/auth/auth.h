@@ -1,4 +1,7 @@
 #pragma once
+/* auth.h — аутентификация и авторизация DataFlow OS:
+ * API-ключи и JWT (HS256), роли пользователей, проверка HTTP-запросов.
+ * Хранилище учётных записей — таблица users в SQLite-каталоге. */
 #include "../core/arena.h"
 #include <sqlite3.h>
 #include <stdbool.h>
@@ -7,14 +10,17 @@
 #define AUTH_TOKEN_LEN   32    /* API-key random bytes */
 #define AUTH_JWT_SECRET_LEN 64
 
+/* Роли по убыванию прав: ADMIN > ANALYST > VIEWER */
 typedef enum { ROLE_ADMIN = 0, ROLE_ANALYST = 1, ROLE_VIEWER = 2 } AuthRole;
 
+/* Полезная нагрузка токена: кто, с какой ролью и до какого момента валиден */
 typedef struct {
     char     user_id[64];
     AuthRole role;
     int64_t  exp;          /* unix timestamp expiry */
 } AuthClaims;
 
+/* Хранилище учётных записей поверх открытого SQLite-соединения */
 typedef struct AuthStore {
     sqlite3 *db;
 } AuthStore;

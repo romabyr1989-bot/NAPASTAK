@@ -248,6 +248,8 @@ JVal *json_get(JVal *obj, const char *key) {
     return NULL;
 }
 
+/* Типизированные аксессоры: возвращают значение нужного типа либо def,
+ * если узел отсутствует (NULL) или имеет другой тип. */
 const char *json_str(JVal *v, const char *def) {
     return (v && v->type==JV_STRING) ? v->s : def;
 }

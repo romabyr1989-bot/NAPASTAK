@@ -27,8 +27,10 @@
 #include <signal.h>
 #include <unistd.h>
 
+/* Глобальное состояние сервера: режим, URL шлюза, токен, путь к данным. */
 McpState g_mcp;
 
+/* Печатает справку по аргументам командной строки в stderr. */
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [--gateway URL --api-key TOKEN] | [--data-dir DIR]\n"
@@ -40,6 +42,8 @@ static void usage(const char *prog) {
         prog);
 }
 
+/* Разбирает argv в g_mcp. По умолчанию HTTP-режим на localhost:8080.
+ * Возвращает ненулевое значение при ошибке или запросе справки (нужно выйти). */
 static int parse_args(int argc, char **argv) {
     g_mcp.mode = MCP_MODE_HTTP;
     strncpy(g_mcp.gateway_url, "http://localhost:8080", sizeof(g_mcp.gateway_url) - 1);
@@ -66,6 +70,8 @@ static int parse_args(int argc, char **argv) {
     return 0;
 }
 
+/* Флаг штатного завершения, выставляется обработчиком сигналов;
+ * sig_atomic_t/volatile — для безопасного чтения из основного цикла. */
 static volatile sig_atomic_t g_shutdown = 0;
 static void on_sig(int s) { (void)s; g_shutdown = 1; }
 
@@ -87,10 +93,12 @@ int main(int argc, char **argv) {
     char *line = malloc(MCP_LINE_BUF);
     if (!line) { LOG_ERROR("oom"); return 1; }
 
+    /* Основной цикл: по одному JSON-RPC сообщению на строку из stdin. */
     while (!g_shutdown && fgets(line, MCP_LINE_BUF, stdin)) {
         size_t n = strlen(line);
+        /* Срезаем завершающие \n и \r (учитывая CRLF). */
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
-        if (n == 0) continue;
+        if (n == 0) continue;  /* пустые строки игнорируем */
         mcp_handle_message(line);
     }
 

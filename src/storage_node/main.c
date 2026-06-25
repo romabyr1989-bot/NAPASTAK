@@ -1,3 +1,12 @@
+/*
+ * storage_node — реплика-standby узла хранения DataFlow OS.
+ *
+ * Слушает TCP-порт, принимает от primary потоки репликации (MSG_REPLICATE)
+ * и применяет WAL-байты к локальным таблицам, поддерживая каталог в актуальном
+ * состоянии. Также отвечает на PING и STATUS-запросы. На каждое соединение
+ * заводится отдельный поток (см. client_thread_fn); корректное завершение —
+ * через SIGINT/SIGTERM (детали обработки сигналов в комментариях ниже).
+ */
 #include "../../lib/cluster/proto.h"
 #include "../../lib/storage/storage.h"
 #include "../../lib/core/log.h"
@@ -14,8 +23,10 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
+/* Флаг graceful-shutdown и fd слушающего сокета — общие для main и обработчика сигналов */
 static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t g_srv_fd   = -1;
+/* Обработчик SIGINT/SIGTERM: выставляет флаг завершения и будит accept() */
 static void sig_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
@@ -26,13 +37,16 @@ static void sig_handler(int sig) {
     if (g_srv_fd >= 0) shutdown(g_srv_fd, SHUT_RDWR);
 }
 
-static char     g_data_dir[512] = "./data_node";
+static char     g_data_dir[512] = "./data_node";  /* каталог данных узла */
 static Catalog *g_catalog       = NULL;
 
+/* Открытые таблицы (имя -> Table*), защищены мьютексом, т.к. доступ из клиентских потоков.
+   g_last_lsn — последний успешно применённый LSN, отдаётся в STATUS-ответе. */
 static HashMap          g_tables;
 static pthread_mutex_t  g_tables_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t         g_last_lsn  = 0;
 
+/* Контекст клиентского потока: дескриптор принятого соединения */
 typedef struct { int fd; } ClientCtx;
 
 /* Get or open a table on the standby (create stub if needed) */
@@ -51,6 +65,8 @@ static Table *get_or_open_table(const char *name) {
     return t;
 }
 
+/* Обработка MSG_REPLICATE: валидирует payload, применяет WAL к таблице и шлёт MSG_REPL_ACK.
+   result_code остаётся -1 при любой ошибке, обнуляется только при успешном append. */
 static void handle_replicate(int fd, ProtoHeader *hdr, void *body, size_t blen) {
     ProtoReplAckBody ack = { .lsn = 0, .result_code = -1 };
 
@@ -62,6 +78,7 @@ static void handle_replicate(int fd, ProtoHeader *hdr, void *body, size_t blen) 
     ProtoReplicateHdr *rhdr = (ProtoReplicateHdr *)body;
     ack.lsn = rhdr->lsn;
 
+    /* WAL-данные идут сразу после заголовка ProtoReplicateHdr в теле сообщения */
     void   *wal_payload = (char *)body + sizeof(ProtoReplicateHdr);
     size_t  wal_len     = blen - sizeof(ProtoReplicateHdr);
     if (wal_len != rhdr->wal_payload_len) {
@@ -92,6 +109,7 @@ static void handle_replicate(int fd, ProtoHeader *hdr, void *body, size_t blen) 
     proto_send(fd, MSG_REPL_ACK, hdr->request_id, &ack, sizeof(ack));
 }
 
+/* Поток обслуживания одного клиента: цикл приёма/диспетчеризации protocol-сообщений */
 static void *client_thread_fn(void *arg) {
     /* Block SIGINT/SIGTERM here so they are always delivered to the main
        thread, whose accept() (installed without SA_RESTART) then returns
@@ -139,6 +157,8 @@ static void *client_thread_fn(void *arg) {
     return NULL;
 }
 
+/* Точка входа: разбор аргументов (-p порт, -d каталог данных), настройка сигналов,
+   открытие каталога и accept-цикл с порождением потока на каждое соединение */
 int main(int argc, char **argv) {
     int port = 9090;
     for (int i = 1; i < argc; i++) {
@@ -190,7 +210,7 @@ int main(int argc, char **argv) {
         struct sockaddr_in peer;
         socklen_t plen = sizeof(peer);
         int cfd = accept(srv_fd, (struct sockaddr *)&peer, &plen);
-        if (cfd < 0) continue;
+        if (cfd < 0) continue;  /* EINTR при сигнале — повторно проверяем g_shutdown */
         ClientCtx *ctx = malloc(sizeof(ClientCtx));
         ctx->fd = cfd;
         pthread_t t;

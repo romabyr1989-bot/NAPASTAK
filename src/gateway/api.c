@@ -1,3 +1,8 @@
+/* api.c — HTTP/pgwire gateway: маршруты REST API, встроенный SQL-исполнитель
+ * (eval_func/eval_val/exec_stmt с join/group/window), эмуляция pg-каталога,
+ * запуск шагов пайплайнов (connector/sink/python/scala/scd2/match) и
+ * обвязка auth/RBAC/audit/matview. Точка регистрации — api_register_routes(). */
+
 /* Expose BSD/Darwin extensions (mkdtemp) that the global _POSIX_C_SOURCE
  * otherwise hides on macOS. No-op on Linux/glibc (covered by _GNU_SOURCE). */
 #define _DARWIN_C_SOURCE
@@ -77,6 +82,8 @@ static bool check_table_access(HttpReq *req, HttpResp *resp,
     return false;
 }
 
+/* Подмешивает row-level-security фильтр в WHERE запроса: парсит rls_sql как
+ * условие и объединяет с существующим WHERE через AND (или ставит как есть). */
 static void apply_rls_to_select(SelectStmt *sel, const char *rls_sql, Arena *a)
 {
     if (!rls_sql || !*rls_sql) return;
@@ -100,6 +107,8 @@ static void apply_rls_to_select(SelectStmt *sel, const char *rls_sql, Arena *a)
     }
 }
 
+/* Проверяет READ-доступ ко всем таблицам SELECT (включая CTE) и применяет RLS;
+ * при отказе пишет 403 и возвращает false. */
 static bool check_select_access(HttpReq *req, HttpResp *resp, SelectStmt *sel)
 {
     for (int i = 0; i < sel->nfrom; i++) {
@@ -159,6 +168,8 @@ static char detect_delim(const char *line, size_t n) {
     return (semis > commas) ? ';' : ',';
 }
 
+/* Делит строку по разделителю in-place (заменяя delim на '\0'); out[] получает
+ * указатели на поля, *nout — их число. Кавычки не учитываются. */
 static void split_line_simple(char *line, char delim, char **out, int max_cols, int *nout) {
     int n = 0; char *p = line; out[n++] = p;
     while (*p && n < max_cols) {
@@ -2849,6 +2860,8 @@ static int32_t pg_infer_col_oid(const RS *rs, int col_idx) {
  * the real engine. Matching is permissive — we just look for the
  * catalog table name in a case-folded copy of the SQL.                 */
 
+/* Нормализует SQL для сопоставления с каталогом: пропускает ведущие пробелы,
+ * приводит к нижнему регистру и срезает хвостовые ';' и пробелы. */
 static void pg_normalize(const char *src, char *out, size_t cap) {
     while (*src == ' ' || *src == '\t' || *src == '\n') src++;
     size_t n = 0;
@@ -2861,6 +2874,7 @@ static void pg_normalize(const char *src, char *out, size_t cap) {
                      out[n-1] == '\t' || out[n-1] == '\n')) out[--n] = '\0';
 }
 
+/* Эмуляция information_schema.tables: по строке на каждую таблицу из каталога. */
 static void pg_handle_info_tables(PgConn *conn) {
     PgColumn cols[] = {
         {"table_catalog", PG_OID_TEXT, -1},
@@ -2881,6 +2895,8 @@ static void pg_handle_info_tables(PgConn *conn) {
     pgwire_send_command_complete(conn, tag);
 }
 
+/* Эмуляция information_schema.columns: разворачивает схему каждой таблицы в
+ * строки со столбцами, маппя внутренний COL_* в имена pg-типов. */
 static void pg_handle_info_columns(PgConn *conn) {
     PgColumn cols[] = {
         {"table_catalog",      PG_OID_TEXT, -1},
@@ -2921,6 +2937,7 @@ static void pg_handle_info_columns(PgConn *conn) {
     pgwire_send_command_complete(conn, tag);
 }
 
+/* Эмуляция pg_namespace: всегда отдаёт фиксированные схемы pg_catalog и public. */
 static void pg_handle_pg_namespace(PgConn *conn) {
     PgColumn cols[] = {
         {"oid",      PG_OID_INT8, 8},
@@ -2935,6 +2952,8 @@ static void pg_handle_pg_namespace(PgConn *conn) {
     pgwire_send_command_complete(conn, "SELECT 2");
 }
 
+/* Эмуляция pg_class: по строке (relkind 'r') на таблицу с синтетическими OID,
+ * начинающимися с 16384 (диапазон пользовательских объектов в Postgres). */
 static void pg_handle_pg_class(PgConn *conn) {
     PgColumn cols[] = {
         {"oid",          PG_OID_INT8, 8},
@@ -3800,6 +3819,8 @@ static int write_rs_to_table(App *app, Arena *a, const char *tname, RS *rs) {
     }
     if (batch.nrows > 0) table_append(t, &batch);
     catalog_update_table_meta(app->catalog, tname, "pipeline", (int64_t)rs->nrows);
+    /* Mark datamarts depending on this table stale (+ queue on-write refresh). */
+    if (app->matviews) mvs_invalidate(app->matviews, tname);
     return total;
 }
 
@@ -4093,6 +4114,11 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
         catalog_update_table_meta(app->catalog, step_output(st), st->connector_type, (int64_t)total_rows);
 
     connector_unload(inst);
+    /* Count rows ingested from a source into "Строк загружено" + the per-minute ring. */
+    if (app->metrics && total_rows > 0) {
+        app->metrics->total_rows += total_rows;
+        metrics_push(&app->metrics->rows_ingested, (double)total_rows);
+    }
     LOG_INFO("connector step '%s' → %s: %d rows", st->connector_type, step_output(st), total_rows);
     return total_rows;
 }
@@ -4582,6 +4608,9 @@ static void rmrf_path(const char *path) {
     }
 }
 
+/* Шаг Scala: вход предыдущего шага выгружается в CSV, оборачивается в скрипт с
+ * пользовательским кодом (df: DataFrame), исполняется, результат ингестится назад.
+ * Возвращает >=0 (число строк) либо -1 c сообщением в errbuf. */
 static int run_scala_step(App *app, Arena *a, PipelineStep *st,
                           char *errbuf, size_t errsz) {
     char label[128];
@@ -5219,6 +5248,7 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
 static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, Arena *external_arena) {
     Arena *a = external_arena ? external_arena : arena_create(4194304); /* 4 MiB */
     int64_t started = (int64_t)time(NULL);
+    struct timespec _mt0; clock_gettime(CLOCK_MONOTONIC, &_mt0);
     int total_rows = 0;
     const char *run_error = NULL;
     int total_retries = 0;
@@ -5371,6 +5401,9 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
 
 done:
     if (report) {
+        struct timespec _mt1; clock_gettime(CLOCK_MONOTONIC, &_mt1);
+        double _run_ms = (_mt1.tv_sec - _mt0.tv_sec) * 1000.0 + (_mt1.tv_nsec - _mt0.tv_nsec) / 1e6;
+        if (app->metrics) metrics_push(&app->metrics->pipeline_latency_ms, _run_ms);
         catalog_log_run(app->catalog, p->id, started, (int64_t)time(NULL),
                         p->run_status == RUN_SUCCESS ? 0 : 1, run_error, total_retries);
         send_pipeline_alert(p, run_error, p->run_status == RUN_SUCCESS);
@@ -5380,12 +5413,13 @@ done:
             p->id, p->run_status == RUN_SUCCESS ? "success" : "failed", total_rows));
         arena_destroy(ba);
     } else {
-        (void)started; (void)run_error; (void)total_retries; (void)total_rows;
+        (void)started; (void)run_error; (void)total_retries; (void)total_rows; (void)_mt0;
     }
     /* Only destroy the arena if WE created it. */
     if (!external_arena) arena_destroy(a);
 }
 
+/* Публичная точка входа: выполнить пайплайн с записью прогона и своей ареной. */
 void pipeline_execute_steps(Pipeline *p, App *app) {
     pipeline_execute_steps_internal(p, app, /*report=*/true, /*external_arena=*/NULL);
 }
@@ -5406,10 +5440,72 @@ static void h_pipeline_run(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp,200,"{\"status\":\"triggered\"}");
 }
 
+/* True if `tbl` occurs as a whole identifier token inside `hay` (so "orders"
+ * does not match "orders_detail"). */
+static bool sql_refs_table(const char *hay, const char *tbl) {
+    if (!hay || !tbl || !tbl[0]) return false;
+    size_t tl = strlen(tbl);
+    for (const char *p = strstr(hay, tbl); p; p = strstr(p + tl, tbl)) {
+        char b = (p == hay) ? ' ' : p[-1];
+        char a = p[tl];
+        #define DFO_IDENT_CH(c) (((c)>='A'&&(c)<='Z')||((c)>='a'&&(c)<='z')||((c)>='0'&&(c)<='9')||(c)=='_')
+        if (!DFO_IDENT_CH(b) && !DFO_IDENT_CH(a)) return true;
+        #undef DFO_IDENT_CH
+    }
+    return false;
+}
+
+/* True if any pipeline other than `exclude_id` reads (in transform_sql) or writes
+ * (target_table) the engine table `table` — such tables must survive deletion.
+ * Note: connector_config "table" names refer to EXTERNAL source tables (a different
+ * namespace), so they are deliberately not consulted here. */
+static bool table_used_by_other_pipeline(const char *table, const char *exclude_id) {
+    Scheduler *s = g_app.scheduler;
+    if (!s || !table || !table[0]) return false;
+    for (int i = 0; i < s->npipelines; i++) {
+        Pipeline *q = &s->pipelines[i];
+        if (!strcmp(q->id, exclude_id)) continue;
+        for (int si = 0; si < q->nsteps; si++) {
+            PipelineStep *st = &q->steps[si];
+            if (st->target_table[0] && !strcasecmp(st->target_table, table)) return true;
+            if (sql_refs_table(st->transform_sql, table)) return true;
+        }
+    }
+    return false;
+}
+
 /* ── DELETE /api/pipelines/:id ── */
 static void h_pipeline_delete(HttpReq *req, HttpResp *resp) {
     const char *id=hm_get(&req->params,"id");
     if(!id){http_resp_error(resp,400,"missing id");return;}
+
+    /* Drop the engine tables this pipeline produced, using the same names the
+     * runner assigns: an explicit target_table, else the pipeline name for the
+     * last step, else __dfo_<id>_s<i> for intermediate steps. Sink steps write
+     * to external systems and own no engine table, so they are skipped. */
+    Pipeline *p = scheduler_find(g_app.scheduler, id);
+    if (p) {
+        Arena *a = arena_create(8192);
+        int dropped = 0;
+        for (int si = 0; si < p->nsteps; si++) {
+            PipelineStep *st = &p->steps[si];
+            if (st->is_sink) continue;
+            const char *out = st->target_table[0]
+                ? st->target_table
+                : (si == p->nsteps - 1
+                    ? sanitize_table_name(a, p->name[0] ? p->name : p->id)
+                    : arena_sprintf(a, "__dfo_%s_s%d", p->id, si));
+            if (!out || !out[0]) continue;
+            if (table_used_by_other_pipeline(out, id) || mvs_table_used(g_app.matviews, out, "")) {
+                LOG_INFO("pipeline %s: keep table '%s' (used by another pipeline/datamart)", id, out);
+                continue;
+            }
+            if (catalog_drop_table(g_app.catalog, out) == 0) dropped++;
+        }
+        arena_destroy(a);
+        LOG_INFO("pipeline %s: dropped %d associated table(s) on delete", id, dropped);
+    }
+
     scheduler_remove(g_app.scheduler,id); catalog_delete_pipeline(g_app.catalog,id);
     http_resp_json(resp,200,"{\"status\":\"deleted\"}");
 }
@@ -5747,6 +5843,8 @@ static ConnectorInst *load_connector_by_type(Arena *a, const char *type,
     return connector_load(so_path, cfg_json, a);
 }
 
+/* POST /api/connector/probe/entities — грузит коннектор по type+config и
+ * возвращает список доступных сущностей (таблиц/потоков). */
 static void h_connector_probe_entities(HttpReq *req, HttpResp *resp) {
     Arena *a = arena_create(65536);
     JVal *root = json_parse(a, req->body, req->body_len);
@@ -5942,6 +6040,8 @@ static void h_connector_probe_preview(HttpReq *req, HttpResp *resp) {
     arena_destroy(a);
 }
 
+/* POST /api/connector/probe/schema — возвращает схему (колонки/типы) одной
+ * сущности коннектора, заданной в поле "entity". */
 static void h_connector_probe_schema(HttpReq *req, HttpResp *resp) {
     Arena *a = arena_create(65536);
     JVal *root = json_parse(a, req->body, req->body_len);
@@ -6054,6 +6154,7 @@ static void h_auth_token(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, jb_done(&jb));
 }
 
+/* POST /api/auth/apikeys — выпускает новый API-ключ для пользователя. */
 static void h_auth_apikey_create(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN) {
         http_resp_error(resp, 403, "admin required");
@@ -6092,6 +6193,7 @@ static void h_auth_apikey_create(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, json_resp);
 }
 
+/* GET /api/auth/apikeys — список API-ключей текущего пользователя. */
 static void h_auth_apikey_list(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN) {
         http_resp_error(resp, 403, "admin required");
@@ -6124,6 +6226,7 @@ static void h_auth_apikey_list(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, jb_done(&jb));
 }
 
+/* DELETE /api/auth/apikeys/:key — отзывает указанный API-ключ. */
 static void h_auth_apikey_delete(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN) {
         http_resp_error(resp, 403, "admin required");
@@ -6141,6 +6244,7 @@ static void h_auth_apikey_delete(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, "{\"ok\":true}");
 }
 
+/* GET /api/auth/me — возвращает идентичность и роль текущего вызывающего. */
 static void h_auth_me(HttpReq *req, HttpResp *resp) {
     const char *role_str = req->auth.role == ROLE_ADMIN ? "admin" :
                            req->auth.role == ROLE_ANALYST ? "analyst" : "viewer";
@@ -6160,6 +6264,7 @@ static void h_rbac_policies_list(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, json);
 }
 
+/* POST /api/rbac/policies — создаёт/обновляет RBAC-политику (только admin). */
 static void h_rbac_policy_set(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
     if (!req->body || req->body_len == 0) { http_resp_error(resp, 400, "missing body"); return; }
@@ -6177,6 +6282,7 @@ static void h_rbac_policy_set(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, "{\"ok\":true}");
 }
 
+/* DELETE /api/rbac/policies/:id — удаляет RBAC-политику по id (только admin). */
 static void h_rbac_policy_del(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
     const char *id_s = hm_get(&req->params, "id");
@@ -6188,6 +6294,7 @@ static void h_rbac_policy_del(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, "{\"ok\":true}");
 }
 
+/* Достаёт значение параметра key из query-string qs (arena-копия), NULL если нет. */
 static char *qs_get(const char *qs, const char *key, Arena *a) {
     if (!qs || !key) return NULL;
     size_t klen = strlen(key);
@@ -6227,6 +6334,25 @@ static void h_audit_query(HttpReq *req, HttpResp *resp) {
 }
 
 /* ── Matview handlers ── */
+
+/* Materialise a datamart: run its definition SQL and write the result into the
+ * table `target_table` (= the view's own name, so it's queryable by name).
+ * Returns the row count, or -1 on parse/exec failure. Wired via mvs_set_exec_fn. */
+static int matview_exec_fn(const char *def_sql, const char *target_table, void *app_v) {
+    App *app = (App *)app_v;
+    Arena *a = arena_create(4 * 1024 * 1024);
+    if (!a) return -1;
+    int n = -1;
+    Stmt *stmt = sql_parse(a, def_sql, strlen(def_sql));
+    if (stmt && !stmt->error) {
+        RS *rs = exec_stmt(a, stmt, NULL);
+        if (rs) n = write_rs_to_table(app, a, target_table, rs);
+    }
+    arena_destroy(a);
+    return n;
+}
+
+/* POST /api/matviews — создаёт datamart (def SQL + cron) и материализует сразу. */
 static void h_matview_create(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN && req->auth.role != ROLE_ANALYST) {
         http_resp_error(resp, 403, "insufficient role"); return;
@@ -6254,9 +6380,11 @@ static void h_matview_create(HttpReq *req, HttpResp *resp) {
     if (mvs_create_view(g_app.matviews, &mv) < 0) {
         http_resp_error(resp, 500, "matview create failed"); return;
     }
+    mvs_refresh(g_app.matviews, name, &g_app);   /* materialise immediately on create */
     http_resp_json(resp, 200, arena_sprintf(a, "{\"name\":\"%s\",\"ok\":true}", name));
 }
 
+/* GET /api/matviews — список зарегистрированных datamart-ов. */
 static void h_matviews_list(HttpReq *req, HttpResp *resp) {
     (void)req;
     Arena *a = req->arena;
@@ -6267,6 +6395,7 @@ static void h_matviews_list(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, json);
 }
 
+/* POST /api/matviews/:name/refresh — принудительно пересобирает datamart. */
 static void h_matview_refresh(HttpReq *req, HttpResp *resp) {
     const char *name = hm_get(&req->params, "name");
     if (!name) { http_resp_error(resp, 400, "missing name"); return; }
@@ -6276,14 +6405,33 @@ static void h_matview_refresh(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, "{\"ok\":true}");
 }
 
+/* DELETE /api/matviews/:name — удаляет datamart (только admin). */
 static void h_matview_drop(HttpReq *req, HttpResp *resp) {
     if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
     const char *name = hm_get(&req->params, "name");
     if (!name) { http_resp_error(resp, 400, "missing name"); return; }
+    /* Drop the datamart's materialised table — unless a pipeline or another
+     * datamart still reads it (the datamart's table = its own name). */
+    if (name[0]
+        && !table_used_by_other_pipeline(name, "")
+        && !mvs_table_used(g_app.matviews, name, name)) {
+        catalog_drop_table(g_app.catalog, name);
+    } else {
+        LOG_INFO("matview drop: keep table '%s' (still used by a pipeline/datamart)", name);
+    }
     if (mvs_drop_view(g_app.matviews, name) < 0) {
         http_resp_error(resp, 500, "drop failed"); return;
     }
     http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
+/* ── GET /api/matviews/:name/runs ── refresh history of one datamart ── */
+static void h_matview_runs(HttpReq *req, HttpResp *resp) {
+    const char *name = hm_get(&req->params, "name");
+    if (!name) { http_resp_error(resp, 400, "missing name"); return; }
+    Arena *a = arena_create(65536); char *json = NULL;
+    if (g_app.matviews) mvs_list_refreshes(g_app.matviews, name, &json, a);
+    http_resp_json(resp, 200, json ? json : "[]");
 }
 
 /* ── Cluster status ── */
@@ -6300,6 +6448,8 @@ static void h_cluster_status(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, buf);
 }
 
+/* Регистрирует все HTTP-маршруты гейтвея в роутере (UI, таблицы, запросы,
+ * пайплайны, коннекторы, auth/RBAC/audit, matview, кластер). */
 void api_register_routes(Router *r) {
     router_add(r,"GET",  "/",           h_ui_html);
     router_add(r,"GET",  "/style.css",  h_ui_css);
@@ -6353,7 +6503,9 @@ void api_register_routes(Router *r) {
     router_add(r,"POST",  "/api/matviews",           h_matview_create);
     router_add(r,"GET",   "/api/matviews",           h_matviews_list);
     router_add(r,"POST",  "/api/matviews/:name/refresh", h_matview_refresh);
+    router_add(r,"GET",   "/api/matviews/:name/runs", h_matview_runs);
     router_add(r,"DELETE","/api/matviews/:name",     h_matview_drop);
+    if (g_app.matviews) mvs_set_exec_fn(g_app.matviews, matview_exec_fn, &g_app);  /* wire materialisation */
     // Cluster endpoint
     router_add(r,"GET",   "/api/cluster/status",     h_cluster_status);
 }

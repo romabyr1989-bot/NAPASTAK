@@ -30,7 +30,8 @@ static int handle_http_failure(const McpHttpResp *r, char *out, size_t cap, int 
     return 0;
 }
 
-/* Append a printf-style chunk to out, advancing *off. */
+/* Append a printf-style chunk to out, advancing *off.
+ * Silently stops once the buffer is full so callers can ignore truncation. */
 static void append(char *out, size_t cap, size_t *off, const char *fmt, ...) {
     if (*off >= cap) return;
     va_list ap; va_start(ap, fmt);
@@ -75,6 +76,8 @@ static void cell_to_str(JVal *v, char *out, size_t cap) {
 }
 
 /* ── tool: query ──────────────────────────────────────────────── */
+/* Run arbitrary SQL via the gateway and render the result as a Markdown
+ * table (SELECT) or a short status line (DML / non-tabular response). */
 void tool_query(JVal *args, char *out, size_t cap, int *is_err, Arena *a) {
     const char *sql = json_str(json_get(args, "sql"), NULL);
     if (!sql) { put_err(out, cap, is_err, "Missing 'sql' parameter"); return; }
@@ -186,7 +189,7 @@ void tool_describe_table(JVal *args, char *out, size_t cap, int *is_err, Arena *
     const char *table = json_str(json_get(args, "table"), NULL);
     if (!table) { put_err(out, cap, is_err, "Missing 'table' parameter"); return; }
     long long sample = json_int(json_get(args, "sample_rows"), 5);
-    if (sample < 0) sample = 0; if (sample > 50) sample = 50;
+    if (sample < 0) sample = 0; if (sample > 50) sample = 50; /* clamp to [0,50] */
 
     /* Fetch /api/tables/<name>/info for schema */
     char path[512];
@@ -301,7 +304,7 @@ void tool_ingest_url(JVal *args, char *out, size_t cap, int *is_err, Arena *a) {
     const char *fmt   = json_str(json_get(args, "format"), "csv");
     if (!table || !url) { put_err(out, cap, is_err, "Missing 'table' or 'url'"); return; }
 
-    /* Build a one-shot pipeline payload */
+    /* Build a one-shot pipeline payload (cron empty → not scheduled, run once below) */
     char et[256], eu[1024], ef[64];
     json_escape_into(table, et, sizeof(et));
     json_escape_into(url,   eu, sizeof(eu));
@@ -425,6 +428,8 @@ void tool_get_metrics(JVal *args, char *out, size_t cap, int *is_err, Arena *a) 
 }
 
 /* ── tool: analyze ────────────────────────────────────────────── */
+/* Build a per-column profile: row count plus distinct/min/max per column,
+ * issuing one aggregate query per column against the gateway. */
 void tool_analyze(JVal *args, char *out, size_t cap, int *is_err, Arena *a) {
     const char *table = json_str(json_get(args, "table"), NULL);
     if (!table) { put_err(out, cap, is_err, "Missing 'table'"); return; }

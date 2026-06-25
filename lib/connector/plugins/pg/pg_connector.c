@@ -126,6 +126,7 @@ static void *pg_create(const char *cfg, Arena *a) {
     return ctx;
 }
 
+/* ── destroy(): закрываем соединение libpq; саму арену освобождает вызывающий ── */
 static void pg_destroy(void *vctx) {
     PgCtx *ctx = vctx;
     if (ctx && ctx->conn) { PQfinish(ctx->conn); ctx->conn = NULL; }
@@ -432,6 +433,7 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
  * via multi-row INSERT with libpq literal/identifier escaping. Returns rows
  * written or <0 on error. */
 #define PG_INS_CHUNK 250
+/* Выполнить SQL и проверить успех (COMMAND_OK/TUPLES_OK); логирует ошибку. 0 — ok, -1 — сбой. */
 static int pg_exec_ok(PGconn *c, const char *sql) {
     PGresult *r = PQexec(c, sql);
     int ok = (PQresultStatus(r) == PGRES_COMMAND_OK || PQresultStatus(r) == PGRES_TUPLES_OK);
@@ -482,6 +484,7 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
     for (int start = 0; start < batch->nrows; start += PG_INS_CHUNK) {
         int end = start + PG_INS_CHUNK; if (end > batch->nrows) end = batch->nrows;
         size_t cap = 4096; char *sql = malloc(cap); size_t off = 0;
+        /* Дописать в sql с автоматическим ростом буфера (удваиваем cap, пока не влезет). */
         #define PG_APP(...) do { \
             int need = snprintf(NULL,0,__VA_ARGS__); \
             if (off + (size_t)need + 1 > cap) { while (off+(size_t)need+1>cap) cap*=2; sql=realloc(sql,cap);} \

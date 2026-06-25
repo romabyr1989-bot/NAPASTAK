@@ -1,22 +1,31 @@
 #pragma once
+/*
+ * txn.h — управление транзакциями поверх storage.
+ * Транзакция буферизует операции записи (INSERT/DELETE/UPDATE) в собственной
+ * arena и применяет их атомарно на COMMIT через пользовательский callback,
+ * либо отбрасывает на ROLLBACK. TxnManager хранит фиксированный пул активных
+ * транзакций и защищён мьютексом для многопоточного доступа.
+ */
 #include "storage.h"
 #include "../core/arena.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdbool.h>
 
-#define TXN_MAX_ACTIVE  64
-#define TXN_MAX_ENTRIES 4096
-#define TXN_ID_NONE     0
+#define TXN_MAX_ACTIVE  64    /* размер пула одновременно активных транзакций */
+#define TXN_MAX_ENTRIES 4096  /* максимум буферизованных операций на транзакцию */
+#define TXN_ID_NONE     0     /* зарезервированный id «нет транзакции» */
 
 typedef uint64_t TxnId;
 
+/* Состояние транзакции в её жизненном цикле */
 typedef enum {
     TXN_ACTIVE    = 0,
     TXN_COMMITTED = 1,
     TXN_ABORTED   = 2,
 } TxnStatus;
 
+/* Тип буферизованной операции записи */
 typedef enum {
     TXN_OP_INSERT = 0,
     TXN_OP_DELETE = 1,
@@ -33,6 +42,7 @@ typedef struct {
     size_t     csv_len;
 } TxnEntry;
 
+/* Одна транзакция: статус и список буферизованных операций в своей arena */
 typedef struct {
     TxnId      id;
     TxnStatus  status;
@@ -42,6 +52,7 @@ typedef struct {
     Arena     *arena;         /* lives from BEGIN to COMMIT/ROLLBACK */
 } Txn;
 
+/* Пул транзакций с выдачей монотонных id; доступ сериализуется через mu */
 typedef struct {
     Txn             txns[TXN_MAX_ACTIVE];
     pthread_mutex_t mu;
@@ -58,6 +69,7 @@ typedef int (*TxnApplyFn)(const char *table, TxnOpType op,
                            const char *new_csv, size_t csv_len,
                            void *userdata);
 
+/* Создание/уничтожение менеджера транзакций */
 TxnManager *txn_manager_create(void);
 void        txn_manager_destroy(TxnManager *tm);
 

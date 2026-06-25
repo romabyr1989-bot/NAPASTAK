@@ -1,3 +1,10 @@
+/*
+ * audit.c — подсистема журналирования аудита DataFlow OS.
+ *
+ * События аудита помещаются в кольцевой буфер без блокировок ввода-вывода,
+ * а фоновый поток батчами сбрасывает их в SQLite и (опционально) в JSONL-файл.
+ * Такая схема отделяет горячий путь (audit_log_event) от медленных записей на диск.
+ */
 #include "audit.h"
 #include "../core/log.h"
 #include "../core/arena.h"
@@ -8,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/* DDL таблицы аудита и индексов; выполняется один раз при инициализации. */
 static const char *AUDIT_SCHEMA =
     "CREATE TABLE IF NOT EXISTS audit_log ("
     "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -25,8 +33,10 @@ static const char *AUDIT_SCHEMA =
     "CREATE INDEX IF NOT EXISTS idx_audit_ts   ON audit_log(ts);"
     "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id, ts);";
 
-#define FLUSH_BATCH 100
+#define FLUSH_BATCH 100  /* максимум записей, забираемых из кольца за один проход */
 
+/* Персистит одну запись аудита: сначала в SQLite, затем в JSONL-файл.
+ * Каждый приёмник защищён собственным мьютексом. */
 static void flush_record(AuditLog *l, const AuditRecord *rec) {
     /* Write to SQLite */
     pthread_mutex_lock(&l->db_mu);
@@ -66,6 +76,9 @@ static void flush_record(AuditLog *l, const AuditRecord *rec) {
     }
 }
 
+/* Тело фонового потока: пока сервис работает или в кольце есть данные,
+ * ждёт появления записей, забирает их батчем под локом и сбрасывает на диск
+ * уже вне лока, чтобы не блокировать продюсеров. */
 static void *flush_thread_fn(void *arg) {
     AuditLog *l = (AuditLog *)arg;
     while (l->running || l->head != l->tail) {
@@ -74,7 +87,7 @@ static void *flush_thread_fn(void *arg) {
         while (l->head == l->tail && l->running) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 1;
+            ts.tv_sec += 1;  /* таймаут 1с — чтобы периодически проверять флаг running */
             pthread_cond_timedwait(&l->ring_cond, &l->ring_mu, &ts);
         }
         /* Забираем батч */
@@ -93,6 +106,9 @@ static void *flush_thread_fn(void *arg) {
     return NULL;
 }
 
+/* Создаёт и инициализирует журнал аудита: открывает БД (WAL), применяет схему,
+ * поднимает мьютексы/условные переменные, опционально открывает JSONL-файл
+ * и запускает фоновый поток сброса. Возвращает NULL при ошибке. */
 AuditLog *audit_log_create(const char *db_path, const char *log_file_path) {
     AuditLog *l = calloc(1, sizeof(AuditLog));
     if (!l) return NULL;
@@ -127,6 +143,8 @@ AuditLog *audit_log_create(const char *db_path, const char *log_file_path) {
     return l;
 }
 
+/* Корректно останавливает журнал: сигналит потоку завершиться, дожидается
+ * слива остатка кольца, закрывает файл/БД и освобождает все ресурсы. */
 void audit_log_destroy(AuditLog *l) {
     if (!l) return;
     l->running = 0;
@@ -144,11 +162,14 @@ void audit_log_destroy(AuditLog *l) {
     free(l);
 }
 
+/* Горячий путь: кладёт событие в кольцевой буфер и будит поток сброса.
+ * Не делает дисковых операций. При переполнении буфера событие отбрасывается. */
 void audit_log_event(AuditLog *l, const AuditEvent *ev) {
     if (!l || !ev) return;
 
     pthread_mutex_lock(&l->ring_mu);
     int next_head = (l->head + 1) % (AUDIT_RING_SIZE * 2); /* wrap-around counter */
+    /* Заполненность = head - tail; если она достигла размера кольца — мест нет */
     if (next_head - l->tail >= AUDIT_RING_SIZE) {
         /* Буфер полон — теряем запись */
         LOG_WARN("audit: ring buffer full, dropping event type=%d", (int)ev->type);
@@ -174,11 +195,13 @@ void audit_log_event(AuditLog *l, const AuditEvent *ev) {
     pthread_mutex_unlock(&l->ring_mu);
 }
 
+/* Выбирает записи аудита по фильтрам (user_id, временной диапазон, лимит)
+ * и сериализует их в JSON-массив в арене. Результат через json_out. */
 int audit_log_query(AuditLog *l, const char *user_id_filter,
                     int64_t from_ts, int64_t to_ts,
                     int limit, char **json_out, Arena *a) {
     if (!l) return -1;
-    if (limit <= 0 || limit > 10000) limit = 100;
+    if (limit <= 0 || limit > 10000) limit = 100;  /* нормализуем лимит к безопасному значению */
 
     pthread_mutex_lock(&l->db_mu);
 

@@ -16,6 +16,7 @@ static uint32_t fnv1a(const char *s) {
 
 static void hm_grow(HashMap *m);
 
+/* Инициализация таблицы: ёмкость округляется вверх до степени двойки. */
 void hm_init(HashMap *m, Arena *a, uint32_t cap) {
     if (cap < 8) cap = 8;
     /* Округляем до степени двойки: тогда (hash & (cap-1)) == (hash % cap) без деления. */
@@ -51,6 +52,7 @@ static void hm_grow(HashMap *m) {
     m->slots = newslots; m->cap = newcap;
 }
 
+/* Вставка или обновление значения по ключу; при необходимости растит таблицу. */
 void hm_set(HashMap *m, const char *key, void *val) {
     /* Порог 75% загрузки: count*4 >= cap*3 — стандартный компромисс память/скорость. */
     if (m->count * 4 >= m->cap * 3) hm_grow(m);
@@ -70,6 +72,7 @@ void hm_set(HashMap *m, const char *key, void *val) {
     m->count++;
 }
 
+/* Поиск значения по ключу; NULL, если ключ отсутствует. */
 void *hm_get(HashMap *m, const char *key) {
     uint32_t h = fnv1a(key), idx = h & (m->cap - 1);
     for (uint32_t i = 0; i < m->cap; i++) {
@@ -108,6 +111,7 @@ bool hm_del(HashMap *m, const char *key) {
     return false;
 }
 
+/* Очистка: обнуляет все слоты, сохраняя выделенную ёмкость. */
 void hm_clear(HashMap *m) { memset(m->slots, 0, m->cap * sizeof(HMEntry)); m->count = 0; }
 
 /* Итератор: idx — индекс следующего слота для проверки (0 в начале).

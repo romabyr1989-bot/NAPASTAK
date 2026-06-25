@@ -9,6 +9,8 @@
 /* forward declaration — definition is later in this file */
 static void bit_set(uint8_t *bm, int i);
 
+/* Состояние коннектора: путь к файлу, разделитель, флаг заголовка и
+ * выведенная/настроенная схема. Память владеется arena. */
 typedef struct {
     char  path[512];
     char  delimiter;
@@ -20,6 +22,7 @@ typedef struct {
 } CsvCtx;
 
 /* ── Schema inference ── */
+/* Угадывает тип столбца по строковому значению (NULL/bool/int/double/text). */
 static ColType infer_type(const char *s) {
     if (!s || !*s || strcasecmp(s,"null")==0 || strcasecmp(s,"na")==0) return COL_NULL;
     if (strcasecmp(s,"true")==0||strcasecmp(s,"false")==0) return COL_BOOL;
@@ -28,6 +31,8 @@ static ColType infer_type(const char *s) {
     return COL_TEXT;
 }
 
+/* Разбивает строку CSV на поля по разделителю с учётом кавычек RFC-4180
+ * (экранированные "" внутри поля). Возвращает массив, n_out — число полей. */
 static char **split_line(Arena *a, const char *line, char delim, int *n_out) {
     int cap=16; char **parts=arena_alloc(a,cap*sizeof(char*)); int n=0;
     const char *p = line;
@@ -45,6 +50,8 @@ static char **split_line(Arena *a, const char *line, char delim, int *n_out) {
     *n_out=n; return parts;
 }
 
+/* Создаёт контекст: разбирает JSON-конфиг (path/delimiter/header) и выводит
+ * схему по первой строке файла. Все столбцы — TEXT (см. примечание ниже). */
 static void *csv_create(const char *cfg, Arena *a) {
     CsvCtx *ctx = arena_calloc(a, sizeof(CsvCtx));
     ctx->arena = a;
@@ -95,6 +102,7 @@ static void *csv_create(const char *cfg, Arena *a) {
 
 static void csv_destroy(void *ctx) { (void)ctx; /* arena owned */ }
 
+/* Проверка доступности: пытается открыть файл на чтение. 0 — ок, -1 — ошибка. */
 static int csv_ping(void *vctx) {
     CsvCtx *ctx=vctx;
     FILE *f=fopen(ctx->path,"r");
@@ -102,6 +110,7 @@ static int csv_ping(void *vctx) {
     fclose(f); return 0;
 }
 
+/* Список сущностей: CSV-файл = одна таблица с именем = базовым именем файла. */
 static int csv_list(void *vctx, Arena *a, DfoEntityList *out) {
     CsvCtx *ctx=vctx;
     out->items=arena_calloc(a,sizeof(DfoEntity));
@@ -114,6 +123,7 @@ static int csv_list(void *vctx, Arena *a, DfoEntityList *out) {
     return 0;
 }
 
+/* Возвращает выведенную при create() схему (единственная сущность файла). */
 static int csv_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     (void)entity;
     CsvCtx *ctx=vctx;
@@ -122,6 +132,8 @@ static int csv_describe(void *vctx, Arena *a, const char *entity, Schema **out) 
     return ctx->schema ? 0 : -1;
 }
 
+/* Читает до BATCH_SIZE строк в колоночный батч, парся ячейки по типам схемы;
+ * пустые/null/na помечаются в null_bitmap. Заголовок пропускается при наличии. */
 static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                            const char *entity, ColBatch **out_batch) {
     (void)entity; (void)req;

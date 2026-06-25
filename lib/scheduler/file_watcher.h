@@ -18,4 +18,5 @@ typedef struct FileWatcher FileWatcher;
  * or the platform doesn't support file watching. The caller must
  * still call file_watcher_destroy() — it's NULL-safe. */
 FileWatcher *file_watcher_create(Scheduler *s);
+/* Останавливает фоновый поток и освобождает ресурсы; безопасно для NULL. */
 void         file_watcher_destroy(FileWatcher *fw);

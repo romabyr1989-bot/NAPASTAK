@@ -1,3 +1,12 @@
+/*
+ * http.c — встроенный HTTP/1.1 сервер шлюза DataFlow OS.
+ *
+ * Содержит: построение ответов, роутер с матчингом :path-параметров и
+ * auth/audit/metrics-мидлварями, ручной парсер запросов, опциональный TLS,
+ * апгрейд до WebSocket (RFC 6455 с собственными SHA-1/base64), HTTP→HTTPS
+ * редирект и цикл событий на kqueue (Apple) или epoll (Linux).
+ * Также предоставляет исходящий клиент http_post_json() поверх libcurl.
+ */
 #include "http.h"
 #include "../core/log.h"
 #include "../observ/observ.h"
@@ -18,6 +27,7 @@
 #include <curl/curl.h>
 #include <time.h>
 
+/* Монотонные миллисекунды — для измерения длительности обработки запроса. */
 static int64_t clock_monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -46,6 +56,7 @@ void http_resp_error(HttpResp *r, int status, const char *msg) {
     http_resp_json(r, status, buf);
 }
 
+/* Текст статуса для строки ответа; неизвестные коды трактуются как 200 OK. */
 static const char *http_status_text(int code) {
     switch (code) {
         case 200: return "OK";
@@ -62,6 +73,7 @@ static const char *http_status_text(int code) {
 }
 
 /* ── Router ── */
+/* Регистрирует маршрут (метод + шаблон пути) с его обработчиком. */
 void router_add(Router *r, const char *method, const char *pattern, HttpHandler h) {
     if (r->nroutes >= HTTP_MAX_ROUTES) { LOG_ERROR("too many routes"); return; }
     Route *rt = &r->routes[r->nroutes++];
@@ -70,6 +82,8 @@ void router_add(Router *r, const char *method, const char *pattern, HttpHandler 
     rt->handler = h;
 }
 
+/* Сопоставляет шаблон с путём; сегменты вида :name извлекаются в params.
+ * Возвращает true только при полном совпадении (с учётом хвостовых '/'). */
 static bool route_match(const char *pattern, const char *path, HashMap *params) {
     /* simple segment match: /api/:id/foo */
     const char *p = pattern, *q = path;
@@ -102,6 +116,8 @@ static bool route_match(const char *pattern, const char *path, HashMap *params) 
     return *p == '\0' && *q == '\0';
 }
 
+/* Находит первый подходящий маршрут, прогоняет auth-мидлварь и вызывает
+ * обработчик. По умолчанию (нет совпадений) отвечает 404. */
 void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
     resp->status = 404;
     resp->content_type = "application/json";
@@ -160,6 +176,9 @@ void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
 }
 
 /* ── HTTP/1.1 parser ── */
+/* Разбирает сырой буфер в HttpReq: строка запроса, заголовки (ключи в
+ * нижнем регистре), тело. Всё выделяется из арены a. Возвращает -1 при
+ * повреждённом запросе. */
 static int parse_request(Arena *a, char *buf, size_t len, HttpReq *req) {
     char *p = buf, *end = buf + len;
     /* method */
@@ -192,6 +211,8 @@ static int parse_request(Arena *a, char *buf, size_t len, HttpReq *req) {
     return 0;
 }
 
+/* Сериализует и отправляет ответ по plain-сокету (без TLS):
+ * заголовки + тело. MSG_NOSIGNAL подавляет SIGPIPE на разорванном соединении. */
 static void send_response(int fd, HttpResp *resp) {
     char header[640];
     const char *ct = resp->content_type ? resp->content_type : "application/octet-stream";
@@ -230,6 +251,8 @@ static void send_response(int fd, HttpResp *resp) {
 #endif
 }
 
+/* Исходящий POST с JSON-телом через libcurl (например, вебхуки/коллбэки).
+ * Возвращает 0 при HTTP 2xx, иначе -1. */
 int http_post_json(const char *url, const char *body, int timeout_ms) {
     if (!url) return -1;
     CURL *curl = curl_easy_init();
@@ -288,6 +311,8 @@ static void sha1_compress(uint32_t h[5], const uint8_t blk[64]) {
     h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;
 }
 
+/* Полный SHA-1 произвольного сообщения (для Sec-WebSocket-Accept).
+ * Делает padding по RFC 3174 и выдаёт 20-байтовый дайджест. */
 static void sha1(const uint8_t *msg, size_t len, uint8_t out[20]) {
     uint32_t h[5] = {0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0};
     uint8_t blk[64];
@@ -319,6 +344,7 @@ static void sha1(const uint8_t *msg, size_t len, uint8_t out[20]) {
                            out[i*4+2]=(uint8_t)(h[i]>>8);out[i*4+3]=(uint8_t)h[i];}
 }
 
+/* Стандартный base64-энкодер (с '=' padding); out должен вмещать терминатор. */
 static void base64_enc(const uint8_t *in, size_t n, char *out) {
     static const char t[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t i=0,j=0;
@@ -334,6 +360,8 @@ static void base64_enc(const uint8_t *in, size_t n, char *out) {
     out[j]='\0';
 }
 
+/* Отвечает на запрос апгрейда WebSocket: вычисляет Sec-WebSocket-Accept
+ * (SHA-1(key+GUID) → base64) и шлёт 101 Switching Protocols. */
 static void ws_handshake(int fd, TlsConn *tls, const char *key) {
     /* RFC 6455 magic GUID */
     const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -381,6 +409,9 @@ struct HttpServer {
     int      https_port;    /* actual HTTPS port (listenfd) */
 };
 
+/* Обрабатывает одно соединение целиком (блокирующе): опциональный TLS,
+ * чтение запроса до Content-Length, парсинг, мидлвари и отправка ответа.
+ * Для WebSocket-апгрейда fd передаётся в App.ws_clients и не закрывается. */
 static void handle_conn(HttpServer *srv, int fd) {
     enum { MAX_REQ_SIZE = 256 * 1024 * 1024 };
     size_t cap = 131072, used = 0;
@@ -443,6 +474,7 @@ static void handle_conn(HttpServer *srv, int fd) {
                     if (*s == '\n' && strncasecmp(s + 1, "content-length:", 15) == 0)
                         { p = s; break; }
                 }
+                /* заголовок в самой первой строке: p+16 ниже укажет на значение */
                 if (!p && strncasecmp(buf, "content-length:", 15) == 0) p = buf - 1;
                 if (p) cl = (size_t)strtoull(p + 16, NULL, 10);
                 want_total = header_len + cl;
@@ -631,6 +663,8 @@ static void handle_conn(HttpServer *srv, int fd) {
     close(fd);
 }
 
+/* Аллоцирует сервер. При наличии tls_ctx HTTPS слушает на 8443,
+ * а исходный port используется под HTTP→HTTPS редирект. */
 HttpServer *http_server_create(Router *r, int port, int backlog, TlsCtx *tls_ctx) {
     HttpServer *s = calloc(1, sizeof(HttpServer));
     s->router = r; s->port = port; s->backlog = backlog;
@@ -639,6 +673,8 @@ HttpServer *http_server_create(Router *r, int port, int backlog, TlsCtx *tls_ctx
     return s;
 }
 
+/* Открывает слушающие сокеты и крутит цикл accept на kqueue/epoll,
+ * пока s->running. Блокирует вызывающий поток. */
 void http_server_run(HttpServer *s) {
     signal(SIGPIPE, SIG_IGN);
     int yes = 1;
@@ -748,4 +784,5 @@ void http_server_run(HttpServer *s) {
 #endif
 }
 
+/* Просит цикл http_server_run() завершиться (флаг проверяется раз в ~100мс). */
 void http_server_stop(HttpServer *s) { s->running = 0; }

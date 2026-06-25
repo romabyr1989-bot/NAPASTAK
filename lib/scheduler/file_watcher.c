@@ -37,6 +37,8 @@ typedef struct {
     char  dir[256];
 } FwEntry;
 
+/* Состояние watcher'а: дескриптор inotify, таблица активных watch'ей
+ * и фоновый поток, читающий события. */
 struct FileWatcher {
     Scheduler *sched;
     int        inotify_fd;
@@ -48,12 +50,15 @@ struct FileWatcher {
 
 #if FW_LINUX
 
+/* Поиск записи watch'а по дескриптору inotify (ev->wd из события). */
 static FwEntry *find_by_wd(FileWatcher *fw, int wd) {
     for (int i = 0; i < fw->nentries; i++)
         if (fw->entries[i].wd == wd) return &fw->entries[i];
     return NULL;
 }
 
+/* Фоновый поток: блокируется на read() inotify, разбирает поток событий
+ * и для каждого подходящего файла запускает связанный pipeline. */
 static void *watcher_loop(void *arg) {
     FileWatcher *fw = arg;
     /* Buffer big enough for several events; events are variable-length so
@@ -86,6 +91,9 @@ static void *watcher_loop(void *arg) {
     return NULL;
 }
 
+/* Создаёт watcher: собирает file_arrival-триггеры, регистрирует inotify-watch
+ * на их каталоги и запускает фоновый поток. Возвращает NULL, если триггеров
+ * нет или ни один watch зарегистрировать не удалось. */
 FileWatcher *file_watcher_create(Scheduler *s) {
     if (!s) return NULL;
 
@@ -152,6 +160,8 @@ FileWatcher *file_watcher_create(Scheduler *s) {
     return fw;
 }
 
+/* Останавливает поток (закрытие fd прерывает read), дожидается его
+ * завершения и освобождает структуру. */
 void file_watcher_destroy(FileWatcher *fw) {
     if (!fw) return;
     fw->running = 0;
@@ -163,6 +173,8 @@ void file_watcher_destroy(FileWatcher *fw) {
 
 #else /* not Linux */
 
+/* Заглушка для не-Linux платформ: watch не поддерживается, лишь сообщаем
+ * оператору, что настроенные file_arrival-триггеры не сработают. */
 FileWatcher *file_watcher_create(Scheduler *s) {
     /* Walk pipelines once to know whether anything would have used the
      * watcher — log a warning so the operator notices. */

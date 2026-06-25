@@ -1,3 +1,15 @@
+/*
+ * matview.c — хранилище материализованных представлений (витрин/datamart).
+ *
+ * Определения витрин и история их обновлений хранятся в том же SQLite-файле
+ * catalog.db (таблицы matviews и matview_runs). Сам результат витрины
+ * материализуется в одноимённую таблицу через колбэк exec_fn (см. api.c),
+ * поэтому витрина адресуется по имени в любых запросах/пайплайнах.
+ *
+ * Режимы обновления (MvRefreshMode): MANUAL, ON_WRITE (при записи в источник),
+ * SCHEDULE (по интервалу). ON_WRITE и SCHEDULE обрабатываются в mvs_tick.
+ * Доступ к БД сериализуется мьютексом mu; очередь on_write — отдельным pending_mu.
+ */
 #include "matview.h"
 #include "../core/log.h"
 #include "../core/arena.h"
@@ -9,6 +21,7 @@
 #include <pthread.h>
 
 
+/* DDL схемы: определения витрин (matviews) + журнал обновлений (matview_runs). */
 static const char *MV_SCHEMA =
     "CREATE TABLE IF NOT EXISTS matviews ("
     "  name           TEXT PRIMARY KEY,"
@@ -18,8 +31,23 @@ static const char *MV_SCHEMA =
     "  refresh_cron   TEXT DEFAULT '',"
     "  last_refreshed INTEGER DEFAULT 0,"
     "  is_stale       INTEGER DEFAULT 1,"
-    "  row_count      INTEGER DEFAULT 0"
-    ");";
+    "  row_count      INTEGER DEFAULT 0,"
+    "  refresh_duration_ms INTEGER DEFAULT 0,"
+    "  last_error     TEXT DEFAULT ''"
+    ");"
+    /* History of refreshes — one row per refresh (manual, scheduled, on-create),
+     * so the metrics modal can show multiple rows. Removed with the datamart. */
+    "CREATE TABLE IF NOT EXISTS matview_runs ("
+    "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  mv_name     TEXT NOT NULL,"
+    "  started_at  INTEGER,"
+    "  finished_at INTEGER,"
+    "  status      INTEGER,"           /* 0 = ok, 1 = error */
+    "  row_count   INTEGER,"
+    "  duration_ms INTEGER,"
+    "  error_msg   TEXT DEFAULT ''"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_mvruns_name ON matview_runs(mv_name);";
 
 struct MatViewStore {
     sqlite3        *db;
@@ -37,6 +65,7 @@ struct MatViewStore {
     pthread_mutex_t pending_mu;
 };
 
+/* Создать хранилище: открыть catalog.db, применить схему/миграции, инициализировать мьютексы. */
 MatViewStore *mvs_create(Catalog *catalog, const char *data_dir) {
     MatViewStore *s = calloc(1, sizeof(MatViewStore));
     s->catalog = catalog;
@@ -57,12 +86,16 @@ MatViewStore *mvs_create(Catalog *catalog, const char *data_dir) {
         free(s);
         return NULL;
     }
+    /* Migrate older catalog.db that predates these columns (errors = already there). */
+    sqlite3_exec(s->db, "ALTER TABLE matviews ADD COLUMN refresh_duration_ms INTEGER DEFAULT 0;", NULL, NULL, NULL);
+    sqlite3_exec(s->db, "ALTER TABLE matviews ADD COLUMN last_error TEXT DEFAULT '';", NULL, NULL, NULL);
     pthread_mutex_init(&s->mu, NULL);
     pthread_mutex_init(&s->pending_mu, NULL);
     LOG_INFO("matview store initialized");
     return s;
 }
 
+/* Освободить хранилище: разрушить мьютексы, закрыть БД. */
 void mvs_destroy(MatViewStore *s) {
     if (!s) return;
     pthread_mutex_destroy(&s->mu);
@@ -91,6 +124,7 @@ static void parse_source_tables(const char *json, MatView *mv) {
     }
 }
 
+/* Заполнить MatView из текущей строки выборки (порядок колонок = SELECT в mvs_get/mvs_list). */
 static int load_mv(sqlite3_stmt *stmt, MatView *mv) {
     memset(mv, 0, sizeof(*mv));
     const char *name = (const char *)sqlite3_column_text(stmt, 0);
@@ -104,10 +138,17 @@ static int load_mv(sqlite3_stmt *stmt, MatView *mv) {
     mv->last_refreshed_at  = sqlite3_column_int64(stmt, 5);
     mv->is_stale           = sqlite3_column_int(stmt, 6) != 0;
     mv->row_count          = sqlite3_column_int64(stmt, 7);
+    if (sqlite3_column_count(stmt) > 8)
+        mv->refresh_duration_ms = sqlite3_column_int64(stmt, 8);
+    if (sqlite3_column_count(stmt) > 9) {
+        const char *err = (const char *)sqlite3_column_text(stmt, 9);
+        if (err) strncpy(mv->last_error, err, sizeof(mv->last_error)-1);
+    }
     parse_source_tables(srcs, mv);
     return 0;
 }
 
+/* Создать/обновить определение витрины (UPSERT по имени). Помечает её как stale. */
 int mvs_create_view(MatViewStore *s, const MatView *mv) {
     if (!s || !mv || !mv->name[0] || !mv->definition_sql[0]) return -1;
 
@@ -147,6 +188,7 @@ int mvs_create_view(MatViewStore *s, const MatView *mv) {
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Удалить определение витрины и её историю обновлений (data-таблицу удаляет вызывающий). */
 int mvs_drop_view(MatViewStore *s, const char *name) {
     if (!s || !name) return -1;
     pthread_mutex_lock(&s->mu);
@@ -155,23 +197,104 @@ int mvs_drop_view(MatViewStore *s, const char *name) {
     sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    /* Drop the refresh history along with the datamart. */
+    sqlite3_stmt *hd;
+    if (sqlite3_prepare_v2(s->db, "DELETE FROM matview_runs WHERE mv_name=?;", -1, &hd, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(hd, 1, name, -1, SQLITE_STATIC);
+        sqlite3_step(hd);
+        sqlite3_finalize(hd);
+    }
     pthread_mutex_unlock(&s->mu);
 
-    /* Удалить внутреннюю таблицу */
-    char storage_name[160];
-    mvs_storage_name(name, storage_name, sizeof(storage_name));
-    catalog_drop_table(s->catalog, storage_name);
-    LOG_INFO("matview: dropped '%s'", name);
+    /* The data table is dropped by the caller (h_matview_drop) so it can first
+     * check no pipeline / other datamart still uses it. */
+    LOG_INFO("matview: dropped definition '%s'", name);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+static void json_esc(const char *in, char *out, size_t outsz);   /* defined below */
+
+/* Refresh history of one datamart, newest first → JSON array. */
+int mvs_list_refreshes(MatViewStore *s, const char *name, char **json_out, Arena *a) {
+    if (!s || !name) return -1;
+    pthread_mutex_lock(&s->mu);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT id,started_at,finished_at,status,row_count,duration_ms,error_msg "
+            "FROM matview_runs WHERE mv_name=? ORDER BY started_at DESC LIMIT 50;",
+            -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->mu); return -1;
+    }
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    size_t cap = 65536;   /* буфер под JSON в арене (до 50 строк истории) */
+    char *buf = arena_alloc(a, cap);
+    int off = snprintf(buf, cap, "[");
+    int first = 1;
+    char eerr[1040];
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *err = (const char *)sqlite3_column_text(st, 6);
+        json_esc(err ? err : "", eerr, sizeof(eerr));
+        off += snprintf(buf+off, cap-(size_t)off,
+            "%s{\"id\":%lld,\"started\":%lld,\"finished\":%lld,\"status\":%d,"
+            "\"row_count\":%lld,\"duration_ms\":%lld,\"error\":\"%s\"}",
+            first ? "" : ",",
+            (long long)sqlite3_column_int64(st, 0),
+            (long long)sqlite3_column_int64(st, 1),
+            (long long)sqlite3_column_int64(st, 2),
+            sqlite3_column_int(st, 3),
+            (long long)sqlite3_column_int64(st, 4),
+            (long long)sqlite3_column_int64(st, 5),
+            eerr);
+        first = 0;
+    }
+    snprintf(buf+off, cap-(size_t)off, "]");
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->mu);
+    *json_out = buf;
+    return 0;
+}
+
+/* Whole-identifier occurrence of `tbl` in `hay` (so "orders" ≠ "orders_x"). */
+static bool mv_sql_refs(const char *hay, const char *tbl) {
+    if (!hay || !tbl || !tbl[0]) return false;
+    size_t tl = strlen(tbl);
+    for (const char *p = strstr(hay, tbl); p; p = strstr(p + tl, tbl)) {
+        char b = (p == hay) ? ' ' : p[-1];
+        char a = p[tl];
+        #define MV_IDENT_CH(c) (((c)>='A'&&(c)<='Z')||((c)>='a'&&(c)<='z')||((c)>='0'&&(c)<='9')||(c)=='_')
+        if (!MV_IDENT_CH(b) && !MV_IDENT_CH(a)) return true;
+        #undef MV_IDENT_CH
+    }
+    return false;
+}
+
+/* Используется ли `table` в SQL какой-либо витрины (кроме exclude_name)? См. mvs_table_used в .h. */
+bool mvs_table_used(MatViewStore *s, const char *table, const char *exclude_name) {
+    if (!s || !table || !table[0]) return false;
+    bool used = false;
+    pthread_mutex_lock(&s->mu);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(s->db, "SELECT name,definition_sql FROM matviews;", -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *nm  = (const char *)sqlite3_column_text(st, 0);
+            const char *sql = (const char *)sqlite3_column_text(st, 1);
+            if (exclude_name && nm && !strcmp(nm, exclude_name)) continue;
+            if (mv_sql_refs(sql, table)) { used = true; break; }
+        }
+        sqlite3_finalize(st);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return used;
+}
+
+/* Прочитать одну витрину по имени в `out`. Возврат 0 если найдена, иначе -1. */
 int mvs_get(MatViewStore *s, const char *name, MatView *out) {
     if (!s || !name) return -1;
     pthread_mutex_lock(&s->mu);
     sqlite3_stmt *stmt;
     const char *sql =
         "SELECT name,definition_sql,source_tables,refresh_mode,refresh_cron,"
-        "last_refreshed,is_stale,row_count FROM matviews WHERE name=?;";
+        "last_refreshed,is_stale,row_count,refresh_duration_ms,last_error FROM matviews WHERE name=?;";
     if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&s->mu); return -1;
     }
@@ -186,30 +309,60 @@ int mvs_get(MatViewStore *s, const char *name, MatView *out) {
     return found ? 0 : -1;
 }
 
+/* Minimal JSON string escaper (quotes, backslash, newlines, control chars). */
+static void json_esc(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const char *p = in ? in : ""; *p && o + 8 < outsz; p++) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+            case '"':  out[o++]='\\'; out[o++]='"';  break;
+            case '\\': out[o++]='\\'; out[o++]='\\'; break;
+            case '\n': out[o++]='\\'; out[o++]='n';  break;
+            case '\r': out[o++]='\\'; out[o++]='r';  break;
+            case '\t': out[o++]='\\'; out[o++]='t';  break;
+            default:
+                if (c < 0x20) o += (size_t)snprintf(out+o, outsz-o, "\\u%04x", c);
+                else out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Все витрины как JSON-массив (для списка в UI). Буфер выделяется в арене. */
 int mvs_list(MatViewStore *s, char **json_out, Arena *a) {
     if (!s) return -1;
     pthread_mutex_lock(&s->mu);
     const char *sql =
         "SELECT name,definition_sql,source_tables,refresh_mode,refresh_cron,"
-        "last_refreshed,is_stale,row_count FROM matviews ORDER BY name;";
+        "last_refreshed,is_stale,row_count,refresh_duration_ms,last_error FROM matviews ORDER BY name;";
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&s->mu); return -1;
     }
-    char *buf = arena_alloc(a, 65536);
-    int off = snprintf(buf, 65536, "[");
+    size_t cap = 262144;
+    char *buf = arena_alloc(a, cap);
+    int off = snprintf(buf, cap, "[");
     int first = 1;
+    char esql[8200], eerr[1040];
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         MatView mv; load_mv(stmt, &mv);
-        if (!first) off += snprintf(buf+off, 65536-(size_t)off, ",");
-        off += snprintf(buf+off, 65536-(size_t)off,
+        json_esc(mv.definition_sql, esql, sizeof(esql));
+        json_esc(mv.last_error,     eerr, sizeof(eerr));
+        if (!first) off += snprintf(buf+off, cap-(size_t)off, ",");
+        off += snprintf(buf+off, cap-(size_t)off,
             "{\"name\":\"%s\",\"refresh_mode\":%d,\"is_stale\":%s,"
-            "\"last_refreshed_at\":%lld,\"row_count\":%lld}",
+            "\"last_refreshed_at\":%lld,\"row_count\":%lld,"
+            "\"refresh_duration_ms\":%lld,\"refresh_cron\":\"%s\","
+            "\"definition_sql\":\"%s\",\"last_error\":\"%s\",\"source_tables\":[",
             mv.name, (int)mv.refresh_mode, mv.is_stale?"true":"false",
-            (long long)mv.last_refreshed_at, (long long)mv.row_count);
+            (long long)mv.last_refreshed_at, (long long)mv.row_count,
+            (long long)mv.refresh_duration_ms, mv.refresh_cron, esql, eerr);
+        for (int i = 0; i < mv.nsource_tables; i++)
+            off += snprintf(buf+off, cap-(size_t)off, "%s\"%s\"", i?",":"", mv.source_tables[i]);
+        off += snprintf(buf+off, cap-(size_t)off, "]}");
         first = 0;
     }
-    snprintf(buf+off, 65536-(size_t)off, "]");
+    snprintf(buf+off, cap-(size_t)off, "]");
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&s->mu);
     *json_out = buf;
@@ -222,56 +375,75 @@ void mvs_set_exec_fn(MatViewStore *s, MvExecFn fn, void *app) {
     s->exec_app = app;
 }
 
+/* Обновить (материализовать) витрину: выполнить её SQL в data-таблицу, зафиксировать
+ * итог (stale/ошибка/метрики) в matviews и дописать строку в matview_runs. */
 int mvs_refresh(MatViewStore *s, const char *name, void *app) {
+    (void)app;
     if (!s || !name) return -1;
     MatView mv;
     if (mvs_get(s, name, &mv) != 0) return -1;
     if (mv.is_refreshing) return 0;
 
-    /* Помечаем как обновляемую */
-    pthread_mutex_lock(&s->mu);
-    sqlite3_exec(s->db, "UPDATE matviews SET is_stale=1 WHERE name=?;", NULL, NULL, NULL);
-    pthread_mutex_unlock(&s->mu);
-
-    int64_t t0 = (int64_t)time(NULL) * 1000;
-
-    /* Имя хранилища для данных */
+    /* Target table = the view's own name → queryable by name everywhere. */
     char storage_name[160];
     mvs_storage_name(name, storage_name, sizeof(storage_name));
 
-    /* Выполняем через callback (если установлен) */
-    int rc = -1;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int64_t started_at = (int64_t)time(NULL);
+
+    int rows = -1;
+    const char *errmsg = NULL;
     if (s->exec_fn) {
-        char refresh_sql[4224];
-        snprintf(refresh_sql, sizeof(refresh_sql),
-                 "CREATE OR REPLACE TABLE %s AS %s",
-                 storage_name, mv.definition_sql);
-        rc = s->exec_fn(mv.definition_sql, s->data_dir, s->exec_app);
+        /* Materialise: the callback runs the definition and writes the result
+         * into `storage_name`, returning the row count (or -1 on error). */
+        rows = s->exec_fn(mv.definition_sql, storage_name, s->exec_app);
+        if (rows < 0) errmsg = "ошибка выполнения SQL витрины (проверьте запрос и источники)";
     } else {
-        LOG_WARN("matview: exec_fn not set, can't refresh '%s'", name);
-        rc = 0; /* Без callback не можем выполнить — не считаем ошибкой */
+        errmsg = "движок SQL не подключён (mvs_set_exec_fn не вызван)";
     }
 
-    int64_t dur_ms = (int64_t)time(NULL) * 1000 - t0;
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t dur_ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
 
-    /* Обновляем метаданные */
+    /* Persist outcome: success clears stale + error; failure keeps stale + reason. */
     pthread_mutex_lock(&s->mu);
-    const char *upd =
-        "UPDATE matviews SET is_stale=0,last_refreshed=?,row_count=0 WHERE name=?;";
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(s->db, upd, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, 1, (int64_t)time(NULL));
-        sqlite3_bind_text(stmt,  2, name, -1, SQLITE_STATIC);
+    if (sqlite3_prepare_v2(s->db,
+            "UPDATE matviews SET is_stale=?,last_refreshed=?,row_count=?,"
+            "refresh_duration_ms=?,last_error=? WHERE name=?;", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int  (stmt, 1, errmsg ? 1 : 0);
+        sqlite3_bind_int64(stmt, 2, (int64_t)time(NULL));
+        sqlite3_bind_int64(stmt, 3, rows > 0 ? rows : 0);
+        sqlite3_bind_int64(stmt, 4, dur_ms);
+        sqlite3_bind_text (stmt, 5, errmsg ? errmsg : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text (stmt, 6, name, -1, SQLITE_STATIC);
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
     }
+    /* Append a history row — accumulates metrics for the datamart's modal. */
+    sqlite3_stmt *hist;
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO matview_runs(mv_name,started_at,finished_at,status,row_count,duration_ms,error_msg)"
+            " VALUES(?,?,?,?,?,?,?);", -1, &hist, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (hist, 1, name, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(hist, 2, started_at);
+        sqlite3_bind_int64(hist, 3, (int64_t)time(NULL));
+        sqlite3_bind_int  (hist, 4, errmsg ? 1 : 0);
+        sqlite3_bind_int64(hist, 5, rows > 0 ? rows : 0);
+        sqlite3_bind_int64(hist, 6, dur_ms);
+        sqlite3_bind_text (hist, 7, errmsg ? errmsg : "", -1, SQLITE_STATIC);
+        sqlite3_step(hist);
+        sqlite3_finalize(hist);
+    }
     pthread_mutex_unlock(&s->mu);
-    (void)dur_ms;
 
-    LOG_INFO("matview: refreshed '%s' rc=%d dur=%llums", name, rc, (long long)dur_ms);
-    return rc;
+    if (errmsg) { LOG_ERROR("matview: refresh '%s' failed: %s (%lldms)", name, errmsg, (long long)dur_ms); return -1; }
+    LOG_INFO("matview: refreshed '%s' → %d rows (%lldms)", name, rows, (long long)dur_ms);
+    return 0;
 }
 
+/* Запись в table_name произошла: пометить зависящие витрины как stale; те из них,
+ * что в режиме ON_WRITE, поставить в очередь pending для обновления в mvs_tick. */
 void mvs_invalidate(MatViewStore *s, const char *table_name) {
     if (!s || !table_name) return;
 
@@ -309,7 +481,7 @@ void mvs_invalidate(MatViewStore *s, const char *table_name) {
         char mv_get_sql[256];
         snprintf(mv_get_sql, sizeof(mv_get_sql),
             "SELECT name,definition_sql,source_tables,refresh_mode,refresh_cron,"
-            "last_refreshed,is_stale,row_count FROM matviews WHERE name='%s';",
+            "last_refreshed,is_stale,row_count,refresh_duration_ms,last_error FROM matviews WHERE name='%s';",
             to_invalidate[i]);
         sqlite3_stmt *gs;
         if (sqlite3_prepare_v2(s->db, mv_get_sql, -1, &gs, NULL) == SQLITE_OK) {
@@ -341,6 +513,8 @@ void mvs_invalidate(MatViewStore *s, const char *table_name) {
         LOG_INFO("matview: invalidated %d views due to write on '%s'", ninv, table_name);
 }
 
+/* Периодический тик планировщика: обновить накопленную ON_WRITE-очередь и
+ * витрины SCHEDULE, у которых истёк интервал (refresh_cron трактуется как секунды). */
 void mvs_tick(MatViewStore *s, void *app) {
     if (!s) return;
 

@@ -21,6 +21,7 @@ static double   lef64(const uint8_t *p) { double d; memcpy(&d,p,8); return d; }
 /* ── Thrift Compact Protocol ── */
 typedef struct { const uint8_t *d; size_t pos, len; } TBuf;
 
+/* Беззнаковый varint (LEB128) */
 static uint64_t tc_uv(TBuf *b) {
     uint64_t r=0; int sh=0;
     while (b->pos < b->len) {
@@ -31,6 +32,7 @@ static uint64_t tc_uv(TBuf *b) {
     }
     return r;
 }
+/* Знаковый varint (zigzag-декодирование) */
 static int64_t tc_i(TBuf *b) { uint64_t n=tc_uv(b); return (int64_t)((n>>1)^-(n&1)); }
 
 /* Типы полей Compact Protocol */
@@ -49,6 +51,7 @@ static int64_t tc_i(TBuf *b) { uint64_t n=tc_uv(b); return (int64_t)((n>>1)^-(n&
 
 static void tc_skip(TBuf *b, int t);
 
+/* Пропускает элемент типа LIST/SET без сохранения значений */
 static void tc_skip_list(TBuf *b) {
     if (b->pos>=b->len) return;
     uint8_t h=b->d[b->pos++];
@@ -57,6 +60,7 @@ static void tc_skip_list(TBuf *b) {
     for (int i=0;i<cnt&&b->pos<b->len;i++) tc_skip(b,et);
 }
 
+/* Пропускает значение поля произвольного compact-типа t (рекурсивно для struct/map) */
 static void tc_skip(TBuf *b, int t) {
     size_t l;
     switch(t) {
@@ -214,6 +218,7 @@ static int rle_bp_dec(const uint8_t *data, size_t dlen,
 }
 
 /* ── Парсер схемы ── */
+/* Разбирает список SchemaElement в плоский массив raw (включая root и группы) */
 static int pq_parse_schema_list(TBuf *b, PqRawSchema *raw, int maxn) {
     if (b->pos>=b->len) return 0;
     uint8_t h=b->d[b->pos++];
@@ -240,6 +245,7 @@ static int pq_parse_schema_list(TBuf *b, PqRawSchema *raw, int maxn) {
     return n;
 }
 
+/* Выбирает листовые узлы схемы (num_children==0) как реальные колонки */
 static int pq_collect_leaves(PqRawSchema *raw, int nraw, PqColDef *cols, int max) {
     int n=0;
     for (int i=1;i<nraw&&n<max;i++) /* 0 = root */
@@ -272,6 +278,7 @@ static void pq_parse_col_meta(TBuf *b, PqColMeta *cm) {
     }
 }
 
+/* Разбирает ColumnChunk: интересует только вложенный ColumnMetaData (поле 3) */
 static void pq_parse_col_chunk(TBuf *b, PqColMeta *cm) {
     memset(cm,0,sizeof(*cm));
     int last=0,ft;
@@ -285,6 +292,7 @@ static void pq_parse_col_chunk(TBuf *b, PqColMeta *cm) {
     }
 }
 
+/* Разбирает список ColumnChunk внутри row group */
 static int pq_parse_col_list(TBuf *b, PqRowGroup *rg, int maxcols) {
     if (b->pos>=b->len) return 0;
     uint8_t h=b->d[b->pos++];
@@ -297,6 +305,7 @@ static int pq_parse_col_list(TBuf *b, PqRowGroup *rg, int maxcols) {
     return n;
 }
 
+/* Разбирает один RowGroup: список колонок и число строк */
 static void pq_parse_row_group(TBuf *b, PqRowGroup *rg) {
     memset(rg,0,sizeof(*rg));
     int last=0,ft;
@@ -310,6 +319,7 @@ static void pq_parse_row_group(TBuf *b, PqRowGroup *rg) {
     }
 }
 
+/* Разбирает список RowGroup из FileMetaData */
 static int pq_parse_rg_list(TBuf *b, PqRowGroup *rgs, int maxrg) {
     if (b->pos>=b->len) return 0;
     uint8_t h=b->d[b->pos++];
@@ -322,6 +332,7 @@ static int pq_parse_rg_list(TBuf *b, PqRowGroup *rgs, int maxrg) {
     return n;
 }
 
+/* Разбирает FileMetaData (футер): схема + row groups; заполняет f->cols/f->rgs */
 static int pq_parse_footer(const uint8_t *data, size_t len, PqFile *f) {
     TBuf b={data,0,len};
     PqRawSchema raw[PQ_MAX_COLS*2]; int nraw=0;
@@ -373,6 +384,8 @@ typedef struct {
     size_t  hdr_bytes; /* размер самого заголовка */
 } PageHdr;
 
+/* Разбирает PageHeader (общие поля + DataPage/DataPageV2/DictionaryPage);
+ * ph->hdr_bytes = длина заголовка для последующего seek к телу страницы */
 static void pq_parse_page_hdr(TBuf *b, PageHdr *ph) {
     memset(ph,0,sizeof(*ph)); ph->v2_compressed=true;
     int last=0,ft;
@@ -712,6 +725,7 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
 }
 
 /* ── Маппинг Parquet → ColType ── */
+/* Все целочисленные/булевы типы сводятся к COL_INT64, прочее (BYTE_ARRAY и т.п.) — к COL_TEXT */
 static ColType pq_to_col_type(int pq_type) {
     switch(pq_type) {
         case PQ_INT32: case PQ_INT64: case PQ_INT96: case PQ_BOOLEAN: return COL_INT64;
@@ -748,6 +762,7 @@ static void cfg_get(const char *json, const char *key,
 
 /* ── Connector lifecycle ── */
 
+/* create(): раскрывает glob из cfg.path и открывает/парсит футеры всех файлов */
 static void *pq_create(const char *cfg, Arena *a) {
     PqCtx *ctx=arena_calloc(a,sizeof(PqCtx));
     ctx->arena=a;
@@ -774,6 +789,7 @@ static void *pq_create(const char *cfg, Arena *a) {
     return ctx;
 }
 
+/* destroy(): закрывает открытые файловые дескрипторы (память — на арене) */
 static void pq_destroy(void *vctx) {
     PqCtx *ctx=vctx;
     if (!ctx) return;
@@ -781,6 +797,7 @@ static void pq_destroy(void *vctx) {
         if (ctx->files[i].fp) { fclose(ctx->files[i].fp); ctx->files[i].fp=NULL; }
 }
 
+/* ping(): проверяет доступность первого файла на чтение */
 static int pq_ping(void *vctx) {
     PqCtx *ctx=vctx;
     if (!ctx||ctx->npaths==0) return -1;
@@ -789,6 +806,7 @@ static int pq_ping(void *vctx) {
     fclose(f); return 0;
 }
 
+/* list_entities(): каждый файл glob-набора — отдельная "таблица" (имя = basename) */
 static int pq_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     PqCtx *ctx=vctx;
     out->items=arena_calloc(a,(size_t)ctx->npaths*sizeof(DfoEntity));
@@ -801,6 +819,7 @@ static int pq_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     return 0;
 }
 
+/* describe(): возвращает схему по первому файлу (entity игнорируется) */
 static int pq_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     (void)entity;
     PqCtx *ctx=vctx;
@@ -887,6 +906,8 @@ static int pq_read_batch(void *vctx, Arena *a, DfoReadReq *req,
  * Минимальный валидный parquet: одна row-group, по одной DATA_PAGE на колонку,
  * все колонки REQUIRED BYTE_ARRAY(UTF8), PLAIN, UNCOMPRESSED. Значения — строки
  * (числа форматируются, null → пустая строка). Метаданные — thrift compact. */
+/* WBuf — растущий байтовый буфер для сериализации страниц и метаданных.
+ * wb_*: запись; tw_*: примитивы thrift compact (zigzag-varint, field-header) */
 typedef struct { uint8_t *d; size_t len, cap; } WBuf;
 static void wb_init(WBuf *b){ b->cap=4096; b->d=malloc(b->cap); b->len=0; }
 static void wb_ensure(WBuf *b,size_t n){ if(b->len+n>b->cap){ while(b->len+n>b->cap)b->cap*=2; b->d=realloc(b->d,b->cap);} }
@@ -902,6 +923,7 @@ static void wb_le32(WBuf *b,uint32_t v){ uint8_t t[4]={(uint8_t)v,(uint8_t)(v>>8
 #define TW_BIN 8
 #define TW_LIST 9
 #define TW_STRUCT 12
+/* Field-header: дельта-кодирование id поля относительно *last, иначе long form */
 static void tw_field(WBuf *b,int *last,int fid,int ct){
     int d=fid-*last;
     if (d>0&&d<=15) wb_u8(b,(uint8_t)((d<<4)|ct)); else { wb_u8(b,(uint8_t)ct); wb_zz32(b,fid); }
@@ -910,6 +932,7 @@ static void tw_field(WBuf *b,int *last,int fid,int ct){
 static void tw_i32(WBuf *b,int *last,int fid,int32_t v){ tw_field(b,last,fid,TW_I32); wb_zz32(b,v); }
 static void tw_i64(WBuf *b,int *last,int fid,int64_t v){ tw_field(b,last,fid,TW_I64); wb_zz64(b,v); }
 static void tw_str(WBuf *b,int *last,int fid,const char *s){ tw_field(b,last,fid,TW_BIN); size_t n=strlen(s); wb_uv(b,n); wb_raw(b,s,n); }
+/* List-header: число элементов + тип элемента (long form при size>=15) */
 static void tw_lh(WBuf *b,int size,int ect){ if(size<15) wb_u8(b,(uint8_t)((size<<4)|ect)); else { wb_u8(b,(uint8_t)(0xF0|ect)); wb_uv(b,(uint64_t)size);} }
 static void tw_stop(WBuf *b){ wb_u8(b,0); }
 
@@ -922,8 +945,8 @@ static int pq_write_batch(void *vctx, Arena *a, const char *entity,
     if (!f) { LOG_ERROR("parquet sink: cannot open %s", entity); return -1; }
     fwrite("PAR1",1,4,f);
 
-    int64_t *coff=malloc((size_t)ncols*sizeof(int64_t));
-    int64_t *csz =malloc((size_t)ncols*sizeof(int64_t));
+    int64_t *coff=malloc((size_t)ncols*sizeof(int64_t)); /* смещение страницы каждой колонки */
+    int64_t *csz =malloc((size_t)ncols*sizeof(int64_t)); /* размер chunk (hdr+vals) каждой колонки */
     char numbuf[64];
     for (int c=0;c<ncols;c++) {
         coff[c]=(int64_t)ftell(f);

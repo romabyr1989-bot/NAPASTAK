@@ -20,4 +20,5 @@
  */
 char *yaml_expand_vars(Arena *a,
                        const char *src, size_t srclen,
+                       /* keys[i] -> vals[i], всего nkvs пар (параллельные массивы) */
                        const char **keys, const char **vals, int nkvs);

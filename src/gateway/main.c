@@ -1,3 +1,7 @@
+/* gateway/main.c — точка входа DataFlow OS.
+ * Поднимает все подсистемы (catalog, auth, scheduler, matviews, кластер),
+ * HTTP/HTTPS-сервер и опциональный PostgreSQL wire-протокол, обрабатывает
+ * CLI-аргументы, конфиг и graceful-shutdown по сигналам. */
 #include "app.h"
 #include "../../lib/core/log.h"
 #include "../../lib/auth/auth.h"
@@ -19,6 +23,9 @@
 #define MSG_NOSIGNAL 0
 #endif
 
+/* Подставляет значения переменных окружения вида ${VAR} в строке.
+ * Возвращает новую malloc'нутую строку (нужно free); буфер растёт по мере
+ * необходимости. Неизвестные ${VAR} раскрываются в пустую строку. */
 static char *expand_env_vars(const char *input) {
     if (!input) return NULL;
     size_t len = strlen(input);
@@ -69,6 +76,7 @@ static char *expand_env_vars(const char *input) {
 }
 
 
+/* Глобальный экземпляр приложения — нужен обработчику сигналов. */
 App g_app;
 
 /* WebSocket broadcast to all connected clients */
@@ -83,6 +91,7 @@ void app_ws_broadcast(App *app, const char *json_msg) {
     if(len<126) frame[flen++]=(uint8_t)len;
     else{ frame[flen++]=126; frame[flen++]=(uint8_t)(len>>8); frame[flen++]=(uint8_t)len; }
     memcpy(frame+flen,json_msg,len); flen+=(int)len;
+    /* Шлём кадр всем; индексы клиентов с ошибкой записи копим для удаления */
     int dead[256]; int ndead=0;
     for(int i=0;i<app->nws_clients;i++){
         WsClient *wc = &app->ws_clients[i];
@@ -91,6 +100,7 @@ void app_ws_broadcast(App *app, const char *json_msg) {
             : send(wc->fd, frame, (size_t)flen, MSG_NOSIGNAL);
         if(r<0) dead[ndead++]=i;
     }
+    /* Удаляем мёртвых с конца: swap-remove не сдвигает ещё не обработанные */
     for(int i=ndead-1;i>=0;i--){
         int di = dead[i];
         if (di < 0 || di >= app->nws_clients) continue;
@@ -145,10 +155,14 @@ static void normalize_sql(const char *sql, char *out, size_t cap) {
                      out[n-1] == '\t' || out[n-1] == '\n')) out[--n] = '\0';
 }
 
+/* Истина, если s начинается с prefix. */
 static int starts_with(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+/* Обработчик одиночного SQL-запроса по pgwire: сначала перехватываем
+ * совместимостные пробы клиентов и txn-команды как no-op, остальное
+ * отдаём реальному движку через api_pg_execute (см. блок выше). */
 static void pg_query_cb(PgConn *conn, const char *sql, void *ud) {
     (void)ud;
     char norm[1024]; normalize_sql(sql, norm, sizeof(norm));
@@ -231,6 +245,8 @@ static void pg_query_cb(PgConn *conn, const char *sql, void *ud) {
     api_pg_execute(conn, sql);
 }
 
+/* Колбэк планировщика: запуск пайплайна по расписанию/триггеру.
+ * Инкрементит метрику, шлёт WS-событие и выполняет шаги пайплайна. */
 static void on_pipeline_run(Pipeline *p, void *ud) {
     App *app=(App*)ud;
     LOG_INFO("running pipeline %s (%s)", p->name, p->id);
@@ -241,6 +257,26 @@ static void on_pipeline_run(Pipeline *p, void *ud) {
     pipeline_execute_steps(p, app);
 }
 
+/* Datamart auto-refresh ticker — drives scheduled + on-write refresh by calling
+ * mvs_tick() every ~15s. Kept as a tiny dedicated thread to avoid coupling the
+ * generic scheduler to the matview store. */
+#include <pthread.h>
+#include <unistd.h>
+static pthread_t   g_mv_ticker;
+static volatile int g_mv_ticker_run = 0;
+static void *mv_ticker_loop(void *arg) {
+    App *app = (App *)arg;
+    while (g_mv_ticker_run) {
+        for (int i = 0; i < 15 && g_mv_ticker_run; i++) sleep(1);  /* responsive to stop */
+        if (g_mv_ticker_run && app->matviews) mvs_tick(app->matviews, app);
+    }
+    return NULL;
+}
+
+/* Инициализация приложения: дефолты, разбор JSON-конфига, создание всех
+ * подсистем (catalog/auth/scheduler/matviews/RBAC/audit/cluster), загрузка
+ * таблиц и пайплайнов (БД + YAML из pipelines_dir), запуск HTTP-сервера,
+ * matview-тикера, file-watcher и опционального pgwire. */
 void app_init(App *app, const char *config_json) {
     memset(app, 0, sizeof(App));
     strncpy(app->data_dir,    DATA_DIR_DEFAULT,    sizeof(app->data_dir)-1);
@@ -322,6 +358,7 @@ void app_init(App *app, const char *config_json) {
     if (app->tls_cert_path[0] && app->tls_key_path[0]) {
         app->tls_enabled = true;
     }
+    /* db_path всегда выводится из data_dir, перекрывая дефолт/конфиг */
     snprintf(app->db_path,sizeof(app->db_path),"%s/catalog.db",app->data_dir);
 
     /* create data dir */
@@ -517,6 +554,16 @@ void app_init(App *app, const char *config_json) {
     /* start scheduler */
     scheduler_start(app->scheduler);
 
+    /* start datamart auto-refresh ticker.
+     * Big stack (16 MB): the SQL engine (exec_stmt) uses deep/large frames; the
+     * default 512 KB pthread stack overflows it (SIGBUS in __chkstk_darwin). */
+    g_mv_ticker_run = 1;
+    pthread_attr_t mv_attr;
+    pthread_attr_init(&mv_attr);
+    pthread_attr_setstacksize(&mv_attr, 16 * 1024 * 1024);
+    pthread_create(&g_mv_ticker, &mv_attr, mv_ticker_loop, app);
+    pthread_attr_destroy(&mv_attr);
+
     /* Step 4: file_arrival trigger watcher.
      * Returns NULL if no file_arrival triggers exist or platform unsupported. */
     app->file_watcher = file_watcher_create(app->scheduler);
@@ -538,14 +585,18 @@ void app_init(App *app, const char *config_json) {
     }
 }
 
+/* Блокирующий запуск: отдаёт управление циклу HTTP-сервера. */
 void app_run(App *app) {
     LOG_INFO("DataFlow OS ready — http://localhost:%d", app->port);
     http_server_run(app->server);
 }
 
+/* Корректное завершение: останавливает фоновые потоки/сервисы и закрывает
+ * подсистемы в порядке, обратном их зависимостям. */
 void app_stop(App *app) {
     if (app->pgwire) { pgwire_destroy(app->pgwire); app->pgwire = NULL; }
     if (app->file_watcher) { file_watcher_destroy(app->file_watcher); app->file_watcher = NULL; }
+    if (g_mv_ticker_run) { g_mv_ticker_run = 0; pthread_join(g_mv_ticker, NULL); }
     scheduler_stop(app->scheduler);
     http_server_stop(app->server);
     tp_destroy(app->workers);
@@ -560,12 +611,16 @@ void app_stop(App *app) {
 
 static volatile sig_atomic_t g_shutdown = 0;
 
+/* Обработчик SIGINT/SIGTERM: помечает shutdown и будит цикл сервера.
+ * Делает только async-signal-safe операции. */
 static void sig_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
     http_server_stop(g_app.server); /* safe: sets volatile int */
 }
 
+/* Точка входа: разбор CLI (-c конфиг-файл, -p порт, -d data_dir),
+ * установка обработчиков сигналов, init → run → (по сигналу) stop. */
 int main(int argc, char **argv) {
     char *config_json = NULL;
 
@@ -590,6 +645,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Файл конфига приоритетнее; иначе собираем JSON из CLI-флагов */
     if (file_config) {
         config_json = file_config;
     } else if (cli_port > 0 || cli_data_dir[0]) {

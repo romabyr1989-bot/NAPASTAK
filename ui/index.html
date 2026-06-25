@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DataFlow OS</title>
+<title>🐇 NAPASTAK</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,7 +12,7 @@
   <!-- ── Login Screen ── -->
   <div id="login-screen" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); z-index: 1000; justify-content: center; align-items: center; flex-direction: column;">
     <div style="background: var(--card-bg, var(--surface)); padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.12); max-width: 400px; width: 100%;">
-      <h2 style="margin: 0 0 1rem 0; text-align: center;">DataFlow OS</h2>
+      <h2 style="margin: 0 0 1rem 0; text-align: center;">🐇 NAPASTAK</h2>
       <form id="login-form">
         <div style="margin-bottom: 1rem;">
           <label for="login-username" style="display: block; margin-bottom: 0.5rem;">Пользователь</label>
@@ -33,17 +33,16 @@
   <!-- ── Sidebar ── -->
   <aside id="sidebar">
     <div class="logo">
-      <span class="logo-icon">⬡</span>
-      <span class="logo-text">DataFlow OS</span>
+      <span class="logo-icon">🐇</span>
+      <span class="logo-text">NAPASTAK</span>
     </div>
     <nav>
       <a class="nav-item active" data-view="pipelines" href="#pipelines">Конвейеры</a>
       <a class="nav-item nav-builder" data-view="builder" href="#builder" id="nav-builder">Конструктор</a>
+      <a class="nav-item"        data-view="matviews"  href="#matviews">Витрины</a>
       <a class="nav-item"        data-view="analytics" href="#analytics">Аналитика</a>
-      <a class="nav-item"        data-view="matviews"  href="#matviews">Представления</a>
-      <a class="nav-item"        data-view="security"  href="#security">Безопасность</a>
       <a class="nav-item"        data-view="metrics"   href="#metrics">Метрики</a>
-      <a class="nav-item"        data-view="settings"  href="#settings">Настройки</a>
+      <a class="nav-item"        data-view="admin"     href="#admin">Администрирование</a>
     </nav>
     <div class="sidebar-footer">
       <span id="ws-status" class="badge badge-warn">подключение…</span>
@@ -53,6 +52,12 @@
   <!-- ── Main content ── -->
   <main id="main">
 
+    <!-- Tabs shown only under «Администрирование» (groups Security / Metrics / Settings) -->
+    <div id="admin-tabbar" class="ingest-tabs" style="display:none;margin-bottom:1rem">
+      <button class="ingest-tab" data-admintab="settings" onclick="switchView('settings')">Настройки</button>
+      <button class="ingest-tab" data-admintab="security" onclick="switchView('security')">Безопасность</button>
+    </div>
+
     <!-- ═══ Pipelines list + tables ═══ -->
     <section id="view-pipelines" class="view">
       <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
@@ -61,13 +66,6 @@
         <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="loadPipelinesView()" title="Перезагрузить">↻ Обновить</button>
       </h1>
       <div id="pipelines-list"></div>
-
-      <!-- Таблицы данных, доступные конвейерам (раньше — отдельный раздел «Таблицы & SQL») -->
-      <h2 style="margin-top:2rem;display:flex;align-items:center;gap:.75rem">
-        Таблицы данных
-        <span style="font-size:.72rem;color:var(--muted);font-weight:400">источники и результаты конвейеров</span>
-      </h2>
-      <div id="query-table-list"></div>
     </section>
 
     <!-- ═══ Pipeline Builder ═══ -->
@@ -143,20 +141,17 @@
 
     <!-- ═══ Metrics ═══ -->
     <section id="view-metrics" class="view">
-      <h1>Метрики
-        <button class="btn btn-sm" onclick="loadMetrics()">↻ Обновить</button>
-      </h1>
       <div class="stat-grid" id="metrics-detail"></div>
-      <div class="metrics-panels">
-        <div class="card metrics-card" id="metrics-tables-chart">
-          <div class="metrics-card-title">Таблицы по объёму</div>
-          <div id="metrics-bar-list"></div>
-        </div>
-        <div class="card metrics-card" id="metrics-pipelines-summary">
-          <div class="metrics-card-title">Конвейеры</div>
-          <div id="metrics-pipeline-list"></div>
-        </div>
-      </div>
+
+      <h2 style="display:flex;align-items:center;gap:.75rem;margin-top:1.75rem">Конвейеры
+        <span id="metrics-pipelines-sum" style="font-size:.72rem;color:var(--muted);font-weight:400"></span>
+      </h2>
+      <div id="metrics-pipelines-list"></div>
+
+      <h2 style="display:flex;align-items:center;gap:.75rem;margin-top:1.75rem">Витрины данных
+        <span id="metrics-matviews-sum" style="font-size:.72rem;color:var(--muted);font-weight:400"></span>
+      </h2>
+      <div id="metrics-matviews-list"></div>
     </section>
 
     <!-- ═══ Analytics ═══ -->
@@ -164,12 +159,11 @@
 
       <!-- ══ Экран 1: список сохранённых ══ -->
       <div id="an-list-screen">
-        <div class="an-list-topbar">
-          <h1 style="margin:0">Аналитика</h1>
-          <button class="btn btn-primary" onclick="openNewAnalytics()">+ Добавить аналитику</button>
-        </div>
-        <div id="an-saved-list" class="an-saved-grid">
-          <div class="qs-empty">Нет сохранённых результатов</div>
+        <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
+          <button class="btn btn-primary btn-sm" style="min-width:160px;justify-content:center" onclick="openNewAnalytics()">+ Добавить аналитику</button>
+        </h1>
+        <div id="an-saved-list">
+          <div class="empty-state">Нет сохранённых результатов</div>
         </div>
       </div>
 
@@ -384,45 +378,44 @@
 
     <!-- ═══ Materialized Views ═══ -->
     <section id="view-matviews" class="view">
-      <h1>Материализованные представления
-        <button class="btn btn-sm" onclick="loadMatviews()">↻ Обновить</button>
-        <button class="btn btn-primary btn-sm" onclick="openCreateMatview()">+ Создать</button>
+      <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
+        <button class="btn btn-primary btn-sm" style="min-width:136px;justify-content:center" onclick="openCreateMatview()" title="Создать новую витрину данных">+ Витрина</button>
+        <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="refreshAllMatviews()" title="Пересчитать все витрины">⟳ Обновить все</button>
       </h1>
 
-      <div id="matviews-list" class="settings-card"><div class="settings-loading">Загрузка…</div></div>
-
-      <!-- Create form (hidden by default) -->
-      <div id="matview-create-form" class="card" style="display:none;margin-top:1rem">
-        <h2 style="margin:0 0 1rem">Новое представление</h2>
-        <div class="form-group">
-          <label>Название <span class="required">*</span></label>
-          <input id="mv-name" type="text" placeholder="mv_sales_by_region">
+      <!-- Create/edit form — appears above the list -->
+      <div id="matview-create-form" class="builder-settings" style="display:none;margin-bottom:1rem">
+        <h2 id="mv-form-title" style="margin:0;font-size:1.05rem">Новая витрина</h2>
+        <div class="builder-settings-row">
+          <div class="bsr-field" style="flex:1 1 100%;max-width:none">
+            <label>Название <span class="required">*</span></label>
+            <input id="mv-name" type="text" placeholder="mv_sales_by_region">
+          </div>
         </div>
-        <div class="form-group">
-          <label>SQL-запрос <span class="required">*</span></label>
-          <textarea id="mv-sql" rows="4" placeholder="SELECT region, SUM(amount) AS total FROM sales GROUP BY region"></textarea>
+        <div class="builder-settings-row">
+          <div class="bsr-field" style="flex:1 1 100%;max-width:none">
+            <label>SQL-запрос <span class="required">*</span></label>
+            <textarea id="mv-sql" class="mono-textarea" rows="4" style="width:100%;box-sizing:border-box" placeholder="SELECT region, SUM(amount) AS total FROM sales GROUP BY region"></textarea>
+          </div>
         </div>
-        <div class="form-group">
-          <label>Исходные таблицы <span class="label-hint">(через запятую)</span></label>
-          <input id="mv-sources" type="text" placeholder="sales, regions">
+        <div class="builder-settings-row">
+          <div class="bsr-field" style="flex:1 1 100%;max-width:none">
+            <label>Доступные таблицы <span class="label-hint" style="text-transform:none;font-weight:400">клик по таблице — показать колонки и вставить имя</span></label>
+            <div id="mv-tables-hint" style="display:flex;gap:.4rem;flex-wrap:wrap;max-height:110px;overflow:auto"></div>
+            <div id="mv-cols-wrap" style="display:none;margin-top:.55rem">
+              <div style="font-size:.72rem;color:var(--muted);margin-bottom:.3rem">Колонки <strong id="mv-cols-table"></strong> <span style="font-weight:400">— клик вставит имя колонки</span></div>
+              <div id="mv-cols-hint" style="display:flex;gap:.4rem;flex-wrap:wrap;max-height:110px;overflow:auto"></div>
+            </div>
+          </div>
         </div>
-        <div class="form-group">
-          <label>Режим обновления</label>
-          <select id="mv-refresh-mode">
-            <option value="0">Вручную</option>
-            <option value="1">По расписанию</option>
-          </select>
-        </div>
-        <div class="form-group" id="mv-cron-group" style="display:none">
-          <label>Cron расписание</label>
-          <input id="mv-cron" type="text" placeholder="*/30 * * * *">
-        </div>
-        <div style="display:flex;gap:.5rem;margin-top:1rem">
-          <button class="btn btn-primary" onclick="createMatview()">Создать</button>
-          <button class="btn" onclick="closeCreateMatview()">Отмена</button>
+        <div class="builder-settings-row" style="margin-top:.2rem;align-items:center">
+          <button class="btn btn-primary btn-sm" style="min-width:120px;justify-content:center" onclick="createMatview()">Сохранить</button>
+          <button class="btn btn-sm" style="min-width:120px;justify-content:center" onclick="closeCreateMatview()">Отмена</button>
           <span id="mv-status" class="query-stat" style="margin-left:.5rem"></span>
         </div>
       </div>
+
+      <div id="matviews-list"></div>
     </section>
 
     <!-- ═══ Security (RBAC + Audit) ═══ -->
@@ -430,16 +423,17 @@
       <h1>Безопасность</h1>
 
       <div class="ingest-tabs" id="security-tabs" style="margin-bottom:1rem">
-        <button class="ingest-tab active" id="sec-tab-rbac"  onclick="switchSecTab('rbac')">Политики RBAC</button>
-        <button class="ingest-tab"        id="sec-tab-audit" onclick="switchSecTab('audit')">Журнал аудита</button>
+        <button class="ingest-tab active" id="sec-tab-rbac"    onclick="switchSecTab('rbac')">Политики RBAC</button>
+        <button class="ingest-tab"        id="sec-tab-audit"   onclick="switchSecTab('audit')">Журнал аудита</button>
+        <button class="ingest-tab"        id="sec-tab-apikeys" onclick="switchSecTab('apikeys')">API-ключи</button>
       </div>
 
       <!-- RBAC pane -->
       <div id="sec-pane-rbac">
-        <div class="card" style="margin-bottom:1rem">
-          <h2 style="margin:0 0 1rem">Добавить политику</h2>
-          <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:flex-end">
-            <div class="form-group" style="flex:1;min-width:120px">
+        <div class="builder-settings" style="margin-bottom:1rem">
+          <h2 style="margin:0;font-size:1.05rem">Добавить политику</h2>
+          <div class="builder-settings-row" style="align-items:flex-end">
+            <div class="bsr-field" style="flex:1 1 130px">
               <label>Роль</label>
               <select id="rbac-new-role">
                 <option value="2">Viewer</option>
@@ -447,11 +441,11 @@
                 <option value="0">Admin</option>
               </select>
             </div>
-            <div class="form-group" style="flex:2;min-width:150px">
+            <div class="bsr-field" style="flex:2 1 180px;max-width:none">
               <label>Шаблон таблицы</label>
               <input id="rbac-new-pattern" type="text" placeholder="sales* или *">
             </div>
-            <div class="form-group" style="flex:1;min-width:120px">
+            <div class="bsr-field" style="flex:1 1 170px">
               <label>Права</label>
               <select id="rbac-new-actions">
                 <option value="1">Чтение (SELECT)</option>
@@ -459,12 +453,15 @@
                 <option value="3">Чтение + Запись</option>
               </select>
             </div>
-            <div class="form-group" style="flex:2;min-width:150px">
-              <label>Фильтр строк <span class="label-hint">(glob, необязательно)</span></label>
+            <div class="bsr-field" style="flex:2 1 180px;max-width:none">
+              <label>Фильтр строк <span class="label-hint" style="text-transform:none;font-weight:400">glob, необязательно</span></label>
               <input id="rbac-new-rowfilter" type="text" placeholder="region_west*">
             </div>
-            <button class="btn btn-primary" onclick="addRbacPolicy()">+ Добавить</button>
-            <span id="rbac-status" class="query-stat"></span>
+            <div class="bsr-field" style="flex:0 0 auto;min-width:140px;max-width:140px">
+              <label>&nbsp;</label>
+              <button class="btn btn-primary btn-sm" style="justify-content:center" onclick="addRbacPolicy()">+ Добавить</button>
+            </div>
+            <span id="rbac-status" class="query-stat" style="align-self:center"></span>
           </div>
         </div>
         <div id="rbac-policies-list" class="settings-card"><div class="settings-loading">Загрузка…</div></div>
@@ -472,21 +469,77 @@
 
       <!-- Audit pane -->
       <div id="sec-pane-audit" style="display:none">
-        <div class="card" style="margin-bottom:1rem">
-          <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:flex-end">
-            <div class="form-group" style="flex:1;min-width:140px">
-              <label>Пользователь</label>
-              <input id="audit-filter-user" type="text" placeholder="admin">
-            </div>
-            <div class="form-group" style="flex:0.7;min-width:90px">
-              <label>Лимит</label>
-              <input id="audit-filter-limit" type="number" value="50" min="1" max="500">
-            </div>
-            <button class="btn btn-primary" onclick="loadAuditLog()">Поиск</button>
-            <span id="audit-status" class="query-stat"></span>
+        <div class="builder-settings" style="margin-bottom:1rem;display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.6rem .9rem;align-items:end">
+          <div class="bsr-field" style="flex:0 0 auto;max-width:none">
+            <label>Действие</label>
+            <select id="audit-filter-action" onchange="auditFilterChanged()">
+              <option value="">Все</option>
+              <option value="1">SQL-запрос</option>
+              <option value="2">Загрузка данных</option>
+              <option value="3">Запуск конвейера</option>
+              <option value="4">Вход в систему</option>
+              <option value="5">Неудачный вход</option>
+              <option value="6">Изменение схемы</option>
+              <option value="7">Изменение прав доступа</option>
+            </select>
           </div>
+          <div class="bsr-field" style="flex:0 0 auto;max-width:none">
+            <label>Пользователь</label>
+            <input id="audit-filter-user" type="text" placeholder="любой" oninput="auditFilterChanged()">
+          </div>
+          <div class="bsr-field" style="flex:0 0 auto;max-width:none">
+            <label>Роль</label>
+            <select id="audit-filter-role" onchange="auditFilterChanged()">
+              <option value="">Все</option>
+              <option value="0">Admin</option>
+              <option value="1">Analyst</option>
+              <option value="2">Viewer</option>
+            </select>
+          </div>
+          <div class="bsr-field" style="flex:0 0 auto;max-width:none">
+            <label>IP</label>
+            <input id="audit-filter-ip" type="text" placeholder="любой" oninput="auditFilterChanged()">
+          </div>
+          <div class="bsr-field" style="flex:0 0 auto;max-width:none">
+            <label>Ресурс</label>
+            <input id="audit-filter-resource" type="text" placeholder="любой" oninput="auditFilterChanged()">
+          </div>
+          <div class="bsr-field" style="flex:0 0 auto;max-width:none">
+            <label>Код</label>
+            <select id="audit-filter-code" onchange="auditFilterChanged()">
+              <option value="">Все</option>
+              <option value="ok">Успех</option>
+              <option value="err">Ошибка</option>
+            </select>
+          </div>
+          <span id="audit-status" class="query-stat" style="grid-column:1/-1"></span>
         </div>
         <div id="audit-log-list" class="settings-card"><div class="settings-loading">Загрузка…</div></div>
+      </div>
+
+      <!-- API keys pane -->
+      <div id="sec-pane-apikeys" style="display:none">
+        <div class="builder-settings" style="margin-bottom:1rem">
+          <div class="builder-settings-row" style="align-items:flex-end">
+            <div class="bsr-field" style="flex:2 1 220px;max-width:none">
+              <label>Пользователь</label>
+              <input id="new-apikey-user" type="text" placeholder="user_id (например: svc-bot)">
+            </div>
+            <div class="bsr-field" style="flex:1 1 150px">
+              <label>Роль</label>
+              <select id="new-apikey-role">
+                <option value="viewer">viewer</option>
+                <option value="analyst" selected>analyst</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <div class="bsr-field" style="flex:0 0 auto;min-width:160px;max-width:160px">
+              <label>&nbsp;</label>
+              <button class="btn btn-primary btn-sm" style="justify-content:center" onclick="createApiKey()">+ Создать ключ</button>
+            </div>
+          </div>
+        </div>
+        <div id="settings-apikeys-list"><div class="settings-loading">Загрузка…</div></div>
       </div>
     </section>
 
@@ -494,111 +547,53 @@
     <section id="view-settings" class="view">
       <h1>Настройки</h1>
 
-      <h2>Сервер</h2>
-      <div class="stat-grid" id="server-info-grid">
-        <div class="settings-loading">Загрузка…</div>
-      </div>
-
-      <h2 style="margin-top:1.75rem">Отображение</h2>
-      <div class="settings-card">
-        <div class="settings-row">
-          <div class="settings-row-label">
-            <div class="settings-row-title">Лимит строк</div>
-            <div class="settings-row-desc">Макс. строк при клике на таблицу в разделе Запрос</div>
+      <h2>Отображение</h2>
+      <div class="builder-settings">
+        <div class="builder-settings-row" style="align-items:flex-end;flex-wrap:wrap">
+          <div class="bsr-field" style="flex:1 1 220px;max-width:320px">
+            <label>Лимит строк <span class="label-hint" style="text-transform:none;font-weight:400">макс. при клике на таблицу</span></label>
+            <select id="pref-row-limit" onchange="savePref('rowLimit',+this.value)">
+              <option value="50">50 строк</option>
+              <option value="100">100 строк</option>
+              <option value="250">250 строк</option>
+              <option value="500">500 строк</option>
+              <option value="1000">1000 строк</option>
+            </select>
           </div>
-          <select id="pref-row-limit" onchange="savePref('rowLimit',+this.value)">
-            <option value="50">50 строк</option>
-            <option value="100">100 строк</option>
-            <option value="250">250 строк</option>
-            <option value="500">500 строк</option>
-            <option value="1000">1000 строк</option>
-          </select>
-        </div>
-
-        <div class="settings-row">
-          <div class="settings-row-label">
-            <div class="settings-row-title">Компактный режим</div>
-            <div class="settings-row-desc">Уменьшенный интервал строк в таблицах результатов</div>
+          <div class="bsr-field bsr-toggle" style="flex:0 0 auto">
+            <label>Компактный режим</label>
+            <label class="toggle">
+              <input id="pref-compact" type="checkbox"
+                     onchange="savePref('compact',this.checked);applyPrefs()">
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
           </div>
-          <label class="toggle">
-            <input id="pref-compact" type="checkbox"
-                   onchange="savePref('compact',this.checked);applyPrefs()">
-            <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          </label>
-        </div>
-
-        <div class="settings-row">
-          <div class="settings-row-label">
-            <div class="settings-row-title">Автообновление метрик</div>
-            <div class="settings-row-desc">Периодически обновлять вкладку Метрики</div>
-          </div>
-          <div style="display:flex;align-items:center;gap:.75rem">
+          <div class="bsr-field bsr-toggle" style="flex:0 0 auto">
+            <label>Автообновление метрик</label>
             <label class="toggle">
               <input id="pref-auto-refresh" type="checkbox"
                      onchange="savePref('autoRefresh',this.checked);restartMetricsTimer()">
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
+          </div>
+          <div class="bsr-field" style="flex:0 0 120px">
+            <label>Интервал, сек</label>
             <input id="pref-refresh-interval" type="number" min="5" max="600" value="30"
-                   style="width:64px"
                    oninput="savePref('refreshInterval',+this.value);restartMetricsTimer()">
-            <span class="settings-unit">сек</span>
           </div>
         </div>
       </div>
 
-      <h2 style="margin-top:1.75rem">Управление таблицами
-        <button class="btn btn-sm" style="margin-left:.75rem" onclick="loadSettings()">↻</button>
-      </h2>
-      <div class="settings-card" id="settings-tables-list">
-        <div class="settings-loading">Загрузка…</div>
-      </div>
-
-      <h2 style="margin-top:1.75rem">API-ключи
-        <button class="btn btn-sm" style="margin-left:.75rem" onclick="loadApiKeys()">↻</button>
-      </h2>
-      <div class="settings-card" id="settings-apikeys-list">
-        <div class="settings-loading">Загрузка…</div>
-      </div>
-      <div style="margin-top:.75rem;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
-        <input id="new-apikey-user" type="text" placeholder="user_id (например: svc-bot)"
-               style="flex:1;min-width:140px;padding:.4rem .6rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:.85rem">
-        <select id="new-apikey-role"
-                style="padding:.4rem .6rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:.85rem">
-          <option value="viewer">viewer</option>
-          <option value="analyst" selected>analyst</option>
-          <option value="admin">admin</option>
-        </select>
-        <button class="btn btn-primary btn-sm" onclick="createApiKey()">+ Создать ключ</button>
-      </div>
-
-      <h2 style="margin-top:1.75rem">Кластер
-        <button class="btn btn-sm" style="margin-left:.75rem" onclick="loadClusterStatus()">↻</button>
-      </h2>
-      <div class="settings-card" id="settings-cluster-status">
-        <div class="settings-loading">Загрузка…</div>
-      </div>
-
-      <h2 style="margin-top:1.75rem">Внешние подключения
-        <span style="font-size:.7rem;color:var(--muted);font-weight:normal;margin-left:.6rem">
-          DataFlow OS говорит на 4 протоколах одновременно
-        </span>
-      </h2>
-      <div class="settings-card" id="settings-connections">
-        <div class="settings-loading">Загрузка…</div>
-      </div>
     </section>
 
   </main>
 </div>
 
 <!-- Run history modal -->
-<div id="runs-modal" class="modal hidden">
+<div id="runs-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
   <div class="modal-box">
     <h2 id="runs-modal-title">История запусков</h2>
     <div id="runs-modal-body"></div>
-    <div class="modal-actions">
-      <button class="btn" onclick="document.getElementById('runs-modal').classList.add('hidden')">Закрыть</button>
-    </div>
   </div>
 </div>
 
@@ -633,19 +628,16 @@
 </div>
 
 <!-- Table preview modal (replaces the old Query view inline SQL editor) -->
-<div id="table-preview-modal" class="modal hidden">
+<div id="table-preview-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
   <div class="modal-box" style="max-width:1000px;width:92%">
     <h2 id="table-preview-title">Просмотр таблицы</h2>
     <div id="table-preview-status" style="font-size:.78rem;color:var(--muted);margin:.25rem 0 .5rem"></div>
     <div id="table-preview-body" style="max-height:60vh;overflow:auto"></div>
-    <div class="modal-actions">
-      <button class="btn" onclick="document.getElementById('table-preview-modal').classList.add('hidden')">Закрыть</button>
-    </div>
   </div>
 </div>
 
 <!-- YAML import modal (Step 5: GitOps) -->
-<div id="yaml-modal" class="modal hidden">
+<div id="yaml-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
   <div class="modal-box" style="max-width:760px;width:90%">
     <h2>Импорт YAML-конвейера</h2>
     <p style="font-size:.8rem;color:var(--muted);margin:.25rem 0 .75rem">
@@ -660,8 +652,6 @@
       <button class="btn" onclick="previewYaml()">Проверить</button>
       <button class="btn btn-primary" id="yaml-apply-btn" onclick="applyYaml()" disabled>Применить</button>
       <span id="yaml-status" style="font-size:.8rem;color:var(--muted);margin-left:.5rem;align-self:center"></span>
-      <button class="btn" style="margin-left:auto"
-              onclick="document.getElementById('yaml-modal').classList.add('hidden')">Закрыть</button>
     </div>
     <pre id="yaml-preview-out" style="display:none;background:var(--surface2);padding:.5rem;border-radius:4px;font-size:.75rem;max-height:240px;overflow:auto;margin-top:.6rem"></pre>
   </div>
@@ -670,7 +660,7 @@
 <div id="toast-container"></div>
 <script src="app.js"></script>
 
-<div id="save-result-modal" class="modal-overlay" style="display:none">
+<div id="save-result-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeSaveModal()">
   <div class="modal-box">
     <h3>Сохранить результат</h3>
     <div class="form-group">
@@ -684,7 +674,7 @@
   </div>
 </div>
 <!-- Index manager modal -->
-<div id="index-modal" class="modal hidden">
+<div id="index-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
   <div class="modal-box">
     <h2 id="index-modal-title">Индексы</h2>
     <input type="hidden" id="index-modal-table">
@@ -699,9 +689,6 @@
         <button class="btn btn-primary" onclick="createIndex()">Создать</button>
       </div>
       <div id="index-modal-status" style="margin-top:.4rem;font-size:.8rem"></div>
-    </div>
-    <div class="modal-actions">
-      <button class="btn" onclick="document.getElementById('index-modal').classList.add('hidden')">Закрыть</button>
     </div>
   </div>
   </div>

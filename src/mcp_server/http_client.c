@@ -7,11 +7,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Растущий буфер ответа, размещаемый в арене (a). */
 typedef struct { char *buf; size_t len, cap; Arena *a; } Buf;
 
+/* libcurl-колбэк записи: дописывает очередную порцию тела в Buf,
+ * при необходимости удваивая ёмкость, и держит строку null-terminated. */
 static size_t write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
     Buf *b = ud;
     size_t add = sz * nm;
+    /* +1 — место под завершающий '\0' */
     if (b->len + add + 1 > b->cap) {
         size_t new_cap = b->cap ? b->cap * 2 : 4096;
         while (new_cap < b->len + add + 1) new_cap *= 2;
@@ -26,6 +30,9 @@ static size_t write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
     return add;
 }
 
+/* Выполняет один HTTP-запрос через libcurl: ставит Bearer-токен и
+ * Content-Type (если заданы), буферизует тело ответа в арену и заполняет
+ * out (status/body/err). Возвращает 0 при успехе, -1 при ошибке curl. */
 static int do_request(const char *method, const char *url,
                       const char *bearer, const char *body,
                       const char *content_type,
@@ -56,7 +63,7 @@ static int do_request(const char *method, const char *url,
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &body_buf);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L); /* безопасно в многопоточной среде */
     if (body) {
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
@@ -75,6 +82,7 @@ static int do_request(const char *method, const char *url,
     }
 
     out->status   = (int)status;
+    /* пустой ответ → отдаём неизменяемую "" вместо NULL */
     out->body     = body_buf.buf ? body_buf.buf : (char *)"";
     out->body_len = body_buf.len;
     out->err[0]   = '\0';
@@ -84,6 +92,7 @@ static int do_request(const char *method, const char *url,
     return 0;
 }
 
+/* Склеивает base+path в новую строку в арене (без нормализации слэшей). */
 static char *build_url(const char *base, const char *path, Arena *a) {
     size_t b = strlen(base), p = strlen(path);
     char *u = arena_alloc(a, b + p + 1);
@@ -92,11 +101,13 @@ static char *build_url(const char *base, const char *path, Arena *a) {
     return u;
 }
 
+/* GET по url_base+path. */
 int mcp_http_get(const char *url_base, const char *path,
                  const char *bearer, McpHttpResp *out, Arena *a) {
     return do_request("GET", build_url(url_base, path, a), bearer, NULL, NULL, out, a);
 }
 
+/* POST с телом body; по умолчанию Content-Type application/json. */
 int mcp_http_post(const char *url_base, const char *path,
                   const char *bearer, const char *body,
                   const char *content_type, McpHttpResp *out, Arena *a) {
@@ -105,6 +116,7 @@ int mcp_http_post(const char *url_base, const char *path,
                       out, a);
 }
 
+/* DELETE по url_base+path. */
 int mcp_http_delete(const char *url_base, const char *path,
                     const char *bearer, McpHttpResp *out, Arena *a) {
     return do_request("DELETE", build_url(url_base, path, a), bearer,

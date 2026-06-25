@@ -42,9 +42,12 @@
 #define PG_OID_VARCHAR   1043
 #define PG_OID_TIMESTAMP 1114
 
+/* Непрозрачные дескрипторы: соединение и сам сервер.
+ * Внутреннее устройство скрыто от вызывающего кода. */
 typedef struct PgConn       PgConn;
 typedef struct PgWireServer PgWireServer;
 
+/* Описание одной колонки результата (для RowDescription). */
 typedef struct {
     const char *name;
     int32_t     type_oid;
@@ -67,6 +70,8 @@ typedef struct {
      * pgwire_user(conn) / pgwire_database(conn). */
     void (*query)(PgConn *conn, const char *sql, void *ud);
 } PgWireCallbacks;
+/* Колбэки реализации SQL: связывают wire-протокол с исполнением запросов;
+ * `ud` — пользовательский контекст, переданный в pgwire_create. */
 
 /* ── Server lifecycle ───────────────────────────────────────────── */
 PgWireServer *pgwire_create(int port, PgWireCallbacks cbs, void *ud);

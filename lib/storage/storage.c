@@ -1,3 +1,14 @@
+/*
+ * storage.c — слой хранения DataFlow OS.
+ *
+ * Содержит три подсистемы:
+ *   1. WAL — append-only журнал записи (вставки строк, тумбстоны DELETE/UPDATE),
+ *      с опциональной репликацией через callback.
+ *   2. Table — таблица поверх WAL: запись батчей (CSV или сжатый формат),
+ *      B-tree индексы по INT64-столбцам, компакция (применение тумбстонов).
+ *   3. Catalog — метаданные в SQLite: таблицы, пайплайны, запуски,
+ *      сохранённые результаты и реестр индексов.
+ */
 #include "storage.h"
 #include "compress.h"
 #include "../core/log.h"
@@ -31,6 +42,7 @@ struct WAL {
     uint64_t         next_lsn;
 };
 
+/* Открыть/создать WAL-файл для дозаписи; write_pos выставляется по размеру файла. */
 WAL *wal_open(const char *path) {
     WAL *w = calloc(1, sizeof(WAL));
     strncpy(w->path, path, sizeof(w->path)-1);
@@ -41,6 +53,8 @@ WAL *wal_open(const char *path) {
     return w;
 }
 
+/* Дозаписать запись формата [uint32_t len][data]; при наличии репликации
+   передать её копию callback'у с инкрементом LSN. */
 int wal_append(WAL *w, const void *data, size_t len) {
     uint32_t l = (uint32_t)len;
     if (write(w->fd, &l, 4) != 4) return -1;
@@ -55,6 +69,7 @@ int64_t wal_tell(WAL *w) { return w ? w->write_pos : 0; }
 int     wal_sync(WAL *w) { return fdatasync(w->fd); }
 void    wal_close(WAL *w){ close(w->fd); free(w); }
 
+/* Тумбстон удаления: [op=DELETE][8 байт offset исходной записи, big-endian]. */
 int wal_append_delete(WAL *w, int64_t orig_offset) {
     uint8_t buf[9];
     buf[0] = WAL_OP_DELETE;
@@ -62,6 +77,8 @@ int wal_append_delete(WAL *w, int64_t orig_offset) {
     return wal_append(w, buf, 9);
 }
 
+/* Тумбстон обновления: [op=UPDATE][8 байт offset][новая CSV-строка].
+   При компакции исходная запись заменяется на new_csv. */
 int wal_append_update(WAL *w, int64_t orig_offset, const char *new_csv, size_t csv_len) {
     size_t total = 9 + csv_len;
     uint8_t *buf = malloc(total);
@@ -75,6 +92,7 @@ int wal_append_update(WAL *w, int64_t orig_offset, const char *new_csv, size_t c
 }
 
 /* ── ColBatch helpers ── */
+/* Чтение/установка i-го бита в упакованном битмапе (для null-масок столбцов). */
 static bool bit_get(const uint8_t *bm, int i) {
     return !!(bm[i/8] & (1u << (i%8)));
 }
@@ -114,6 +132,7 @@ static void table_load_indexes(Table *t) {
     closedir(d);
 }
 
+/* Сохранить схему таблицы в dir/schema.json (отладочная копия рядом с WAL). */
 static void table_write_schema_file(const char *dir, Schema *sc) {
     if (!sc) return;
     char path[600]; snprintf(path, sizeof(path), "%s/schema.json", dir);
@@ -131,6 +150,7 @@ static void table_write_schema_file(const char *dir, Schema *sc) {
     fclose(f);
 }
 
+/* Создать новую таблицу: каталог dir/name, файл схемы и пустой WAL. */
 Table *table_create(const char *name, Schema *schema, const char *dir) {
     Table *t = calloc(1, sizeof(Table));
     strncpy(t->name, name, sizeof(t->name)-1);
@@ -145,6 +165,7 @@ Table *table_create(const char *name, Schema *schema, const char *dir) {
     return t;
 }
 
+/* Открыть существующую таблицу: переоткрыть WAL и загрузить B-tree индексы. */
 Table *table_open(const char *name, const char *dir) {
     Table *t = calloc(1, sizeof(Table));
     strncpy(t->name, name, sizeof(t->name)-1);
@@ -156,6 +177,7 @@ Table *table_open(const char *name, const char *dir) {
     return t;
 }
 
+/* Подключить callback репликации к WAL таблицы. */
 void table_set_wal_callback(Table *t, WalWriteCallback cb, void *userdata) {
     if (!t || !t->wal) return;
     t->wal->repl_cb = cb;
@@ -289,6 +311,10 @@ int table_update(Table *t, int64_t orig_offset, const char *new_csv, size_t csv_
     return wal_append_update(t->wal, orig_offset, new_csv, csv_len);
 }
 
+/* Компакция WAL: за два прохода применить тумбстоны.
+   Pass 1 — собрать удалённые offset'ы и UPDATE-замены; Pass 2 — переписать
+   живые INSERT'ы (для обновлённых строк подставить новый CSV) в новый файл,
+   затем атомарно заменить wal.bin и переоткрыть журнал. */
 int table_compact(Table *t, Arena *a) {
     if (!t) return -1;
     (void)a;
@@ -401,6 +427,7 @@ void table_close(Table *t) {
     free(t);
 }
 
+/* Вернуть открытый B-tree индекс по столбцу col_idx, либо NULL если его нет. */
 BTree *table_get_index(Table *t, int col_idx) {
     if (!t) return NULL;
     for (int i = 0; i < t->nindexes; i++)
@@ -408,6 +435,9 @@ BTree *table_get_index(Table *t, int col_idx) {
     return NULL;
 }
 
+/* Построить B-tree индекс по INT64-столбцу: сбросить старый при наличии,
+   просканировать WAL и заполнить дерево (ключ → offset записи), затем
+   зарегистрировать в каталоге. */
 int table_create_index(Table *t, int col_idx, Catalog *c) {
     if (!t || col_idx < 0) return -1;
     /* Only COL_INT64 supported */
@@ -508,6 +538,8 @@ static const char *CATALOG_SCHEMA =
     "  created_at INTEGER);"
     "CREATE INDEX IF NOT EXISTS idx_saved_results_created ON saved_results(created_at DESC);";
 
+/* Открыть SQLite-каталог: режим WAL, применить базовую схему и миграции
+   (добавление новых столбцов в существующие таблицы — ошибки игнорируются). */
 Catalog *catalog_open(const char *path) {
     Catalog *c = calloc(1, sizeof(Catalog));
     if (sqlite3_open(path, &c->db) != SQLITE_OK) {
@@ -621,6 +653,7 @@ int catalog_update_table_meta(Catalog *c, const char *name, const char *source, 
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Список таблиц с метаданными для UI (имя, источник, число строк, столбцы). */
 int catalog_list_tables_full(Catalog *c, char **json_out, Arena *a) {
     /* Returns JSON array: [{name, source, row_count, columns:[{name,type}]}] */
     JBuf jb; jb_init(&jb, a, 4096);
@@ -702,6 +735,12 @@ int catalog_delete_pipeline(Catalog *c, const char *id) {
     sqlite3_prepare_v2(c->db,"DELETE FROM pipelines WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
+    /* Drop the run history together with the pipeline. */
+    sqlite3_stmt *rd;
+    if(sqlite3_prepare_v2(c->db,"DELETE FROM pipeline_runs WHERE pipeline_id=?",-1,&rd,NULL)==SQLITE_OK){
+        sqlite3_bind_text(rd,1,id,-1,SQLITE_STATIC);
+        sqlite3_step(rd); sqlite3_finalize(rd);
+    }
     return rc==SQLITE_DONE?0:-1;
 }
 
@@ -740,6 +779,7 @@ int catalog_list_runs(Catalog *c, const char *pid, char **out, Arena *a) {
     *out=(char*)jb_done(&jb); return 0;
 }
 
+/* Сохранить результат запроса (колонки и строки как JSON); вернуть rowid в out_id. */
 int catalog_save_result(Catalog *c, const char *name, const char *sql_text,
                         const char *columns_json, const char *rows_json,
                         int row_count, int64_t *out_id) {
@@ -759,6 +799,7 @@ int catalog_save_result(Catalog *c, const char *name, const char *sql_text,
     return 0;
 }
 
+/* Список сохранённых результатов без тела строк (rows_json) — превью для UI. */
 int catalog_list_results(Catalog *c, char **out, Arena *a) {
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
@@ -780,6 +821,7 @@ int catalog_list_results(Catalog *c, char **out, Arena *a) {
     *out=(char*)jb_done(&jb); return 0;
 }
 
+/* Получить один сохранённый результат целиком, включая rows_json. */
 int catalog_get_result(Catalog *c, int64_t id, char **out, Arena *a) {
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
@@ -869,6 +911,7 @@ int catalog_drop_indexes(Catalog *c, const char *table) {
     return rc==SQLITE_DONE?0:-1;
 }
 
+/* Проверить наличие индекса по столбцу; при наличии вернуть col_idx через out. */
 int catalog_has_index(Catalog *c, const char *table, const char *col,
                       int *col_idx_out) {
     catalog_ensure_index_table(c);

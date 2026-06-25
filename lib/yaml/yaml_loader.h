@@ -29,10 +29,11 @@
 #include "../core/arena.h"
 #include <stddef.h>
 
+/* Описание ошибки разбора: текст причины и позиция (1-based) в исходнике. */
 typedef struct {
-    char buf[256];
-    int  line;
-    int  col;
+    char buf[256];  /* человекочитаемое сообщение об ошибке */
+    int  line;      /* номер строки, где обнаружена ошибка */
+    int  col;       /* номер колонки в строке */
 } YamlError;
 
 /* On success: *json_out is set (NUL-terminated, in arena `a`) and 0 returned.

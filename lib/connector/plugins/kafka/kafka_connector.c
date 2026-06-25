@@ -67,6 +67,9 @@ static void kafka_curl_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT)
 
 /* ── JSON config parser helpers ── */
 
+/* Извлекает строковое значение по ключу "key" из плоского JSON-конфига в dst.
+ * Наивный парсер (strstr/strchr), достаточный для одноуровневого config_json;
+ * при отсутствии ключа dst не трогается (остаётся значение по умолчанию). */
 static void cfg_str(const char *cfg, const char *key, char *dst, size_t dstsz)
 {
     const char *p = strstr(cfg, key);
@@ -101,6 +104,8 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
         rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
 }
 
+/* Создаёт consumer rd_kafka: задаёт брокеры, group.id, auto.offset.reset и
+ * применяет security-настройки. Возвращает NULL при ошибке конфигурации. */
 static rd_kafka_t *make_consumer(const KafkaCtx *ctx, char *errstr, size_t errlen)
 {
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
@@ -243,8 +248,11 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
 
 /* ── Avro: Confluent Schema Registry client ── */
 
+/* Растущий буфер для накопления HTTP-ответа Schema Registry. */
 struct curl_buf { char *data; size_t len, cap; };
 
+/* libcurl write-callback: дописывает полученный кусок в curl_buf, при нехватке
+ * места реаллоцирует; возврат 0 сигнализирует curl об ошибке (OOM). */
 static size_t sr_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
 {
     struct curl_buf *buf = (struct curl_buf *)userdata;
@@ -408,6 +416,9 @@ static ColBatch *batch_from_avro(KafkaCtx *ctx, Arena *a,
 
 /* ── CDC consumer thread ── */
 
+/* Фоновый поток CDC: опрашивает топик, оборачивает каждое сообщение в CdcEvent
+ * (op=INSERT, lsn=offset) и передаёт в cdc_handler, пока выставлен флаг
+ * consumer_running. Каждое событие живёт в собственной арене. */
 static void *consumer_thread_fn(void *arg)
 {
     KafkaCtx *ctx = (KafkaCtx *)arg;
@@ -448,6 +459,9 @@ static void *consumer_thread_fn(void *arg)
 
 /* ── Connector functions ── */
 
+/* Создаёт контекст коннектора: разбирает config_json, инициализирует кэш схем,
+ * создаёт consumer и подписывается на топик. Возвращает ctx всегда (даже при
+ * ошибке инициализации rk — причина пишется в last_err). */
 static void *kafka_create(const char *config_json, Arena *arena)
 {
     pthread_once(&kafka_curl_once, kafka_curl_global_init);
@@ -511,6 +525,8 @@ static void *kafka_create(const char *config_json, Arena *arena)
     return ctx;
 }
 
+/* Останавливает CDC-поток, закрывает consumer и освобождает только собственные
+ * ресурсы плагина (память ctx/арены принадлежит хосту — см. примечание ниже). */
 static void kafka_destroy(void *vctx)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
@@ -548,6 +564,8 @@ static int kafka_list_entities(void *vctx, Arena *a, DfoEntityList *out)
     return 0;
 }
 
+/* Выводит схему топика: сэмплирует до 10 сообщений и строит Schema по формату
+ * (CSV-заголовок / Avro-схема / ключи JSON); при неудаче — fallback из 2 колонок. */
 static int kafka_describe(void *vctx, Arena *a, const char *entity, Schema **out)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
@@ -628,6 +646,9 @@ static int kafka_describe(void *vctx, Arena *a, const char *entity, Schema **out
     return 0;
 }
 
+/* Читает до `limit` сообщений, разбирает каждое по формату и сливает в один
+ * ColBatch (схема — от первого сообщения). Курсор req->cursor = последний offset.
+ * Возвращает 0 и *out=NULL, если сообщений пока нет. */
 static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                             const char *entity, ColBatch **out)
 {
@@ -789,6 +810,7 @@ static int kafka_cdc_stop(void *vctx)
     return 0;
 }
 
+/* Проверка связи: запрашивает метаданные брокеров (таймаут 3с). 0 — ОК. */
 static int kafka_ping(void *vctx)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;

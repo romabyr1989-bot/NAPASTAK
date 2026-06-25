@@ -209,6 +209,7 @@ static void *gp_create(const char *cfg, Arena *a) {
     return ctx;
 }
 
+/* ── destroy(): закрыть соединение libpq. Контекст живёт в арене (не free). ── */
 static void gp_destroy(void *vctx) {
     GpCtx *ctx = vctx;
     if (ctx && ctx->conn) { PQfinish(ctx->conn); ctx->conn = NULL; }
@@ -458,7 +459,8 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 }
 
 /* ── write_batch(): выгрузка строк в таблицу GP (sink, как у pg) ── */
-#define GP_INS_CHUNK 250
+#define GP_INS_CHUNK 250   /* строк на один multi-row INSERT (батч режется по чанкам) */
+/* Выполнить SQL и проверить успех (COMMAND_OK или TUPLES_OK). Логирует ошибку. */
 static int gp_exec_ok(PGconn *c, const char *sql) {
     PGresult *r = PQexec(c, sql);
     int ok = (PQresultStatus(r) == PGRES_COMMAND_OK || PQresultStatus(r) == PGRES_TUPLES_OK);
@@ -505,10 +507,13 @@ static int gp_write_batch(void *vctx, Arena *a, const char *entity,
     }
     snprintf(collist+co, sizeof(collist)-co, ")");
 
+    /* Вставляем чанками по GP_INS_CHUNK строк: для каждого чанка собираем
+     * один multi-row INSERT через GP_APP (растущий буфер). */
     int written = 0;
     for (int start = 0; start < batch->nrows; start += GP_INS_CHUNK) {
         int end = start + GP_INS_CHUNK; if (end > batch->nrows) end = batch->nrows;
         size_t cap = 4096; char *sql = malloc(cap); size_t off = 0;
+        /* GP_APP: append с автодвоением буфера sql при нехватке места. */
         #define GP_APP(...) do { \
             int need = snprintf(NULL,0,__VA_ARGS__); \
             if (off + (size_t)need + 1 > cap) { while (off+(size_t)need+1>cap) cap*=2; sql=realloc(sql,cap);} \
@@ -543,6 +548,7 @@ static int gp_write_batch(void *vctx, Arena *a, const char *entity,
     return written;
 }
 
+/* Таблица виртуальных методов — точка входа плагина (резолвится загрузчиком). */
 const DfoConnector dfo_connector_entry = {
     .abi_version   = DFO_CONNECTOR_ABI_VERSION,
     .name          = "greenplum",

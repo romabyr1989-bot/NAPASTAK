@@ -49,6 +49,7 @@ static void parse_field(const char *s, CronField *f, int lo, int hi) {
     }
 }
 
+/* Проверка вхождения значения v в развёрнутый список поля. */
 static bool field_has(CronField *f, int v) {
     for(int i=0;i<f->n;i++) if(f->vals[i]==v) return true;
     return false;
@@ -142,6 +143,7 @@ static void jval_write(JBuf *jb, JVal *v) {
     }
 }
 
+/* Сериализует JVal в строку JSON, выделяя буфер в переданной арене. */
 static const char *jval_to_json(JVal *v, Arena *a) {
     if (!v) return "null";
     JBuf jb; jb_init(&jb, a, 256);
@@ -187,6 +189,9 @@ static const char *trigger_type_to_str(TriggerType t) {
     }
 }
 
+/* Заполняет Pipeline из JSON-описания. Возвращает 0 при успехе, -1 если JSON
+ * не разобрался или корень не объект. Отсутствующие поля принимают значения
+ * по умолчанию ради обратной совместимости со старыми описаниями. */
 int pipeline_from_json(Pipeline *p, const char *json) {
     Arena *a = arena_create(32768);
     JVal *root = json_parse(a, json, strlen(json));
@@ -298,6 +303,9 @@ int pipeline_from_json(Pipeline *p, const char *json) {
     return 0;
 }
 
+/* Обратная к pipeline_from_json: сериализует Pipeline в JSON-строку.
+ * Необязательные поля выводятся только когда заданы, чтобы старые пайплайны
+ * проходили round-trip без изменений. */
 char *pipeline_to_json(const Pipeline *p, Arena *a) {
     JBuf jb; jb_init(&jb,a,4096);
     jb_obj_begin(&jb);
@@ -434,6 +442,7 @@ static void *sched_loop(void *arg) {
     return NULL;
 }
 
+/* Создаёт планировщик с колбэком запуска cb и пользовательскими данными ud. */
 Scheduler *scheduler_create(RunCallback cb, void *ud) {
     Scheduler *s=calloc(1,sizeof(Scheduler));
     pthread_mutex_init(&s->mu,NULL);
@@ -441,12 +450,14 @@ Scheduler *scheduler_create(RunCallback cb, void *ud) {
     return s;
 }
 
+/* Добавляет копию пайплайна в планировщик (лимит 256). */
 void scheduler_add(Scheduler *s, Pipeline *p) {
     pthread_mutex_lock(&s->mu);
     if(s->npipelines<256) s->pipelines[s->npipelines++]=*p;
     pthread_mutex_unlock(&s->mu);
 }
 
+/* Удаляет пайплайн по id, переставляя на его место последний элемент (порядок не важен). */
 void scheduler_remove(Scheduler *s, const char *id) {
     pthread_mutex_lock(&s->mu);
     for(int i=0;i<s->npipelines;i++)
@@ -456,6 +467,7 @@ void scheduler_remove(Scheduler *s, const char *id) {
     pthread_mutex_unlock(&s->mu);
 }
 
+/* Ищет пайплайн по id; возвращает указатель внутрь массива или NULL. */
 Pipeline *scheduler_find(Scheduler *s, const char *id) {
     pthread_mutex_lock(&s->mu);
     Pipeline *found = NULL;
@@ -465,6 +477,7 @@ Pipeline *scheduler_find(Scheduler *s, const char *id) {
     return found;
 }
 
+/* Запуск/останов фонового потока планировщика; stop дожидается завершения потока. */
 void scheduler_start(Scheduler *s) { s->running=1; pthread_create(&s->thread,NULL,sched_loop,s); }
 void scheduler_stop(Scheduler *s)  { s->running=0; pthread_join(s->thread,NULL); }
 

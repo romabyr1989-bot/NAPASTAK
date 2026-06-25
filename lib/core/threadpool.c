@@ -36,6 +36,7 @@ static void *worker(void *arg) {
     return NULL;
 }
 
+/* Создаёт пул из n воркеров с очередью не более qmax задач. */
 ThreadPool *tp_create(int n, int qmax) {
     ThreadPool *p = calloc(1, sizeof(ThreadPool));
     p->nthreads = n; p->queue_max = qmax;

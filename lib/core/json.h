@@ -5,8 +5,10 @@
 #include <stdbool.h>
 
 /* ── Builder ── */
+/* Растущий буфер для потоковой сборки JSON; память берётся из арены `a`. */
 typedef struct { char *buf; size_t len, cap; Arena *a; } JBuf;
 
+/* Инициализирует буфер: привязывает арену и резервирует initial байт. */
 void jb_init(JBuf *j, Arena *a, size_t initial);
 void jb_obj_begin(JBuf *j);
 void jb_obj_end(JBuf *j);
@@ -24,11 +26,13 @@ void jb_raw(JBuf *j, const char *raw);  /* append pre-built JSON verbatim */
 const char *jb_done(JBuf *j);
 
 /* ── Parser ── */
+/* Тип разобранного JSON-значения (JV_ERROR — признак ошибки разбора). */
 typedef enum {
     JV_NULL, JV_BOOL, JV_NUMBER, JV_STRING, JV_ARRAY, JV_OBJECT, JV_ERROR
 } JValType;
 
 typedef struct JVal JVal;
+/* Узел дерева разбора: union активен согласно полю type (см. метки ниже). */
 struct JVal {
     JValType    type;
     union {
@@ -40,8 +44,10 @@ struct JVal {
     };
 };
 
+/* Разбирает src (len байт) в дерево JVal на арене; при ошибке тип JV_ERROR. */
 JVal *json_parse(Arena *a, const char *src, size_t len);
 JVal *json_get(JVal *obj, const char *key);   /* O(n) key lookup */
+/* Аксессоры с дефолтом: возвращают def, если v не нужного типа/NULL. */
 const char *json_str(JVal *v, const char *def);
 long long   json_int(JVal *v, long long def);
 double      json_dbl(JVal *v, double def);

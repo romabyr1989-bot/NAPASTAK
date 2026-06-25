@@ -1,3 +1,8 @@
+/*
+ * tls.c — обёртка над OpenSSL для серверных TLS-соединений.
+ * Предоставляет создание TLS-контекста (сертификат + ключ), приём
+ * зашифрованных соединений и неблокирующее чтение/запись поверх SSL.
+ */
 #include "tls.h"
 #include "../core/log.h"
 #include <openssl/ssl.h>
@@ -5,15 +10,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Серверный TLS-контекст: разделяемая на все соединения конфигурация OpenSSL. */
 typedef struct TlsCtx {
     SSL_CTX *ssl_ctx;
 } TlsCtx;
 
+/* Одно установленное TLS-соединение: SSL-сессия поверх сокета fd. */
 typedef struct TlsConn {
     SSL *ssl;
     int fd;
 } TlsConn;
 
+/*
+ * Создаёт серверный TLS-контекст из PEM-файлов сертификата и ключа.
+ * Инициализирует OpenSSL, задаёт минимум TLS 1.2 и набор сильных шифров.
+ * Возвращает NULL при любой ошибке загрузки/проверки.
+ */
 TlsCtx *tls_server_ctx_create(const char *cert_pem_path,
                                const char *key_pem_path) {
     if (!cert_pem_path || !key_pem_path) {
@@ -77,12 +89,18 @@ TlsCtx *tls_server_ctx_create(const char *cert_pem_path,
     return tctx;
 }
 
+/* Освобождает TLS-контекст и связанный SSL_CTX. */
 void tls_server_ctx_destroy(TlsCtx *ctx) {
     if (!ctx) return;
     SSL_CTX_free(ctx->ssl_ctx);
     free(ctx);
 }
 
+/*
+ * Выполняет TLS-рукопожатие на уже принятом сокете fd.
+ * При успехе возвращает TlsConn; WANT_READ/WANT_WRITE при незавершённом
+ * handshake трактуются как ошибка (вызывающий код блокирующий).
+ */
 TlsConn *tls_conn_accept(TlsCtx *ctx, int fd) {
     if (!ctx) return NULL;
 
@@ -118,6 +136,7 @@ TlsConn *tls_conn_accept(TlsCtx *ctx, int fd) {
     return conn;
 }
 
+/* Корректно закрывает TLS-сессию (SSL_shutdown) и освобождает память. */
 void tls_conn_destroy(TlsConn *conn) {
     if (!conn) return;
     if (conn->ssl) {
@@ -127,6 +146,10 @@ void tls_conn_destroy(TlsConn *conn) {
     free(conn);
 }
 
+/*
+ * Читает расшифрованные данные. Возвращает число байт (>0), 0 если
+ * операция временно заблокировалась бы (WANT_READ/WANT_WRITE), -1 при ошибке.
+ */
 ssize_t tls_read(TlsConn *conn, void *buf, size_t n) {
     if (!conn) return -1;
     int ret = SSL_read(conn->ssl, buf, (int)n);
@@ -137,6 +160,10 @@ ssize_t tls_read(TlsConn *conn, void *buf, size_t n) {
     return -1;
 }
 
+/*
+ * Шифрует и отправляет данные. Возвращает число записанных байт (>0),
+ * 0 при временной блокировке (WANT_READ/WANT_WRITE), -1 при ошибке.
+ */
 ssize_t tls_write(TlsConn *conn, const void *buf, size_t n) {
     if (!conn) return -1;
     int ret = SSL_write(conn->ssl, buf, (int)n);
@@ -147,6 +174,7 @@ ssize_t tls_write(TlsConn *conn, const void *buf, size_t n) {
     return -1;
 }
 
+/* Возвращает дескриптор сокета, лежащий под TLS-соединением. */
 int tls_conn_fd(TlsConn *conn) {
     if (!conn) return -1;
     return conn->fd;

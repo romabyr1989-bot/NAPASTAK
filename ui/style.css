@@ -261,6 +261,26 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 .result-table td.compact { padding: .25rem .6rem; }
 .result-table tr:last-child td { border-bottom: none; }
 .result-table tr:hover td { background: var(--surface2); }
+
+/* Grid/flex-элементы по умолчанию имеют min-width/min-height: auto и НЕ сжимаются
+   меньше содержимого — поэтому широкая/высокая таблица предпросмотра раздувает
+   ячейку, вылезает за карточку (.step-card overflow:hidden) и обрезается, а
+   внутренний overflow:auto не срабатывает. min-width/height:0 это чинит: ячейка
+   ужимается до карточки, а таблица скроллится внутри своего бокса. */
+.step-body, .step-body > *, .conn-group { min-width: 0; }
+[id^="step-conn-cfg-"], [id^="step-conn-cfg-"] * { min-width: 0; }
+[id^="pb-dbpreview-"] { min-width: 0; max-width: 100%; }
+
+/* Таблица предпросмотра: ограничиваем высоту и включаем прокрутку по обеим осям
+   (вместе с min-width:0 выше — чтобы широкая/высокая выборка не растягивала и не
+   обрезала форму). Структурные селекторы — работает независимо от JS. Шапка
+   «липкая», полоса прокрутки всегда видимая (на macOS overlay скрыт до скролла). */
+[id^="pb-dbpreview-"] .result-table-wrap { max-height: 340px; overflow: auto; }
+[id^="pb-dbpreview-"] .result-table thead th { position: sticky; top: 0; z-index: 1; }
+[id^="pb-dbpreview-"] .result-table-wrap::-webkit-scrollbar { width: 11px; height: 11px; }
+[id^="pb-dbpreview-"] .result-table-wrap::-webkit-scrollbar-track { background: var(--surface2); }
+[id^="pb-dbpreview-"] .result-table-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; border: 2px solid var(--surface2); }
+[id^="pb-dbpreview-"] .result-table-wrap::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .null-val    { color: var(--muted); font-style: italic; }
 .result-empty { padding: 2rem; text-align: center; color: var(--muted); }
 .dml-banner {
@@ -292,6 +312,13 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
   border-radius: 4px; padding: .15rem .5rem;
   border: 1px solid var(--border);
 }
+
+/* ── Pagination ── */
+.pager { display: flex; align-items: center; justify-content: center; gap: .75rem; margin: 1rem 0 .25rem; flex-wrap: wrap; }
+.pager-info { font-size: .8rem; color: var(--muted); }
+.pager .btn[disabled] { opacity: .45; cursor: default; pointer-events: none; }
+.pager-size { font-size: .8rem; color: var(--muted); display: inline-flex; align-items: center; gap: .35rem; margin-left: .5rem; }
+.pager-size select { height: 30px; padding: 0 .4rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); font-size: .8rem; }
 
 /* ── Status badges ── */
 .badge { display: inline-block; font-size: .7rem; padding: .15rem .5rem; border-radius: 12px; font-weight: 600; }
@@ -562,37 +589,15 @@ textarea { font-family: var(--mono); resize: vertical; }
 /* ── Ingest drop zone ── */
 .link { color: var(--accent2); cursor: pointer; text-decoration: underline; }
 
-/* ── Metrics panels ── */
-.metrics-panels {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  margin-top: 1rem;
-}
-.metrics-card { padding: 1.25rem; }
-.metrics-card-title {
-  font-size: .7rem; font-weight: 700; letter-spacing: .07em;
-  text-transform: uppercase; color: var(--muted); margin-bottom: 1rem;
-}
-.metrics-empty { color: var(--muted); font-size: .85rem; }
-
-/* bar chart */
-.mbar-row { display: flex; align-items: center; gap: .6rem; margin-bottom: .55rem; }
-.mbar-label { font-size: .82rem; width: 130px; flex-shrink: 0; overflow: hidden;
-               text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.mbar-track { flex: 1; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
-.mbar-fill  { height: 100%; background: var(--accent); border-radius: 4px;
-               transition: width .3s ease; }
-.mbar-val   { font-size: .78rem; color: var(--muted); width: 64px; text-align: right;
-               flex-shrink: 0; font-variant-numeric: tabular-nums; }
-
-/* pipeline list */
-.mpl-row { display: flex; align-items: center; gap: .6rem; padding: .45rem 0;
-            border-bottom: 1px solid var(--border); }
-.mpl-row:last-child { border-bottom: none; }
-.mpl-name { flex: 1; font-size: .85rem; font-weight: 500;
-             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mpl-meta { font-size: .75rem; color: var(--muted); flex-shrink: 0; }
+/* Metrics key→value breakdown rows (used by the run-history / datamart modals) */
+.mstat-row { display: flex; justify-content: space-between; align-items: baseline;
+             padding: .4rem 0; border-bottom: 1px solid var(--border); font-size: .85rem; }
+.mstat-row:last-child { border-bottom: none; }
+.mstat-k { color: var(--muted); }
+.mstat-v { font-weight: 600; font-variant-numeric: tabular-nums; }
+.mstat-v.ok   { color: var(--green); }
+.mstat-v.warn { color: var(--amber); }
+.mstat-v.err  { color: var(--red); }
 
 /* ── Preview table ── */
 #preview-table { overflow-x: auto; }
@@ -715,7 +720,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: .9rem;
+  font-size: 1.15rem;   /* эмодзи-заяц 🐇 заполняет бейдж */
 }
 
 .logo-text { font-weight: 600; color: #101014; letter-spacing: -.01em; }
@@ -755,7 +760,6 @@ h2 {
 .card,
 .stat-card,
 .query-panel,
-.settings-card,
 .help-banner,
 .pipeline-card,
 .builder-topbar {
@@ -763,6 +767,8 @@ h2 {
   border: none;
   box-shadow: none;
 }
+/* .settings-card keeps its framed look (var(--surface) + border) so the
+   Администрирование panels match the framed .builder-settings forms. */
 
 .stat-grid { gap: .95rem; }
 
@@ -780,6 +786,26 @@ h2 {
   color: #6e6e73;
   letter-spacing: .02em;
   text-transform: none;
+}
+
+/* ── Metric tiles: framed gradient background, border along the whole edge, no hover. ── */
+.stat-card {
+  background: linear-gradient(158deg, #ffffff 0%, #eef1f9 100%);
+  border: 1.5px solid rgba(91,110,245,.45);   /* обрамление по всему краю плитки */
+  box-shadow: 0 1px 2px rgba(16,24,40,.05), 0 18px 32px -22px rgba(31,46,90,.35);
+}
+.stat-card .stat-val { color: var(--accent); }   /* акцентное число — наряднее */
+
+/* Metric section panels (Конвейеры / Витрины) share the same card framing */
+#view-metrics > h2 { padding-left: .1rem; }
+
+/* Аналитика (внутренние экраны): карточки/панели в рамке, как builder-settings
+   конвейеров. Селектор с #id перебивает flat-сброс .card/.query-panel выше. */
+#view-analytics .card,
+#view-analytics .query-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
 .table-card {
@@ -1069,44 +1095,11 @@ details[open] .st-summary::before { content: '▼ '; }
 
 @media (max-width: 700px) {
   .analytics-form-grid { grid-template-columns: 1fr; }
-  .metrics-panels { grid-template-columns: 1fr; }
 }
 
 /* ── Analytics step flow ── */
 /* ── Analytics list screen ── */
 #an-list-screen { display: flex; flex-direction: column; gap: 1rem; }
-.an-list-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: .25rem; }
-
-.an-saved-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 1rem;
-}
-.an-result-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1rem;
-  cursor: pointer;
-  transition: border-color .15s;
-  display: flex;
-  flex-direction: column;
-  gap: .5rem;
-}
-.an-result-card:hover { border-color: var(--accent); }
-.an-result-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: .5rem; }
-.an-result-name { font-weight: 600; font-size: .95rem; flex: 1; }
-.an-result-meta { font-size: .75rem; color: var(--muted); }
-.an-result-sql {
-  font-family: var(--mono);
-  font-size: .72rem;
-  color: var(--muted);
-  background: var(--surface2);
-  border-radius: 4px;
-  padding: .35rem .5rem;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
 /* ── Analytics view screen ── */
 #an-view-screen { display: flex; flex-direction: column; gap: 1.25rem; }
 .an-view-sql-textarea {

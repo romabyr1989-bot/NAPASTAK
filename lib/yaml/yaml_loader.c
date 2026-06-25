@@ -59,6 +59,7 @@ static int set_err(YamlError *err, int line, int col, const char *fmt, ...) {
 }
 
 /* ────────── String helpers ────────── */
+/* Скопировать первые len байт s в арену как NUL-терминированную строку. */
 static char *arena_substr(Arena *a, const char *s, size_t len) {
     char *out = arena_alloc(a, len + 1);
     memcpy(out, s, len);
@@ -66,6 +67,7 @@ static char *arena_substr(Arena *a, const char *s, size_t len) {
     return out;
 }
 
+/* Строка состоит только из пробельных символов (или пустая)? */
 static int is_blank(const char *s) {
     while (*s) {
         if (!isspace((unsigned char)*s)) return 0;
@@ -74,6 +76,7 @@ static int is_blank(const char *s) {
     return 1;
 }
 
+/* Срезать хвостовые пробелы на месте; возвращает s. */
 static char *rstrip(char *s) {
     size_t n = strlen(s);
     while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
@@ -99,6 +102,7 @@ static void strip_comment(char *s) {
     rstrip(s);
 }
 
+/* Число ведущих пробелов (отступ строки). Табы как отступ не считаются. */
 static int count_indent(const char *s) {
     int n = 0;
     while (s[n] == ' ') n++;
@@ -231,7 +235,7 @@ static int preprocess(Yaml *y, const char *src, size_t len) {
             } else {
                 /* check for "key: value" inside the dash content */
                 char *colon = NULL;
-                int q = 0;
+                int q = 0; /* активная кавычка ('"'/'\''), чтобы пропускать ':' внутри строк */
                 for (char *p = after_dash; *p; p++) {
                     if (q) { if (*p == '\\' && p[1]) p++; else if (*p == q) q = 0; continue; }
                     if (*p == '"' || *p == '\'') { q = *p; continue; }

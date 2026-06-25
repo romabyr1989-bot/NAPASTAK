@@ -44,6 +44,7 @@ typedef struct AvroSchemaNode {
     struct AvroSchemaNode  *next;          /* cache linkage (owned by the .c) */
 } AvroSchemaNode;
 
+/* Map an Avro primitive type name to AvroType; unknown/complex names → строка. */
 static inline AvroType avro_type_from_str(const char *t)
 {
     if (!t)                     return AVRO_STRING;
@@ -126,7 +127,7 @@ static inline int avro_decode_record(Arena *a, const AvroField *fields, int nfie
 
     for (int f = 0; f < nfields; f++) {
         const AvroField *field    = &fields[f];
-        AvroType         eff_type = field->type;
+        AvroType         eff_type = field->type;  /* для union уточняется ниже */
 
         /* Every field needs at least one byte (a union branch index, a string
          * length prefix of 0x00, a varint, ...) — only the literal `null` type
@@ -141,9 +142,9 @@ static inline int avro_decode_record(Arena *a, const AvroField *fields, int nfie
             pos += avro_decode_long(payload + pos, plen - pos, &branch);
             if (pos > plen) return -1;
             if ((int)branch == field->union_null_idx) {
-                nulls[f] = 1; values[f] = NULL; continue;
+                nulls[f] = 1; values[f] = NULL; continue;  /* выбрана ветка null */
             }
-            eff_type = field->union_inner;
+            eff_type = field->union_inner;  /* иначе декодируем непустую ветку */
         }
 
         switch (eff_type) {

@@ -1,4 +1,8 @@
 #pragma once
+/* app.h — публичный интерфейс шлюза DataFlow OS.
+ * Описывает агрегирующую структуру App (все подсистемы сервера: каталог,
+ * планировщик, хранилище, auth/RBAC/audit, кластер, PG-wire, HTTP/TLS)
+ * и объявляет жизненный цикл приложения + точки регистрации маршрутов. */
 #include "../../lib/net/http.h"
 #include "../../lib/storage/storage.h"
 #include "../../lib/storage/txn.h"
@@ -23,6 +27,8 @@
 /* WebSocket client: plain WS (tls=NULL) or WSS */
 typedef struct { int fd; TlsConn *tls; } WsClient;
 
+/* App — единый контейнер состояния сервера: владеет всеми подсистемами,
+ * конфигурацией и сетевыми объектами. Глобальный экземпляр — g_app. */
 typedef struct {
     /* subsystems */
     Catalog    *catalog;
@@ -96,11 +102,15 @@ typedef struct {
     HttpServer *server;
 } App;
 
+/* Глобальный экземпляр приложения. */
 extern App g_app;
 
+/* Жизненный цикл сервера: разбор конфига и инициализация подсистем,
+ * запуск цикла обслуживания, корректная остановка. */
 void app_init(App *app, const char *config_json);
 void app_run(App *app);
 void app_stop(App *app);
+/* Рассылка JSON-сообщения всем подключённым WebSocket-клиентам. */
 void app_ws_broadcast(App *app, const char *json_msg);
 
 /* route registration */

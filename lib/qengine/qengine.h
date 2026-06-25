@@ -8,12 +8,14 @@
 /* ── Operator interface (iterator / volcano model) ── */
 typedef struct Operator Operator;
 
+/* Таблица виртуальных методов оператора: жизненный цикл open/next/close. */
 typedef struct {
     int (*open)(Operator *op);
     int (*next)(Operator *op, ColBatch **out);  /* 0=ok 1=eof -1=error */
     void(*close)(Operator *op);
 } OpVtable;
 
+/* Узел дерева исполнения: vtable + дочерние операторы, арена и схема результата. */
 struct Operator {
     const OpVtable *vt;
     Operator       *left;
@@ -58,12 +60,14 @@ int qengine_exec_json(Operator *root, Arena *a,
                       int *rows_out);
 
 /* ── Evaluate a scalar expression against one row ── */
+/* Контекст вычисления выражения: указывает на конкретную строку (row) батча. */
 typedef struct {
     Schema     *schema;
     ColBatch   *batch;
     int         row;
 } EvalCtx;
 
+/* Размеченное значение скаляра: union интерпретируется по полю type из Scalar. */
 typedef union {
     int64_t     ival;
     double      fval;

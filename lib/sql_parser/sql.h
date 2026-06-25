@@ -1,9 +1,16 @@
 #pragma once
+/*
+ * sql.h — публичный интерфейс SQL-движка DataFlow OS.
+ * Описывает узлы AST (Expr/Stmt), спецификацию оконных функций,
+ * узлы плана выполнения (PlanNode) и API парсера/планировщика.
+ * Вся память узлов выделяется в Arena (см. arena.h).
+ */
 #include "../core/arena.h"
 #include "../storage/storage.h"
 #include <stdbool.h>
 
 /* ── AST ── */
+/* Вид выражения; определяет, какое поле union в struct Expr активно */
 typedef enum {
     EXPR_COL, EXPR_STAR, EXPR_LITERAL_INT, EXPR_LITERAL_FLOAT,
     EXPR_LITERAL_STR, EXPR_LITERAL_NULL, EXPR_LITERAL_BOOL,
@@ -11,6 +18,7 @@ typedef enum {
     EXPR_CASE, EXPR_LIST, EXPR_WINDOW
 } ExprType;
 
+/* Операторы для EXPR_BINOP/EXPR_UNOP: сравнения, логика, арифметика, шаблоны */
 typedef enum {
     OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
     OP_AND, OP_OR, OP_NOT,
@@ -25,6 +33,7 @@ typedef struct Expr Expr;
 typedef struct Stmt Stmt;
 typedef struct WindowSpec WindowSpec;
 
+/* Узел выражения AST: активное поле union выбирается по полю type */
 struct Expr {
     ExprType    type;
     WindowSpec *win_spec;   /* non-NULL for EXPR_WINDOW */
@@ -51,6 +60,7 @@ struct Expr {
 
 typedef enum { JOIN_INNER, JOIN_LEFT, JOIN_RIGHT, JOIN_FULL, JOIN_CROSS } JoinType;
 
+/* Элемент FROM: таблица или производная таблица (подзапрос) с условием JOIN */
 typedef struct {
     const char *table;      /* NULL if subquery */
     const char *alias;
@@ -59,6 +69,7 @@ typedef struct {
     Stmt       *subquery;   /* non-NULL = derived table */
 } FromItem;
 
+/* Элемент ORDER BY: выражение и направление сортировки */
 typedef struct {
     Expr       *expr;
     bool        desc;
@@ -66,6 +77,8 @@ typedef struct {
 } OrderItem;
 
 typedef enum { WF_ROWS, WF_RANGE } WinFrameType;
+
+/* Вид границы оконной рамки (UNBOUNDED/N PRECEDING/CURRENT ROW/...) */
 
 typedef enum {
     WBOUND_UNBOUNDED_PREC,
@@ -77,6 +90,7 @@ typedef enum {
 
 typedef struct { WinBoundKind kind; int64_t n; } WinFrameBound;
 
+/* Спецификация окна: PARTITION BY / ORDER BY / рамка (ROWS|RANGE BETWEEN ...) */
 struct WindowSpec {
     Expr         **partition_by;
     int            npartition;
@@ -88,11 +102,13 @@ struct WindowSpec {
     bool           has_frame;
 };
 
+/* Именованный CTE из секции WITH (общее табличное выражение) */
 typedef struct {
     const char  *name;
     struct SelectStmt_s *body;
 } CTE;
 
+/* Полностью разобранный SELECT со всеми секциями запроса */
 typedef struct SelectStmt_s {
     /* WITH */
     CTE        *ctes;
@@ -119,6 +135,7 @@ typedef struct SelectStmt_s {
     int64_t     offset;
 } SelectStmt;
 
+/* Разобранный INSERT: целевая таблица, список колонок и значения */
 typedef struct {
     const char  *table;
     const char **columns;
@@ -128,23 +145,25 @@ typedef struct {
 
 typedef enum { SET_UNION, SET_UNION_ALL, SET_INTERSECT, SET_EXCEPT } SetOpType;
 
+/* Вид верхнеуровневого оператора; выбирает активное поле union в struct Stmt */
 typedef enum {
     STMT_SELECT, STMT_INSERT, STMT_SET_OP, STMT_UPDATE, STMT_DELETE,
     STMT_BEGIN, STMT_COMMIT, STMT_ROLLBACK,
     STMT_UNKNOWN
 } StmtType;
 
+/* Корень разобранного оператора; поле error != NULL при ошибке парсинга */
 struct Stmt {
     StmtType     type;
     union {
         SelectStmt select;
         InsertStmt insert;
-        struct {
+        struct {                /* STMT_SET_OP: UNION/INTERSECT/EXCEPT двух запросов */
             SetOpType  set_op;
             Stmt      *set_left;
             Stmt      *set_right;
         };
-        struct {
+        struct {                /* STMT_UPDATE/STMT_DELETE: SET-присваивания и WHERE */
             char  table[128];
             char  set_cols[64][64];
             char  set_vals[64][256];
@@ -156,11 +175,12 @@ struct Stmt {
 };
 
 /* ── Public API ── */
-Stmt  *sql_parse(Arena *a, const char *query, size_t len);
-char  *stmt_to_str(Arena *a, const Stmt *s);
-void   stmt_dump(const Stmt *s);
+Stmt  *sql_parse(Arena *a, const char *query, size_t len);  /* разбор текста запроса в AST (память из Arena) */
+char  *stmt_to_str(Arena *a, const Stmt *s);                /* сериализация AST обратно в SQL-строку */
+void   stmt_dump(const Stmt *s);                            /* отладочный вывод дерева оператора */
 
 /* ── Plan nodes ── */
+/* Тип узла физического/логического плана выполнения */
 typedef enum {
     PLAN_SCAN, PLAN_FILTER, PLAN_PROJECT, PLAN_JOIN,
     PLAN_SORT, PLAN_LIMIT, PLAN_AGG, PLAN_DISTINCT,
@@ -168,6 +188,7 @@ typedef enum {
 } PlanNodeType;
 
 typedef struct PlanNode PlanNode;
+/* Узел дерева плана; набор используемых полей зависит от type (left/right — дочерние узлы) */
 struct PlanNode {
     PlanNodeType type;
     PlanNode    *left;
@@ -191,4 +212,5 @@ struct PlanNode {
     int          nwindow_exprs;
 };
 
+/* Построение дерева плана выполнения из разобранного оператора */
 PlanNode *sql_plan(Arena *a, const Stmt *s);

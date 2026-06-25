@@ -8,31 +8,38 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+/* Заполняет buf случайными байтами из /dev/urandom.
+ * Если устройство недоступно — детерминированный fallback (только для UUID, не для криптографии). */
 static void gen_random_bytes(uint8_t *buf, size_t n) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) { (void)read(fd, buf, n); close(fd); }
     else { for (size_t i = 0; i < n; i++) buf[i] = (uint8_t)(i ^ 0xA5); }
 }
 
+/* Глобальный логгер процесса (каждый .so линкует свою копию — см. комментарий в log_write). */
 Logger g_log;
 
 /* Thread-local correlation ID — lives for the lifetime of one worker thread */
 _Thread_local char g_correlation_id[37] = {0};
 
+/* Текстовые имена и ANSI-цвета уровней; индексируются значением LogLevel. */
 static const char *level_str[]   = {"DEBUG","INFO","WARN","ERROR"};
 static const char *level_color[] = {"\033[37m","\033[32m","\033[33m","\033[31m"};
 
+/* Инициализирует логгер: поток вывода, минимальный уровень, режим (text/json) и мьютекс. */
 void log_init(Logger *l, FILE *out, LogLevel min_level, int json_mode) {
     l->out = out; l->min_level = min_level; l->json_mode = json_mode;
     pthread_mutex_init(&l->mu, NULL);
 }
 
+/* Устанавливает correlation ID текущего потока (NULL или усечение до 36 символов). */
 void log_set_correlation_id(const char *id) {
     if (!id) { g_correlation_id[0] = '\0'; return; }
     strncpy(g_correlation_id, id, 36);
     g_correlation_id[36] = '\0';
 }
 
+/* Генерирует новый случайный UUIDv4 и кладёт его в correlation ID текущего потока. */
 void log_new_correlation_id(void) {
     uint8_t b[16];
     gen_random_bytes(b, 16);
@@ -44,6 +51,8 @@ void log_new_correlation_id(void) {
         b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
 }
 
+/* Форматирует и выводит одну строку лога (printf-стиль): метка времени UTC,
+ * уровень, файл:строка, correlation_id и сообщение — в text или json режиме. */
 void log_write(Logger *l, LogLevel level, const char *file, int line,
                const char *fmt, ...) {
     /* A plugin .so links its own copy of this logger; loaded via dlopen its

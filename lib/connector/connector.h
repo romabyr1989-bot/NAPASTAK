@@ -1,28 +1,40 @@
+/* connector.h — публичный ABI плагинов-коннекторов DataFlow OS.
+ * Описывает контракт между ядром и динамически загружаемыми коннекторами
+ * (.so): обнаружение сущностей, чтение/запись батчей, CDC и health-probe.
+ * Каждый плагин экспортирует символ DFO_CONNECTOR_EXPORT_SYM, возвращающий
+ * DfoConnector. Порядок полей в DfoConnector менять нельзя (бинарная
+ * совместимость по DFO_CONNECTOR_ABI_VERSION). */
 #pragma once
 #include "../core/arena.h"
 #include "../storage/storage.h"
 #include <stdint.h>
 
+/* Версия ABI; должна совпадать у ядра и плагина при загрузке. */
 #define DFO_CONNECTOR_ABI_VERSION 3
 
+/* Описание одной сущности источника (таблица/вью/поток). */
 typedef struct {
     const char *entity;  /* table / endpoint name */
     const char *type;    /* "table","view","stream" */
 } DfoEntity;
 
+/* Список сущностей, возвращаемый list_entities (память — из Arena). */
 typedef struct {
     DfoEntity *items;
     int        count;
 } DfoEntityList;
 
+/* Параметры одного запроса чтения батча. */
 typedef struct {
     const char *cursor;    /* opaque bookmark for pagination */
     int64_t     limit;
     const char *filter;    /* optional SQL-like predicate */
 } DfoReadReq;
 
+/* Тип CDC-операции в потоке изменений. */
 typedef enum { CDC_INSERT=1, CDC_UPDATE=2, CDC_DELETE=3 } CdcOp;
 
+/* Одно событие изменения данных (Change Data Capture). */
 typedef struct {
     CdcOp       op;
     const char *entity;
@@ -31,6 +43,7 @@ typedef struct {
     int64_t     lsn;
 } CdcEvent;
 
+/* Колбэк, вызываемый коннектором на каждое CDC-событие. */
 typedef void (*DfoCdcHandler)(CdcEvent *ev, void *userdata);
 
 /* ── Plugin ABI — never change field order ── */
@@ -86,9 +99,14 @@ typedef struct {
 #define DFO_CONNECTOR_EXPORT_SYM "dfo_connector_entry"
 
 /* ── Loader ── */
+/* Непрозрачный дескриптор загруженного экземпляра коннектора (.so + ctx). */
 typedef struct ConnectorInst ConnectorInst;
 
+/* Загрузить плагин по пути, создать ctx из config_json; NULL при ошибке. */
 ConnectorInst *connector_load(const char *so_path, const char *config_json, Arena *a);
+/* Выгрузить плагин и освободить связанные ресурсы. */
 void           connector_unload(ConnectorInst *inst);
+/* Таблица функций ABI данного экземпляра. */
 const DfoConnector *connector_api(ConnectorInst *inst);
+/* Приватный ctx коннектора (передаётся первым аргументом в вызовы ABI). */
 void          *connector_ctx(ConnectorInst *inst);

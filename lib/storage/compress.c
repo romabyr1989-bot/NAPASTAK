@@ -1,3 +1,12 @@
+/*
+ * compress.c — колоночное сжатие батчей хранилища DataFlow OS.
+ *
+ * Поддерживаемые кодировки (Encoding): PLAIN, RLE, DICT, DELTA.
+ * Кодировка для столбца выбирается эвристически по выборке данных
+ * (compress_choose_encoding), затем столбец сжимается (compress_col) и
+ * может быть сериализован в компактный бинарный формат "DCMB".
+ * Все аллокации идут через арену (Arena) — освобождение пакетное.
+ */
 #include "compress.h"
 #include <string.h>
 #include <stdlib.h>
@@ -8,23 +17,27 @@
    Вспомогательные функции: битовые операции
    ═══════════════════════════════════════════════════ */
 
+/* Проверка i-го бита NULL-битмапа (LSB-first); NULL-битмап == "нет NULL". */
 static bool null_bit(const uint8_t *bm, int i) {
     if (!bm) return false;
     return !!(bm[i/8] & (1u << (i%8)));
 }
 
+/* Размер NULL-битмапа в байтах для nrows строк (округление вверх). */
 static int null_bm_bytes(int nrows) { return (nrows + 7) / 8; }
 
 /* ═══════════════════════════════════════════════════
    Сериализаторы/десериализаторы для бинарного формата
    ═══════════════════════════════════════════════════ */
 
+/* wN — запись little-endian значения в буфер с продвижением курсора *p; wb — сырые байты. */
 static void w8 (uint8_t **p, uint8_t  v){ **p=v; (*p)++; }
 static void w16(uint8_t **p, uint16_t v){ memcpy(*p,&v,2); (*p)+=2; }
 static void w32(uint8_t **p, uint32_t v){ memcpy(*p,&v,4); (*p)+=4; }
 static void w64(uint8_t **p, uint64_t v){ memcpy(*p,&v,8); (*p)+=8; }
 static void wb (uint8_t **p, const void *d, size_t n){ memcpy(*p,d,n); (*p)+=n; }
 
+/* rN — чтение little-endian значения с продвижением курсора *p. */
 static uint8_t  r8 (const uint8_t **p){ uint8_t  v=**p; (*p)++;   return v; }
 static uint16_t r16(const uint8_t **p){ uint16_t v; memcpy(&v,*p,2); (*p)+=2; return v; }
 static uint32_t r32(const uint8_t **p){ uint32_t v; memcpy(&v,*p,4); (*p)+=4; return v; }
@@ -34,6 +47,11 @@ static uint64_t r64(const uint8_t **p){ uint64_t v; memcpy(&v,*p,8); (*p)+=8; re
    compress_choose_encoding
    ═══════════════════════════════════════════════════ */
 
+/*
+ * Эвристический выбор кодировки по выборке (до 1000 строк):
+ * оценивает кардинальность/монотонность/долю повторов и возвращает
+ * наиболее выгодную Encoding. NULL не учитываются в статистике.
+ */
 Encoding compress_choose_encoding(void *values, uint8_t *null_bitmap,
                                   int nrows, ColType type) {
     if (nrows <= 0) return ENC_PLAIN;
@@ -122,9 +140,10 @@ Encoding compress_choose_encoding(void *values, uint8_t *null_bitmap,
    compress_col
    ═══════════════════════════════════════════════════ */
 
+/* RLE для int64/bool: NULL кодируется как INT64_MIN; длина run ограничена 65535 (uint16). */
 static int compress_col_rle_int(CompressedCol *out, int64_t *vs,
                                  uint8_t *bm, int nrows, Arena *a) {
-    /* Подсчёт runs */
+    /* Первый проход: подсчёт числа run для аллокации массивов */
     int nruns = 0;
     for (int i = 0; i < nrows; ) {
         int64_t v = null_bit(bm, i) ? INT64_MIN : vs[i];
@@ -158,6 +177,7 @@ static int compress_col_rle_int(CompressedCol *out, int64_t *vs,
     return 0;
 }
 
+/* RLE для текста: NULL и пустые строки трактуются как ""; значения run копируются в арену. */
 static int compress_col_rle_text(CompressedCol *out, char **vs,
                                   uint8_t *bm, int nrows, Arena *a) {
     int nruns = 0;
@@ -193,6 +213,11 @@ static int compress_col_rle_text(CompressedCol *out, char **vs,
     return 0;
 }
 
+/*
+ * Словарная кодировка int64/bool: словарь сортируется, коды находятся
+ * бинарным поиском. Ширина кода 1 или 2 байта (dict_is_u8). При >65535
+ * уникальных значений возвращает -1 (вызов compress_col откатится в PLAIN).
+ */
 static int compress_col_dict_int(CompressedCol *out, int64_t *vs,
                                   uint8_t *bm, int nrows, Arena *a) {
     /* Собрать уникальные значения */
@@ -245,6 +270,10 @@ static int compress_col_dict_int(CompressedCol *out, int64_t *vs,
     return 0;
 }
 
+/*
+ * Словарная кодировка текста: словарь не сортируется (поиск кода линейный),
+ * строки копируются в арену. При >65535 уникальных значений возвращает -1.
+ */
 static int compress_col_dict_text(CompressedCol *out, char **vs,
                                    uint8_t *bm, int nrows, Arena *a) {
     char **uniq = arena_alloc(a, (size_t)nrows * sizeof(char*));
@@ -281,6 +310,11 @@ static int compress_col_dict_text(CompressedCol *out, char **vs,
     return 0;
 }
 
+/*
+ * Дельта-кодировка int64: base_value = первое non-NULL значение, далее
+ * хранятся 32-битные разности к предыдущему non-NULL. NULL дают дельту 0.
+ * Если разность не влезает в int32 — возврат -1 (откат в PLAIN).
+ */
 static int compress_col_delta(CompressedCol *out, int64_t *vs,
                                uint8_t *bm, int nrows, Arena *a) {
     /* Найти первый non-null */
@@ -302,6 +336,11 @@ static int compress_col_delta(CompressedCol *out, int64_t *vs,
     return 0;
 }
 
+/*
+ * Сжимает один столбец заданной кодировкой enc, заполняя *out.
+ * Копирует NULL-битмап в арену. При неприменимой кодировке или ошибке
+ * сжатия (rc != 0) откатывается на ENC_PLAIN. Всегда возвращает 0.
+ */
 int compress_col(CompressedCol *out, void *values, uint8_t *null_bitmap,
                  int nrows, ColType type, Encoding enc, Arena *a) {
     memset(out, 0, sizeof(*out));
@@ -350,6 +389,11 @@ int compress_col(CompressedCol *out, void *values, uint8_t *null_bitmap,
    decompress_col
    ═══════════════════════════════════════════════════ */
 
+/*
+ * Восстанавливает значения столбца из CompressedCol в *values_out
+ * (массив в арене) и при необходимости NULL-битмап в *null_bitmap_out.
+ * Возвращает 0, либо -1 при неизвестной кодировке.
+ */
 int decompress_col(const CompressedCol *in, void **values_out,
                    uint8_t **null_bitmap_out, Arena *a) {
     int nrows = in->nrows;
@@ -437,6 +481,10 @@ int decompress_col(const CompressedCol *in, void **values_out,
    compress_batch / decompress_batch
    ═══════════════════════════════════════════════════ */
 
+/*
+ * Сжимает весь батч: для каждого столбца выбирает кодировку и вызывает
+ * compress_col. Параллельно грубо оценивает original_bytes для compress_ratio.
+ */
 CompressedBatch *compress_batch(const ColBatch *batch, Arena *a) {
     CompressedBatch *cb = arena_calloc(a, sizeof(CompressedBatch));
     cb->schema = batch->schema;
@@ -463,6 +511,7 @@ CompressedBatch *compress_batch(const ColBatch *batch, Arena *a) {
     return cb;
 }
 
+/* Обратная операция к compress_batch: восстанавливает ColBatch постолбцово. */
 ColBatch *decompress_batch(const CompressedBatch *cb, Arena *a) {
     ColBatch *batch = arena_calloc(a, sizeof(ColBatch));
     batch->schema = cb->schema;
@@ -490,6 +539,7 @@ ColBatch *decompress_batch(const CompressedBatch *cb, Arena *a) {
    ═══════════════════════════════════════════════════ */
 
 /* Estimate max serialized size */
+/* Верхняя оценка размера буфера сериализации (+64 байта запаса). */
 static size_t ser_estimate(const CompressedBatch *cb) {
     size_t n = 14; /* magic + version + ncols + nrows */
     for (int c = 0; c < cb->ncols; c++) {
@@ -523,6 +573,11 @@ static size_t ser_estimate(const CompressedBatch *cb) {
     return n + 64;
 }
 
+/*
+ * Сериализует сжатый батч в бинарный формат "DCMB" v1 (см. описание выше).
+ * Буфер выделяется в арене по верхней оценке ser_estimate; в *out_len
+ * возвращается фактический размер.
+ */
 int compressed_batch_serialize(const CompressedBatch *cb,
                                 void **out, size_t *out_len, Arena *a) {
     size_t cap = ser_estimate(cb);
@@ -613,6 +668,11 @@ int compressed_batch_serialize(const CompressedBatch *cb,
     return 0;
 }
 
+/*
+ * Разбирает буфер формата "DCMB" обратно в CompressedBatch.
+ * Возвращает NULL при неверной длине, чужой сигнатуре или некорректных
+ * ncols/nrows. Курсор продвигается до end, превышение длины не проверяется.
+ */
 CompressedBatch *compressed_batch_deserialize(const void *data,
                                                size_t len, Arena *a) {
     const uint8_t *p = (const uint8_t*)data;
@@ -723,6 +783,7 @@ CompressedBatch *compressed_batch_deserialize(const void *data,
     return cb;
 }
 
+/* Коэффициент сжатия original_bytes / compressed_bytes (>=1 — лучше). */
 float compress_ratio(const CompressedBatch *cb) {
     if (!cb || cb->compressed_bytes == 0) return 1.0f;
     return (float)cb->original_bytes / (float)cb->compressed_bytes;

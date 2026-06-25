@@ -1,4 +1,8 @@
 #pragma once
+/* storage.h — публичный интерфейс слоя хранения DataFlow OS:
+ * колоночные батчи (ColBatch), журнал упреждающей записи (WAL),
+ * таблицы с B-tree индексами и каталог метаданных на SQLite
+ * (схемы таблиц, пайплайны, история запусков, сохранённые результаты). */
 #include "../core/arena.h"
 #include "../core/json.h"
 #include "../index/btree.h"
@@ -9,12 +13,14 @@
 /* ── Column types ── */
 typedef enum { COL_INT64=0, COL_DOUBLE, COL_TEXT, COL_BOOL, COL_NULL } ColType;
 
+/* Описание одной колонки: имя, тип и допустимость NULL. */
 typedef struct {
     const char *name;
     ColType     type;
     bool        nullable;
 } ColDef;
 
+/* Схема таблицы — упорядоченный массив колонок. */
 typedef struct {
     ColDef *cols;
     int     ncols;
@@ -24,6 +30,8 @@ typedef struct {
 #define BATCH_SIZE 8192
 #define MAX_COLS   2048
 
+/* Колоночный батч: до BATCH_SIZE строк, данные хранятся по колонкам
+ * (column-major) для эффективного сканирования и векторизации. */
 typedef struct {
     Schema     *schema;
     int         ncols;
@@ -43,6 +51,8 @@ typedef void (*WalWriteCallback)(const char *table_name, uint64_t lsn,
                                   const void *data, size_t len, void *userdata);
 
 /* ── WAL ── */
+/* Журнал упреждающей записи: append-only лог изменений таблицы.
+ * INSERT пишется как CSV-строки; DELETE/UPDATE — записи с op-байтом. */
 typedef struct WAL WAL;
 WAL     *wal_open  (const char *path);
 int      wal_append(WAL *w, const void *data, size_t len);
@@ -56,6 +66,8 @@ int      wal_append_update(WAL *w, int64_t orig_offset, const char *new_csv, siz
 typedef struct Catalog Catalog;
 
 /* ── Table ── */
+/* Таблица: WAL-хранилище + опциональные индексы. scan читает данные в батчи,
+ * compact схлопывает delete/update-записи в новый компактный файл. */
 typedef struct Table Table;
 Table  *table_create(const char *name, Schema *schema, const char *dir);
 Table  *table_open  (const char *name, const char *dir);
@@ -80,6 +92,8 @@ int     table_create_index(Table *t, int col_idx, Catalog *c);
 BTree  *table_get_index   (Table *t, int col_idx);
 
 /* ── Catalog (SQLite-backed) ── */
+/* Каталог хранит метаданные системы в SQLite-БД: схемы таблиц,
+ * определения пайплайнов, историю запусков, сохранённые результаты и индексы. */
 Catalog *catalog_open(const char *db_path);
 void     catalog_close(Catalog *c);
 

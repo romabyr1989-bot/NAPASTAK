@@ -16,8 +16,11 @@
 #define MCP_LINE_BUF (256 * 1024)   /* one JSON-RPC message ≤ 256 KB */
 #define MCP_RESULT_BUF (64 * 1024)  /* tool result text ≤ 64 KB */
 
+/* Режим работы: HTTP — проксирование запросов в gateway по сети;
+ * EMBEDDED — прямой доступ к данным без сетевого слоя (заготовка). */
 typedef enum { MCP_MODE_HTTP, MCP_MODE_EMBEDDED } McpMode;
 
+/* Конфигурация и состояние одного экземпляра MCP-сервера. */
 typedef struct {
     McpMode mode;
     char    gateway_url[512];   /* e.g. http://localhost:8080 */
@@ -27,6 +30,7 @@ typedef struct {
     int     initialized;
 } McpState;
 
+/* Глобальное состояние сервера (единственный экземпляр на процесс). */
 extern McpState g_mcp;
 
 /* ── Dispatch (main.c) ── */
@@ -46,6 +50,7 @@ void mcp_handle_tools_call(JVal *id, JVal *params, Arena *a);
 void mcp_jb_emit_jval(JBuf *jb, JVal *v);
 
 /* ── HTTP client (http_client.c) ── */
+/* Результат одного HTTP-запроса к gateway. */
 typedef struct {
     int   status;          /* HTTP status, -1 on transport error */
     char *body;            /* arena-owned */

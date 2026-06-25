@@ -49,6 +49,10 @@ static int buf_append(Arena *a, char **buf, size_t *cap, size_t *len,
     return 0;
 }
 
+/* Раскрывает {{ var }} в YAML-шаблоне и вырезает блок vars:.
+ * a — арена для всех аллокаций; src/srclen — исходный текст; keys/vals/nkvs —
+ * внешний словарь от вызывающего (перекрывает file-level vars:).
+ * Возвращает новую строку в арене, "" для NULL-входа, или NULL при OOM. */
 char *yaml_expand_vars(Arena *a,
                        const char *src, size_t srclen,
                        const char **keys, const char **vals, int nkvs) {

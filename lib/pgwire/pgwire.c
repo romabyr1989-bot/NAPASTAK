@@ -680,6 +680,10 @@ static void handle_close(PgConn *c, const uint8_t *body, size_t len) {
     send_simple_tag(c->fd, '3');                     /* CloseComplete */
 }
 
+/* Главный цикл обработки сообщений после успешной аутентификации:
+ * читает заголовок (тип + длина), затем тело и диспетчеризует по типу
+ * сообщения — Simple Query ('Q') и Extended Query ('P'/'B'/'D'/'E'/'C'/'S').
+ * Возвращает 0 при штатном Terminate, -1 при ошибке/обрыве соединения. */
 static int run_query_loop(PgConn *c) {
     while (c->srv->running) {
         uint8_t hdr[5];
@@ -736,6 +740,9 @@ static int run_query_loop(PgConn *c) {
     return 0;
 }
 
+/* Точка входа потока соединения: startup-хендшейк (с возможным SSL-пробом),
+ * cleartext-аутентификация, отправка стартовых ParameterStatus и переход в
+ * цикл запросов. На выходе освобождает состояние Extended Query и закрывает fd. */
 static void *connection_thread(void *arg) {
     PgConn *c = arg;
     LOG_INFO("pgwire: client connected fd=%d", c->fd);
@@ -788,6 +795,8 @@ done:
 }
 
 /* ── Accept loop ──────────────────────────────────────────────── */
+/* Цикл accept: на каждое входящее соединение выделяет PgConn и порождает
+ * отдельный detached-поток connection_thread с увеличенным стеком. */
 static void *accept_thread_fn(void *arg) {
     PgWireServer *s = arg;
     LOG_INFO("pgwire: listening on :%d", s->port);

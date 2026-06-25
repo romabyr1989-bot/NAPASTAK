@@ -17,7 +17,7 @@
 static inline size_t avro_decode_long(const uint8_t *p, size_t avail, int64_t *out)
 {
     uint64_t value = 0;
-    int      shift = 0;
+    int      shift = 0;      /* позиция текущей 7-битной группы в результате */
     size_t   i     = 0;
     while (i < avail) {
         uint8_t b = p[i++];
@@ -40,7 +40,8 @@ static inline size_t avro_decode_bytes(const uint8_t *p, size_t avail,
 {
     int64_t slen     = 0;
     size_t  consumed = avro_decode_long(p, avail, &slen);
-    *out = p + consumed;
+    *out = p + consumed;    /* указатель на данные сразу за префиксом длины */
     *len = slen;
+    /* отрицательную длину трактуем как пустую, чтобы не уйти в огромный size_t */
     return consumed + (slen > 0 ? (size_t)slen : 0);
 }

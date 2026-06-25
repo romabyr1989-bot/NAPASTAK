@@ -1,3 +1,9 @@
+/*
+ * auth.c — модуль аутентификации DataFlow OS.
+ * Реализует два механизма доступа: API-ключи (хранятся в SQLite) и
+ * JWT-токены (HS256/HMAC-SHA256). auth_check_request связывает их с
+ * HTTP-запросом, проверяя заголовки и query-параметры.
+ */
 #include "auth.h"
 #include "../core/log.h"
 #include "../net/http.h"
@@ -10,6 +16,7 @@
 #include <unistd.h>
 #include <strings.h>
 
+/* Кодирование в base64url (алфавит с '-'/'_', без паддинга) для частей JWT. */
 static int base64url_encode(const unsigned char *data, size_t len, char *out, size_t out_len) {
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t i = 0, j = 0;
@@ -28,6 +35,7 @@ static int base64url_encode(const unsigned char *data, size_t len, char *out, si
     return 0;
 }
 
+/* Обратное преобразование base64url в байты; b64d — таблица значений символов. */
 static int base64url_decode(const char *in, unsigned char *out, size_t out_len) {
     static const unsigned char b64d[256] = {
         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -49,6 +57,7 @@ static int base64url_decode(const char *in, unsigned char *out, size_t out_len) 
     return (int)j;
 }
 
+/* Открывает (или создаёт) SQLite-БД ключей и гарантирует наличие таблицы auth_keys. */
 AuthStore *auth_store_create(const char *db_path) {
     AuthStore *s = calloc(1, sizeof(AuthStore));
     if (sqlite3_open(db_path, &s->db) != SQLITE_OK) {
@@ -71,6 +80,7 @@ AuthStore *auth_store_create(const char *db_path) {
     return s;
 }
 
+/* Закрывает соединение с БД и освобождает хранилище. */
 void auth_store_destroy(AuthStore *s) {
     if (s) {
         sqlite3_close(s->db);
@@ -78,9 +88,12 @@ void auth_store_destroy(AuthStore *s) {
     }
 }
 
+/* Генерирует новый API-ключ ("dfo_" + hex случайных байт), сохраняет его в БД
+ * и возвращает строку ключа в key_out. */
 int auth_apikey_create(AuthStore *s, const char *user_id, AuthRole role,
                        char *key_out, size_t key_len) {
     unsigned char rand_bytes[AUTH_TOKEN_LEN];
+    /* Источник криптослучайности — /dev/urandom. */
     FILE *f = fopen("/dev/urandom", "rb");
     if (!f || fread(rand_bytes, 1, sizeof(rand_bytes), f) != sizeof(rand_bytes)) {
         if (f) fclose(f);
@@ -107,6 +120,7 @@ int auth_apikey_create(AuthStore *s, const char *user_id, AuthRole role,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Проверяет API-ключ по БД (только не отозванные) и заполняет claims_out. */
 int auth_apikey_verify(AuthStore *s, const char *key, AuthClaims *claims_out) {
     const char *sql = "SELECT user_id, role, created_at FROM auth_keys WHERE key = ? AND revoked = 0;";
     sqlite3_stmt *stmt;
@@ -129,6 +143,7 @@ int auth_apikey_verify(AuthStore *s, const char *key, AuthClaims *claims_out) {
     return -1;
 }
 
+/* Помечает ключ как отозванный (revoked = 1); сама запись не удаляется. */
 int auth_apikey_revoke(AuthStore *s, const char *key) {
     const char *sql = "UPDATE auth_keys SET revoked = 1 WHERE key = ?;";
     sqlite3_stmt *stmt;
@@ -141,6 +156,7 @@ int auth_apikey_revoke(AuthStore *s, const char *key) {
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Формирует подписанный JWT (HS256): header.payload.signature в base64url. */
 int auth_jwt_sign(const char *secret, const AuthClaims *claims,
                   char *token_out, size_t token_len) {
     // Header: {"alg":"HS256","typ":"JWT"}
@@ -174,6 +190,7 @@ int auth_jwt_sign(const char *secret, const AuthClaims *claims,
     return 0;
 }
 
+/* Проверяет подпись и срок действия JWT, извлекает sub/role/exp в claims_out. */
 int auth_jwt_verify(const char *secret, const char *token, AuthClaims *claims_out) {
     char *parts[3];
     char token_copy[2048];
@@ -181,6 +198,7 @@ int auth_jwt_verify(const char *secret, const char *token, AuthClaims *claims_ou
     char *p = token_copy;
     int i = 0;
     char *dot;
+    /* Разбиваем по первым двум точкам: header и payload; остаток — подпись. */
     while ((dot = strchr(p, '.')) && i < 2) {
         *dot = '\0';
         parts[i++] = p;
@@ -234,6 +252,9 @@ int auth_jwt_verify(const char *secret, const char *token, AuthClaims *claims_ou
     return 0;
 }
 
+/* Точка входа авторизации HTTP-запроса: пробует JWT/API-ключ из заголовка
+ * Authorization, затем X-Api-Key, затем query-параметр ?api_key=. Возвращает 0
+ * при успехе с заполненным claims_out, иначе -1. */
 int auth_check_request(AuthStore *s, const char *jwt_secret, void *req_void, AuthClaims *claims_out) {
     HttpReq *req = (HttpReq *)req_void;
     // Check Authorization header

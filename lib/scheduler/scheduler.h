@@ -1,14 +1,20 @@
 #pragma once
+/* scheduler.h — модель данных и API планировщика пайплайнов DataFlow OS.
+ * Описывает шаги (PipelineStep), пайплайны (Pipeline), триггеры запуска
+ * и фоновый поток-планировщик (Scheduler), а также сериализацию в/из JSON
+ * и функции крон-расписания. */
 #include "../core/arena.h"
 #include "../core/json.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
 
-#define MAX_STEPS    64
-#define MAX_TRIGGERS  8
+#define MAX_STEPS    64   /* верхний предел шагов в одном пайплайне */
+#define MAX_TRIGGERS  8   /* верхний предел триггеров запуска на пайплайн */
 
+/* Статус отдельного шага в рамках одного запуска. */
 typedef enum { STEP_PENDING=0, STEP_RUNNING, STEP_SUCCESS, STEP_FAILED } StepStatus;
+/* Статус запуска всего пайплайна. */
 typedef enum { RUN_PENDING=0, RUN_RUNNING, RUN_SUCCESS, RUN_FAILED, RUN_CANCELLED } RunStatus;
 
 /* Event-driven triggers — see docs/TRIGGERS.md.
@@ -21,6 +27,7 @@ typedef enum {
     /* TRIGGER_KAFKA_MSG / TRIGGER_DB_CHANGE reserved for future steps */
 } TriggerType;
 
+/* Одно условие запуска пайплайна; актуальные поля зависят от type. */
 typedef struct {
     TriggerType type;
     char        cron_expr[64];        /* TRIGGER_CRON */
@@ -30,6 +37,8 @@ typedef struct {
     char        file_pattern[64];     /* TRIGGER_FILE_ARRIVAL — glob ("*.csv") */
 } PipelineTrigger;
 
+/* Один шаг пайплайна. Тип шага определяется по непустым полям (SQL/Python/
+ * Scala/SCD2/sink/match); deps[] задаёт зависимости в DAG запуска. */
 typedef struct {
     char        id[64];
     char        name[128];
@@ -137,6 +146,8 @@ typedef struct {
     void *result_rs;
 } StepResultCache;
 
+/* Пайплайн: упорядоченный набор шагов плюс расписание/триггеры, состояние
+ * последнего запуска и настройки алертинга. */
 typedef struct {
     char          id[64];
     char          name[128];
@@ -170,6 +181,8 @@ typedef struct {
 /* Callback invoked in scheduler thread when a pipeline should run */
 typedef void (*RunCallback)(Pipeline *p, void *userdata);
 
+/* Состояние планировщика: реестр пайплайнов под защитой mu и фоновый поток,
+ * который сверяет next_run и дёргает on_run. */
 typedef struct {
     Pipeline       pipelines[256];
     int            npipelines;

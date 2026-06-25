@@ -44,6 +44,8 @@ void mcp_jb_emit_jval(JBuf *jb, JVal *v) {
     }
 }
 
+/* Сформировать и отправить JSON-RPC error-ответ с заданными code и message;
+ * id зеркалит id запроса (или null). Использует временную арену. */
 void mcp_send_error(JVal *id, int code, const char *msg) {
     Arena *a = arena_create(2048);
     JBuf b; jb_init(&b, a, 1024);
@@ -61,6 +63,9 @@ void mcp_send_error(JVal *id, int code, const char *msg) {
 }
 
 /* ── Dispatch ─────────────────────────────────────────────────── */
+/* Точка входа для одного входящего JSON-RPC сообщения: парсит, проверяет
+ * method/id и маршрутизирует на соответствующий обработчик. Уведомления
+ * (без id) при неизвестном методе игнорируются. */
 void mcp_handle_message(const char *json) {
     Arena *a = arena_create(64 * 1024);
     JVal *req = json_parse(a, json, strlen(json));
@@ -265,6 +270,8 @@ void mcp_handle_tools_list(JVal *id, JVal *params, Arena *a) {
 }
 
 /* ── tools/call ───────────────────────────────────────────────── */
+/* Диспетчеризация вызова инструмента по полю name: подбирает tool_*-функцию,
+ * собирает её текстовый вывод в content[0].text и проставляет isError. */
 void mcp_handle_tools_call(JVal *id, JVal *params, Arena *a) {
     if (!params || params->type != JV_OBJECT) {
         mcp_send_error(id, -32602, "Invalid params");
