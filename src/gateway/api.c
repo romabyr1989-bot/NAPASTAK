@@ -5490,6 +5490,16 @@ static bool error_is_nonretryable(const char *msg) {
         "no such", "not found", "does not exist", "unknown table", "unknown column",
         "no route to host", "name or service not known", "could not resolve",
         "connection refused", "unknown host",
+        /* transport refusals (libcurl/libpq phrasings) */
+        "couldn't connect", "could not connect", "no connection",
+        /* deterministic sink/config errors — these fail identically every time, so
+         * burning the whole retry-backoff budget on them only delays the failure */
+        "target table", "empty target",
+        "constraint", "violates", "duplicate key", "already exists", "no unique",
+        "invalid", "malformed",
+        /* Russian phrasings emitted by the pg/json_http connectors */
+        "не задан", "нет подключени", "целевая таблица", "недоступ",
+        "уже существ", "соединени",
         NULL
     };
     for (const char **n = needles; *n; n++)
