@@ -61,9 +61,8 @@
     <!-- ═══ Pipelines list + tables ═══ -->
     <section id="view-pipelines" class="view">
       <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
-        <button class="btn btn-primary btn-sm" style="min-width:136px;justify-content:center" onclick="openPipelineBuilder(null)" title="Создать новый конвейер в визуальном редакторе">+ Конвейер</button>
+        <button class="btn btn-primary btn-sm" onclick="openPipelineBuilder(null)" title="Создать новый конвейер в визуальном редакторе">+ Конвейер</button>
         <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="openYamlImport()" title="Импортировать YAML-описание конвейера">📄 Импорт YAML</button>
-        <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="loadPipelinesView()" title="Перезагрузить">↻ Обновить</button>
       </h1>
       <div id="pipelines-list"></div>
     </section>
@@ -77,11 +76,23 @@
       </div>
 
       <!-- Граф последовательности — на всю ширину -->
-      <div class="pb-flow-wrap">
-        <div id="pb-flow-graph" class="pb-flow-graph"></div>
+      <div class="pb-section" id="pb-sec-graph">
+        <div class="pb-section-head" onclick="pbToggleSection(this)">
+          <span class="pb-chevron">▾</span> Граф шагов
+        </div>
+        <div class="pb-section-body">
+          <div class="pb-flow-wrap" onclick="openFlowModal()" title="Открыть граф шагов крупнее">
+            <div id="pb-flow-graph" class="pb-flow-graph"></div>
+          </div>
+        </div>
       </div>
 
       <!-- Настройки — единая форма под графом -->
+      <div class="pb-section" id="pb-sec-settings">
+        <div class="pb-section-head" onclick="pbToggleSection(this)">
+          <span class="pb-chevron">▾</span> Общие настройки
+        </div>
+        <div class="pb-section-body">
       <div class="builder-settings">
       <div class="builder-settings-row">
         <div style="flex:1">
@@ -131,6 +142,8 @@
       </div>
 
       </div><!-- /.builder-settings -->
+        </div><!-- /.pb-section-body -->
+      </div><!-- /.pb-section (Общие настройки) -->
 
       <!-- Карточки шагов -->
       <div id="pb-steps"></div>
@@ -591,9 +604,17 @@
 
 <!-- Run history modal -->
 <div id="runs-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
-  <div class="modal-box">
+  <div class="modal-box" style="max-width:1100px;width:92%">
     <h2 id="runs-modal-title">История запусков</h2>
     <div id="runs-modal-body"></div>
+  </div>
+</div>
+
+<!-- Граф шагов крупнее -->
+<div id="flow-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
+  <div class="modal-box" style="max-width:1400px;width:94%;background:#131929;border:1.5px solid #4a5a82;box-shadow:0 8px 40px rgba(0,0,0,.5)">
+    <h2 style="text-align:center;color:#f1f5f9">Граф шагов конвейера</h2>
+    <div id="flow-modal-body" style="overflow:auto;max-height:78vh"></div>
   </div>
 </div>
 
@@ -640,11 +661,6 @@
 <div id="yaml-modal" class="modal hidden" onclick="if(event.target===this)this.classList.add('hidden')">
   <div class="modal-box" style="max-width:760px;width:90%">
     <h2>Импорт YAML-конвейера</h2>
-    <p style="font-size:.8rem;color:var(--muted);margin:.25rem 0 .75rem">
-      Вставь содержимое <code>.yaml</code>-файла, нажми <b>Проверить</b>,
-      посмотри JSON-результат, затем <b>Применить</b> — конвейер сохранится через REST API.
-      Поддерживается тот же subset что и <code>pipelines_dir</code>.
-    </p>
     <textarea id="yaml-input" rows="12"
       style="width:100%;font-family:var(--mono);font-size:.8rem;padding:.5rem"
       placeholder="name: my_etl&#10;triggers:&#10;  - type: cron&#10;    cron_expr: '@daily'&#10;steps:&#10;  - id: extract&#10;    transform_sql: SELECT 1&#10;    target_table: t"></textarea>

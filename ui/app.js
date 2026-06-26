@@ -153,9 +153,10 @@ function handleWsEvent(msg) {
   const ev = msg.event || msg.type || '';
   logActivity(ev + (msg.table ? ` — ${msg.table}` : '') + (msg.id ? ` — ${msg.id}` : ''));
   if (ev === 'table_updated')        { loadQuerySidebar(); }
-  if (ev === 'pipeline_created')     { loadPipelines(); }
-  if (ev === 'pipeline_run_started') { loadPipelines(); }
-  if (ev === 'pipeline_triggered')   { loadPipelines(); }
+  if (ev === 'pipeline_created')     { loadPipelines({ silent: true }); }
+  if (ev === 'pipeline_run_started') { loadPipelines({ silent: true }); }
+  if (ev === 'pipeline_triggered')   { loadPipelines({ silent: true }); }
+  if (ev === 'pipeline_done')        { loadPipelines({ silent: true }); }   /* завершение → обновить статус/историю */
 }
 
 function setBadge(cls, text) {
@@ -739,9 +740,11 @@ let _pipelinesPerPage = 10;   /* page size (Infinity = «Все») */
 let _pipelinesAll = [];
 let _pipelinesPage = 0;
 
-async function loadPipelines() {
+async function loadPipelines({ silent = false } = {}) {
   const list = document.getElementById('pipelines-list');
-  list.innerHTML = '<div style="color:var(--muted);padding:.5rem">Загрузка…</div>';
+  /* silent — обновление на месте (без «Загрузка…» и сброса страницы):
+     для запуска конвейера и WS-событий, чтобы не было мелькания/переброса. */
+  if (!silent) list.innerHTML = '<div style="color:var(--muted);padding:.5rem">Загрузка…</div>';
   try {
     const pipelines = await apiFetch('/api/pipelines');
     if (!pipelines) return;
@@ -757,7 +760,7 @@ async function loadPipelines() {
       return;
     }
     _pipelinesAll  = pipelines;
-    _pipelinesPage = 0;
+    if (!silent) _pipelinesPage = 0;   /* тихое обновление сохраняет текущую страницу */
     renderPipelinesPage();
   } catch (err) {
     list.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(String(err))}</div>`;
@@ -777,8 +780,10 @@ function renderPipelinesPage() {
   const start = all ? 0 : _pipelinesPage * perPage;
   const end   = all ? total : Math.min(start + perPage, total);
   const slice = all ? _pipelinesAll : _pipelinesAll.slice(start, end);
-  list.innerHTML = '';
-  slice.forEach(p => list.appendChild(makePipelineRow(p)));
+  /* Атомарная замена через фрагмент (без промежуточного innerHTML='',
+     который схлопывает список и перебрасывает прокрутку наверх). */
+  const frag = document.createDocumentFragment();
+  slice.forEach(p => frag.appendChild(makePipelineRow(p)));
   if (total > 0) {
     const nav = document.createElement('div');
     nav.className = 'pager';
@@ -793,8 +798,9 @@ function renderPipelinesPage() {
       `<label class="pager-size">На странице:
          <select onchange="pipelinesSetPerPage(this.value)">${opts}</select>
        </label>`;
-    list.appendChild(nav);
+    frag.appendChild(nav);
   }
+  list.replaceChildren(frag);
 }
 
 function pipelinesGoPage(p) {
@@ -813,6 +819,9 @@ const STATUS_LABELS = ['ожидание','выполняется','успех',
 const STATUS_BADGE  = ['badge-warn','badge-run','badge-ok','badge-err','badge-warn'];
 
 const _pipelineCache = {};
+/* id конвейеров, по которым прямо сейчас идёт ручной прогон (клиентский индикатор,
+   переживает ре-рендеры списка → карточка показывает «выполняется» до завершения). */
+const _runningPipelines = new Set();
 
 function makePipelineRow(p) {
   _pipelineCache[p.id] = p;
@@ -822,27 +831,28 @@ function makePipelineRow(p) {
     if (e.target.closest('button')) return;
     openPipelineBuilder(_pipelineCache[p.id]);
   };
-  const status = p.status || 0;
+  const running = _runningPipelines.has(p.id);
+  const status  = running ? 1 : (p.status || 0);   /* 1 = выполняется */
   const steps  = (p.steps || []).map(s =>
     `<span class="step-badge">${escHtml(s.name || s.id || 'step')}</span>`).join('');
   const nextRunStr = p.next_run && p.next_run > 0 && p.next_run < 9e15
-    ? new Date(p.next_run * 1000).toLocaleString() : '—';
+    ? new Date(p.next_run * 1000).toLocaleString('ru') : '—';
   div.innerHTML = `
     <div style="flex:1;min-width:0">
       <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
         <span class="pipeline-name">${escHtml(p.name || p.id)}</span>
-        <span class="badge ${STATUS_BADGE[status]}">${STATUS_LABELS[status]}</span>
+        <span class="badge ${STATUS_BADGE[status]}">${running ? 'выполняется' : STATUS_LABELS[status]}</span>
         ${!p.enabled ? '<span class="badge badge-warn">отключён</span>' : ''}
       </div>
       <div class="pipeline-meta">
         расписание: <code>${escHtml(p.cron || 'вручную')}</code>
-        &nbsp;·&nbsp; последний запуск: ${p.last_run ? new Date(p.last_run * 1000).toLocaleString() : '—'}
+        &nbsp;·&nbsp; последний запуск: ${p.last_run ? new Date(p.last_run * 1000).toLocaleString('ru') : '—'}
         &nbsp;·&nbsp; следующий: ${nextRunStr}
       </div>
       <div class="step-list">${steps}</div>
     </div>
     <div class="pipeline-actions">
-      <button class="btn btn-sm btn-primary" onclick="triggerPipeline('${escAttr(p.id)}')">▶ Запустить</button>
+      <button class="btn btn-sm btn-primary${running ? ' pulse' : ''}" onclick="triggerPipeline('${escAttr(p.id)}')">${running ? 'Выполняется…' : '▶ Запустить'}</button>
       <button class="btn btn-sm" onclick="showPipelineRuns('${escAttr(p.id)}','${escAttr(p.name||p.id)}')">История</button>
       <button class="btn btn-sm btn-danger" onclick="deletePipeline('${escAttr(p.id)}','${escAttr(p.name||p.id)}')">✕</button>
     </div>
@@ -851,13 +861,29 @@ function makePipelineRow(p) {
 }
 
 async function triggerPipeline(id) {
+  if (_runningPipelines.has(id)) return;     /* уже идёт */
+  _runningPipelines.add(id);
+  renderPipelinesPage();                     /* мгновенно: карточка → «выполняется», кнопка disabled */
+  showToast('Запуск конвейера…', 'info');
+  logActivity(`запуск конвейера ${id}`);
   try {
     await apiPost(`/api/pipelines/${id}/run`, {});
-    showToast('Конвейер запущен', 'ok');
-    logActivity(`запущен конвейер ${id}`);
-    setTimeout(loadPipelines, 600);
+    /* Бэкенд выполняет конвейер синхронно и всегда отвечает "triggered",
+       поэтому реальный исход берём из последнего прогона. */
+    let last = null;
+    try {
+      const runs = await apiFetch(`/api/pipelines/${id}/runs`);
+      if (Array.isArray(runs) && runs.length) last = runs[0];
+    } catch (_) {}
+    if (last && last.status !== 0)
+      showToast('Конвейер завершился с ошибкой: ' + (humanizeError(last.error) || 'см. историю'), 'error');
+    else
+      showToast('Конвейер выполнен', 'ok');
   } catch (err) {
-    showToast(String(err), 'error');
+    showToast('Не удалось запустить: ' + (humanizeError(String(err)) || String(err)), 'error');
+  } finally {
+    _runningPipelines.delete(id);
+    loadPipelines({ silent: true });         /* снять индикатор + показать итоговый статус */
   }
 }
 
@@ -866,8 +892,44 @@ async function deletePipeline(id, name) {
   try {
     await apiFetch(`/api/pipelines/${id}`, 'DELETE');
     showToast(`Конвейер "${name || id}" удалён`, 'ok');
-    loadPipelines();
+    loadPipelines({ silent: true });
   } catch (err) { showToast(String(err), 'error'); }
+}
+
+/* Перевод технической ошибки прогона в человекопонятный русский текст.
+   Полный оригинал сохраняется в подсказке (title), здесь — короткая суть. */
+function humanizeError(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  const low = s.toLowerCase();
+  const stepM = s.match(/(\w+)\s+step\s+(s\d+)/i);
+  const step  = stepM ? ` (шаг ${stepM[2]})` : '';
+  let msg = null;
+  if (low.includes('write_batch failed') || (low.includes('sink') && low.includes('fail')))
+    msg = 'Не удалось записать данные в приёмник';
+  else if (low.includes('traceback') || low.includes('python step')) {
+    const k = s.match(/KeyError:\s*'([^']+)'/);
+    const f = s.match(/(\w+Error):/);
+    msg = k ? `Ошибка Python: нет столбца «${k[1]}»`
+        : (f ? `Ошибка Python: ${f[1]}` : 'Ошибка в Python-шаге');
+  }
+  else if (low.includes('scala step')) msg = 'Ошибка в Scala-шаге';
+  else if (low.includes('parse') || low.includes('syntax') || /near ['"]/.test(low))
+    msg = 'Ошибка в SQL-запросе';
+  else if (low.includes('connection refused') || low.includes('could not connect') || low.includes('connect failed'))
+    msg = 'Не удалось подключиться к источнику/приёмнику';
+  else if (low.includes('timeout') || low.includes('timed out'))
+    msg = 'Превышено время ожидания (таймаут)';
+  else if (low.includes('unauthorized') || low.includes('permission denied') || low.includes('password') || low.includes('access denied'))
+    msg = 'Ошибка доступа/авторизации';
+  else if (low.includes('not found') || low.includes('no such table') || low.includes('does not exist'))
+    msg = 'Объект не найден (таблица/файл/ресурс)';
+  else if (low.includes('exit='))
+    msg = 'Шаг завершился с ошибкой';
+  if (msg) return msg + step;
+  /* запасной вариант — первая строка, обрезанная */
+  const first = s.split('\n')[0];
+  return first.length > 100 ? first.slice(0, 100) + '…' : first;
 }
 
 async function showPipelineRuns(id, name) {
@@ -893,19 +955,17 @@ async function showPipelineRuns(id, name) {
       <div class="mstat-row"><span class="mstat-k">Средняя длительность</span><span class="mstat-v">${avgD.toFixed(1)} с</span></div>
       <div class="mstat-row"><span class="mstat-k">Макс. длительность</span><span class="mstat-v">${maxD} с</span></div>
     </div>`;
-    let html = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Длит.</th><th>Повторы</th><th>Ошибка</th></tr></thead><tbody>';
+    let html = '<table class="runs-table"><thead><tr><th>Начало</th><th>Статус</th><th>Длит.</th><th>Повторы</th><th>Ошибка</th></tr></thead><tbody>';
     list.forEach(r => {
       const statusLabel = r.status === 0 ? '<span class="badge badge-ok">успех</span>'
         : '<span class="badge badge-err">ошибка</span>';
       const dur = (r.started && r.finished) ? (r.finished - r.started) + ' с' : '—';
       html += `<tr>
-        <td>${r.id}</td>
-        <td>${r.started ? new Date(r.started*1000).toLocaleString() : '—'}</td>
-        <td>${r.finished ? new Date(r.finished*1000).toLocaleString() : '—'}</td>
+        <td>${r.started ? new Date(r.started*1000).toLocaleString('ru') : '—'}</td>
         <td>${statusLabel}</td>
         <td>${dur}</td>
         <td>${typeof r.retry_count === 'number' ? r.retry_count : 0}</td>
-        <td>${escHtml(r.error || '')}</td>
+        <td title="${escAttr(r.error || '')}" style="${r.error ? 'color:var(--red)' : ''}">${escHtml(humanizeError(r.error))}</td>
       </tr>`;
     });
     html += '</tbody></table>';
@@ -971,6 +1031,7 @@ function openPipelineBuilder(pipeline) {
 
   renderBuilderSteps();
   renderTriggers();
+  pbRestoreSections();   /* применить сохранённое сворачивание секций */
 
   /* Push a pipeline-specific URL so F5 can restore the same builder context.
    * Use switchView with pushState:false so it doesn't push generic '#builder'
@@ -1161,6 +1222,39 @@ function pbAddStep() {
   if (last) last.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+/* Свернуть/развернуть секцию конструктора (Граф шагов / Общие настройки).
+   Состояние сохраняется в localStorage по id секции → переживает перезагрузку. */
+function pbToggleSection(head) {
+  const sec = head.closest('.pb-section');
+  if (!sec) return;
+  const collapsed = sec.classList.toggle('collapsed');
+  if (sec.id) try {
+    const m = JSON.parse(localStorage.getItem('dfo_pb_sections') || '{}');
+    m[sec.id] = collapsed;
+    localStorage.setItem('dfo_pb_sections', JSON.stringify(m));
+  } catch (_) {}
+}
+
+/* Применить сохранённое состояние секций (вызывается при открытии конструктора). */
+function pbRestoreSections() {
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem('dfo_pb_sections') || '{}'); } catch (_) {}
+  Object.entries(m).forEach(([id, collapsed]) => {
+    const sec = document.getElementById(id);
+    if (sec) sec.classList.toggle('collapsed', !!collapsed);
+  });
+}
+
+/* Свернуть/развернуть карточку шага. Состояние в _collapsed попадает в черновик
+   (snapshotBuilder хранит сырые шаги) → переживает перезагрузку. */
+function pbToggleStep(idx) {
+  const card = document.getElementById(`step-card-${idx}`);
+  if (!card) return;
+  const collapsed = card.classList.toggle('collapsed');
+  if (pb.steps[idx]) pb.steps[idx]._collapsed = collapsed;
+  saveBuilderDraft();
+}
+
 function pbRemoveStep(idx) {
   pb.steps.splice(idx, 1);
   /* fix dep references: remove refs to deleted step, shift down refs > idx */
@@ -1168,17 +1262,6 @@ function pbRemoveStep(idx) {
     s.deps = (s.deps || [])
       .filter(d => d !== idx)
       .map(d => d > idx ? d - 1 : d);
-  });
-  renderBuilderSteps();
-}
-
-function pbMoveStep(idx, dir) {
-  const newIdx = idx + dir;
-  if (newIdx < 0 || newIdx >= pb.steps.length) return;
-  [pb.steps[idx], pb.steps[newIdx]] = [pb.steps[newIdx], pb.steps[idx]];
-  /* fix dep references: swap idx and newIdx */
-  pb.steps.forEach(s => {
-    s.deps = (s.deps || []).map(d => d === idx ? newIdx : d === newIdx ? idx : d);
   });
   renderBuilderSteps();
 }
@@ -1797,6 +1880,33 @@ function renderBuilderSteps() {
   });
 }
 
+/* Цвет узла графа по типу шага — для цветовой индикации разных типов. */
+function stepColor(t) {
+  /* Приглушённая палитра — спокойные тона, белый текст бейджа читается. */
+  if (t.startsWith('sink:'))         return '#c0894f';  /* приёмник — приглушённый янтарный */
+  if (CONNECTOR_TYPES.includes(t))   return '#5e9b78';  /* источник — приглушённый зелёный */
+  if (t === 'python')                return '#b3994d';  /* Python — приглушённое золото */
+  if (t === 'scala')                 return '#bd6f6f';  /* Scala — приглушённый красный */
+  if (t === 'matchrules')            return '#8d7cb3';  /* MDM-сопоставление — приглушённый фиолетовый */
+  if (t === 'scd2')                  return '#519089';  /* SCD2 — приглушённый бирюзовый */
+  return '#6b7cc2';                                     /* SQL-трансформация — приглушённый синий */
+}
+
+/* Короткая подпись типа шага для бейджа на ноде графа. */
+function stepTypeShort(t) {
+  if (t.startsWith('sink:'))       return 'ПРИЁМНИК';
+  if (CONNECTOR_TYPES.includes(t)) return 'ИСТОЧНИК';
+  return { python: 'PYTHON', scala: 'SCALA', matchrules: 'MDM', scd2: 'SCD2', sql: 'SQL' }[t] || 'SQL';
+}
+
+/* Открыть граф шагов крупнее в отдельной модалке (клон текущего SVG). */
+function openFlowModal() {
+  const src = document.getElementById('pb-flow-graph');
+  if (!src || !src.innerHTML.trim()) return;   /* нет шагов — нечего показывать */
+  document.getElementById('flow-modal-body').innerHTML = src.innerHTML;
+  document.getElementById('flow-modal').classList.remove('hidden');
+}
+
 function renderFlowGraph() {
   const wrap = document.getElementById('pb-flow-graph');
   if (!wrap) return;
@@ -1808,15 +1918,47 @@ function renderFlowGraph() {
   }
   if (outer) outer.style.display = '';
 
-  const NW = 200, NH = 80, GAP = 52, PADX = 20, PADY = 28;
-  const W = pb.steps.length * (NW + GAP) - GAP + PADX * 2;
-  const H = NH + PADY * 2;
-
+  const steps = pb.steps;
   const ACCENT  = '#5b6ef5';
   const NODE_BG = '#252d4a';
   const TEXT    = '#f1f5f9';
   const SUB     = '#94a3b8';
-  const BADGE_BG= '#5b6ef5';
+
+  /* deps → индексы шагов (поддержка и числовых индексов, и строковых id);
+     самозависимость отбрасывается. */
+  const depIdx = (st, self) => (st.deps || [])
+    .map(d => typeof d === 'number' ? d : steps.findIndex(x => x.id === d))
+    .filter(j => j >= 0 && j < steps.length && j !== self);
+
+  /* Уровень (колонка) = длиннейший путь от корней (шагов без зависимостей).
+     Шаги одного уровня без связи между собой идут параллельно. */
+  const level = new Array(steps.length).fill(0);
+  for (let pass = 0; pass < steps.length; pass++) {
+    let changed = false;
+    steps.forEach((st, i) => {
+      const ds = depIdx(st, i);
+      const lv = ds.length ? Math.max(...ds.map(d => level[d] + 1)) : 0;
+      if (lv > level[i]) { level[i] = lv; changed = true; }
+    });
+    if (!changed) break;
+  }
+  /* защита от циклов/битых deps: уровень не выше числа шагов */
+  for (let i = 0; i < steps.length; i++) level[i] = Math.min(level[i], steps.length - 1);
+  const maxLevel = Math.max(0, ...level);
+  /* ряд шага внутри его уровня (параллельные шаги — стопкой) */
+  const rowOf = new Array(steps.length);
+  let maxRows = 1;
+  for (let lv = 0; lv <= maxLevel; lv++) {
+    let r = 0;
+    steps.forEach((_, i) => { if (level[i] === lv) rowOf[i] = r++; });
+    maxRows = Math.max(maxRows, r);
+  }
+
+  const NW = 200, NH = 80, GX = 72, GY = 52, PADX = 34, PADY = 48;
+  const posX = i => PADX + level[i] * (NW + GX);
+  const posY = i => PADY + rowOf[i] * (NH + GY);
+  const W = (maxLevel + 1) * (NW + GX) - GX + PADX * 2;
+  const H = maxRows * (NH + GY) - GY + PADY * 2;
 
   let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -1825,34 +1967,39 @@ function renderFlowGraph() {
     </marker>
   </defs>`;
 
-  pb.steps.forEach((step, i) => {
-    const x = PADX + i * (NW + GAP), y = PADY;
-    const cx = x + NW / 2;
+  /* Связи: от правого края каждой зависимости к левому краю шага (кривая Безье,
+     чтобы аккуратно соединять параллельные ветки на разных рядах). */
+  steps.forEach((st, i) => {
+    depIdx(st, i).forEach(d => {
+      const x1 = posX(d) + NW, y1 = posY(d) + NH / 2;
+      const x2 = posX(i) - 3,  y2 = posY(i) + NH / 2;
+      const mx = (x1 + x2) / 2;
+      s += `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+              fill="none" stroke="${ACCENT}" stroke-width="2" marker-end="url(#arh)"/>`;
+    });
+  });
+
+  /* Узлы */
+  steps.forEach((step, i) => {
+    const x = posX(i), y = posY(i), cx = x + NW / 2;
     const name  = (step.name || `Шаг ${i + 1}`).slice(0, 24);
     const table = step.target_table ? step.target_table.slice(0, 26) : '';
+    const tp    = stepType(step);
+    const col   = stepColor(tp);               /* цвет рамки/бейджа по типу шага */
+    const tShort = stepTypeShort(tp);          /* подпись типа на бейдже */
+    const bw = Math.max(52, tShort.length * 7 + 18), bh = 20, bx = cx - bw / 2, by = y - bh - 6;
 
-    if (i > 0) {
-      const x0 = x - GAP, my = y + NH / 2;
-      s += `<line x1="${x0}" y1="${my}" x2="${x - 3}" y2="${my}"
-              stroke="${ACCENT}" stroke-width="2" marker-end="url(#arh)"/>`;
-    }
-
-    /* badge pill sits above the node with 10px gap */
-    const bw = 52, bh = 20, bx = cx - bw / 2, by = y - bh - 6;
-
-    s += `<g onclick="document.getElementById('step-card-${i}')?.scrollIntoView({behavior:'smooth',block:'nearest'})" style="cursor:pointer">
+    s += `<g onclick="event.stopPropagation();document.getElementById('step-card-${i}')?.scrollIntoView({behavior:'smooth',block:'nearest'})" style="cursor:pointer">
       <rect x="${x}" y="${y}" width="${NW}" height="${NH}" rx="10"
-            fill="${NODE_BG}" stroke="${ACCENT}" stroke-width="2"/>
+            fill="${NODE_BG}" stroke="${col}" stroke-width="2.5"/>
       <rect x="${bx}" y="${by}" width="${bw}" height="${bh}" rx="10"
-            fill="${BADGE_BG}"/>
+            fill="${col}"/>
       <text x="${cx}" y="${by + 14}" text-anchor="middle" font-size="10" font-weight="700"
-            fill="#fff" font-family="system-ui,sans-serif" letter-spacing=".05em">ШАГ ${i + 1}</text>
+            fill="#fff" font-family="system-ui,sans-serif" letter-spacing=".05em">${tShort}</text>
       <text x="${cx}" y="${y + 30}" text-anchor="middle" font-size="13" font-weight="600"
             fill="${TEXT}" font-family="system-ui,sans-serif">${escHtml(name)}</text>
       ${table ? `<text x="${cx}" y="${y + 52}" text-anchor="middle" font-size="11"
-            fill="${SUB}" font-family="system-ui,sans-serif"
-            onclick="event.stopPropagation();document.getElementById('step-card-${i}')?.scrollIntoView({behavior:'smooth',block:'nearest'});runStepPreview(${i})"
-            style="cursor:pointer;text-decoration:underline">→ ${escHtml(table)}</text>` : ''}
+            fill="${SUB}" font-family="system-ui,sans-serif">→ ${escHtml(table)}</text>` : ''}
     </g>`;
   });
 
@@ -1862,7 +2009,7 @@ function renderFlowGraph() {
 
 function makeStepCard(step, idx) {
   const div = document.createElement('div');
-  div.className = 'step-card';
+  div.className = 'step-card' + (step._collapsed ? ' collapsed' : '');
   div.id = `step-card-${idx}`;
   const t = stepType(step);
   const isTransform = ['sql','python','scala'].includes(t);
@@ -1888,14 +2035,11 @@ function makeStepCard(step, idx) {
       </div>`;
   div.innerHTML = `
     <div class="step-header">
+      <button class="step-collapse" onclick="pbToggleStep(${idx})" title="Свернуть / развернуть шаг" aria-label="Свернуть / развернуть">▾</button>
       <span class="step-num">${idx + 1}</span>
       <input class="step-name-input" type="text" placeholder="Название шага"
              value="${escAttr(step.name)}"
              oninput="pbUpdateStep(${idx},'name',this.value);renderFlowGraph()">
-      <div class="step-move-btns">
-        ${idx > 0                      ? `<button class="btn btn-sm" onclick="pbMoveStep(${idx},-1)" title="Вверх">↑</button>` : ''}
-        ${idx < pb.steps.length - 1   ? `<button class="btn btn-sm" onclick="pbMoveStep(${idx}, 1)" title="Вниз">↓</button>` : ''}
-      </div>
       <button class="step-del" onclick="pbRemoveStep(${idx})" title="Удалить шаг" aria-label="Удалить шаг">×</button>
     </div>
     <div class="step-body">
@@ -2545,7 +2689,7 @@ function metricsPagerHTML(total, start, end, pages, page, all, perPage, goFn, si
 
 function metricPipeCardHTML(p) {
   const st    = p.status || 0;
-  const last  = p.last_run ? new Date(p.last_run * 1000).toLocaleString() : 'не запускался';
+  const last  = p.last_run ? new Date(p.last_run * 1000).toLocaleString('ru') : 'не запускался';
   const sched = p.cron ? `расписание: ${escHtml(p.cron)}` : 'вручную';
   return `<div class="pipeline-item pipeline-item-clickable" title="Метрики конвейера"
                onclick="showPipelineRuns('${escAttr(p.id)}','${escAttr(p.name || p.id)}')">
@@ -2564,7 +2708,7 @@ function metricPipeCardHTML(p) {
 function metricMvCardHTML(v) {
   const badge = v.last_error ? 'badge-err' : (v.is_stale ? 'badge-warn' : 'badge-ok');
   const lbl   = v.last_error ? 'ошибка' : (v.is_stale ? 'устарело' : 'актуально');
-  const when  = v.last_refreshed_at ? new Date(v.last_refreshed_at * 1000).toLocaleString() : 'не обновлялась';
+  const when  = v.last_refreshed_at ? new Date(v.last_refreshed_at * 1000).toLocaleString('ru') : 'не обновлялась';
   return `<div class="pipeline-item pipeline-item-clickable" title="Метрики витрины"
                onclick="showMatviewMetrics('${escAttr(v.name)}')">
     <div style="flex:1;min-width:0">
@@ -2716,8 +2860,8 @@ async function showMatviewMetrics(name) {
   const avgD = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : 0;
   const maxD = durs.length ? Math.max(...durs) : 0;
   const lastRows = runs.length ? runs[0].row_count : (mv ? mv.row_count : 0);
-  const when = (mv && mv.last_refreshed_at) ? new Date(mv.last_refreshed_at * 1000).toLocaleString()
-             : (runs.length && runs[0].finished ? new Date(runs[0].finished * 1000).toLocaleString() : 'не обновлялась');
+  const when = (mv && mv.last_refreshed_at) ? new Date(mv.last_refreshed_at * 1000).toLocaleString('ru')
+             : (runs.length && runs[0].finished ? new Date(runs[0].finished * 1000).toLocaleString('ru') : 'не обновлялась');
   const status = (mv && mv.last_error) ? '<span class="badge badge-err">ошибка</span>'
     : (mv && mv.is_stale ? '<span class="badge badge-warn">устарело</span>' : '<span class="badge badge-ok">актуально</span>');
 
@@ -2734,17 +2878,15 @@ async function showMatviewMetrics(name) {
 
   let table;
   if (runs.length) {
-    table = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Строк</th><th>Длит., мс</th><th>Ошибка</th></tr></thead><tbody>'
+    table = '<table class="runs-table"><thead><tr><th>Начало</th><th>Статус</th><th>Строк</th><th>Длит., мс</th><th>Ошибка</th></tr></thead><tbody>'
       + runs.map(r => {
           const st = r.status === 0 ? '<span class="badge badge-ok">успех</span>' : '<span class="badge badge-err">ошибка</span>';
           return `<tr>
-            <td>${r.id}</td>
-            <td>${r.started ? new Date(r.started * 1000).toLocaleString() : '—'}</td>
-            <td>${r.finished ? new Date(r.finished * 1000).toLocaleString() : '—'}</td>
+            <td>${r.started ? new Date(r.started * 1000).toLocaleString('ru') : '—'}</td>
             <td>${st}</td>
             <td>${fmtNum(r.row_count || 0)}</td>
             <td>${r.duration_ms ?? 0}</td>
-            <td>${escHtml(r.error || '')}</td>
+            <td title="${escAttr(r.error || '')}" style="${r.error ? 'color:var(--red)' : ''}">${escHtml(humanizeError(r.error))}</td>
           </tr>`;
         }).join('')
       + '</tbody></table>';
