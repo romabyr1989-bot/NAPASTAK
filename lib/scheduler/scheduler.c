@@ -477,6 +477,21 @@ Pipeline *scheduler_find(Scheduler *s, const char *id) {
     return found;
 }
 
+void scheduler_finish_run(Scheduler *s, const char *id, int run_status,
+                          int last_run_failed, const char *error_msg) {
+    pthread_mutex_lock(&s->mu);
+    for(int i=0;i<s->npipelines;i++)
+        if(strcmp(s->pipelines[i].id,id)==0){
+            s->pipelines[i].run_status      = run_status;
+            s->pipelines[i].last_run_failed = last_run_failed;
+            if(error_msg)
+                snprintf(s->pipelines[i].error_msg,
+                         sizeof(s->pipelines[i].error_msg), "%s", error_msg);
+            break;
+        }
+    pthread_mutex_unlock(&s->mu);
+}
+
 /* Запуск/останов фонового потока планировщика; stop дожидается завершения потока. */
 void scheduler_start(Scheduler *s) { s->running=1; pthread_create(&s->thread,NULL,sched_loop,s); }
 void scheduler_stop(Scheduler *s)  { s->running=0; pthread_join(s->thread,NULL); }

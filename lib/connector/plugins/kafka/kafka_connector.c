@@ -36,6 +36,7 @@ typedef struct {
     char  group_id[128];
     char  topic_name[128];
     char  data_format[16];   /* "json" | "csv" | "avro" */
+    char  addr_family[8];    /* broker.address.family: v4 | v6 | any (default v4) */
 
     /* Security (managed Kafka: Confluent Cloud / MSK / Aiven need SASL_SSL) */
     char  security_protocol[32];  /* PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL */
@@ -49,6 +50,11 @@ typedef struct {
     char  schema_registry_url[512];  /* e.g. "http://registry:8081" */
     char  sr_auth[256];              /* optional "user:pass" basic auth */
     AvroSchemaCache *schema_cache;   /* id → parsed Avro schema (lazy) */
+
+    /* Set by rd_kafka error_cb when librdkafka reports that every configured
+     * broker is unreachable (RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN). Lets a read
+     * distinguish "broker down" (hard error) from "topic drained" (0 rows OK). */
+    atomic_int      all_brokers_down;
 
     DfoCdcHandler   cdc_handler;
     void           *cdc_userdata;
@@ -86,6 +92,28 @@ static void cfg_str(const char *cfg, const char *key, char *dst, size_t dstsz)
 }
 
 /* ── Kafka rdkafka helpers ── */
+
+/* rd_kafka error callback. librdkafka delivers asynchronous, cluster-level
+ * errors here (the per-message ->err only covers consume-time issues). We latch
+ * RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN so a subsequent read_batch can fail loudly
+ * instead of silently returning 0 rows when nothing is actually reachable. The
+ * opaque is the KafkaCtx (set via rd_kafka_conf_set_opaque in make_consumer). */
+static void kafka_error_cb(rd_kafka_t *rk, int err, const char *reason, void *opaque)
+{
+    (void)rk;
+    KafkaCtx *ctx = (KafkaCtx *)opaque;
+    if (!ctx) return;
+    if ((rd_kafka_resp_err_t)err == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
+        atomic_store(&ctx->all_brokers_down, 1);
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "all brokers down (%s): %s",
+                 ctx->brokers, reason ? reason : "no reachable broker");
+        LOG_WARN("kafka: all brokers down: %s", reason ? reason : "");
+    } else {
+        LOG_WARN("kafka: error_cb [%s]: %s",
+                 rd_kafka_err2name((rd_kafka_resp_err_t)err), reason ? reason : "");
+    }
+}
 
 /* Apply SASL/SSL security settings to a conf (consumer or producer). Each key
  * is set only when non-empty, so plaintext clusters keep working unchanged.
@@ -127,7 +155,19 @@ static rd_kafka_t *make_consumer(const KafkaCtx *ctx, char *errstr, size_t errle
         rd_kafka_conf_destroy(conf);
         return NULL;
     }
+    /* Force IPv4 by default: "localhost" resolves to ::1 first on many hosts,
+     * but most Kafka/Redpanda brokers listen only on IPv4 — librdkafka then
+     * reports "all brokers down". Overridable via broker_address_family. */
+    rd_kafka_conf_set(conf, "broker.address.family",
+                      ctx->addr_family[0] ? ctx->addr_family : "v4", errstr, errlen);
+
     kafka_apply_security(conf, ctx, errstr, errlen);
+
+    /* Latch cluster-level errors (all-brokers-down) into ctx via the opaque so a
+     * read can fail instead of silently returning 0 rows. ctx is the connector's
+     * own context; the cast drops const only because the conf API is untyped. */
+    rd_kafka_conf_set_opaque(conf, (void *)ctx);
+    rd_kafka_conf_set_error_cb(conf, kafka_error_cb);
 
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, errlen);
     if (!rk) return NULL;
@@ -148,7 +188,10 @@ static ColBatch *batch_from_raw(Arena *a, const char *payload, size_t payload_le
     schema->ncols  = 2;
     schema->cols   = arena_alloc(a, 2 * sizeof(ColDef));
     schema->cols[0].name     = "kafka_offset";
-    schema->cols[0].type     = COL_INT64;
+    schema->cols[0].type     = COL_TEXT;   /* TEXT like every other column — a
+                                            * native COL_INT64 leaks its raw value
+                                            * as a char* on read-back (offset 1 ->
+                                            * (char*)0x1) and crashes SELECT. */
     schema->cols[0].nullable = false;
     schema->cols[1].name     = "value";
     schema->cols[1].type     = COL_TEXT;
@@ -159,8 +202,9 @@ static ColBatch *batch_from_raw(Arena *a, const char *payload, size_t payload_le
     batch->ncols   = 2;
     batch->nrows   = 1;
 
-    int64_t *offsets = arena_alloc(a, sizeof(int64_t));
-    offsets[0] = offset_val;
+    char **offsets = arena_alloc(a, sizeof(char *));
+    char obuf[24]; snprintf(obuf, sizeof(obuf), "%lld", (long long)offset_val);
+    offsets[0] = arena_strdup(a, obuf);
     batch->values[0] = offsets;
     batch->null_bitmap[0] = arena_calloc(a, 1);
 
@@ -188,7 +232,10 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
     schema->cols   = arena_alloc(a, ncols * sizeof(ColDef));
 
     schema->cols[0].name     = "kafka_offset";
-    schema->cols[0].type     = COL_INT64;
+    schema->cols[0].type     = COL_TEXT;   /* TEXT like every other column — a
+                                            * native COL_INT64 leaks its raw value
+                                            * as a char* on read-back (offset 1 ->
+                                            * (char*)0x1) and crashes SELECT. */
     schema->cols[0].nullable = false;
 
     for (size_t i = 0; i < root->nkeys; i++) {
@@ -198,7 +245,11 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
         if (!v || v->type == JV_NULL)
             schema->cols[i + 1].type = COL_TEXT;
         else if (v->type == JV_NUMBER)
-            schema->cols[i + 1].type = COL_DOUBLE;
+            /* Numbers are stored as TEXT (like the PG/Oracle connectors and the
+             * engine's text storage). A native COL_DOUBLE column crashes the
+             * engine on read-back (SELECT) — text avoids it and preserves the
+             * value without float surprises. */
+            schema->cols[i + 1].type = COL_TEXT;
         else if (v->type == JV_BOOL)
             schema->cols[i + 1].type = COL_BOOL;
         else
@@ -211,8 +262,9 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
     batch->nrows  = 1;
 
     /* offset column */
-    int64_t *offsets = arena_alloc(a, sizeof(int64_t));
-    offsets[0] = offset_val;
+    char **offsets = arena_alloc(a, sizeof(char *));
+    char obuf[24]; snprintf(obuf, sizeof(obuf), "%lld", (long long)offset_val);
+    offsets[0] = arena_strdup(a, obuf);
     batch->values[0] = offsets;
     batch->null_bitmap[0] = arena_calloc(a, 1);
 
@@ -224,14 +276,24 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
         batch->null_bitmap[i + 1] = arena_calloc(a, 1);
 
         if (!v || v->type == JV_NULL) {
+            /* NULL contract: a missing/JSON-null field is materialized as the
+             * DFO_NULL_SENTINEL string (not a NULL pointer, not ""). The null
+             * bitmap is kept set so any null-aware consumer also sees it. */
             char **sv = arena_alloc(a, sizeof(char *));
-            sv[0] = NULL;
+            sv[0] = arena_strdup(a, DFO_NULL_SENTINEL);
             batch->values[i + 1] = sv;
             batch->null_bitmap[i + 1][0] = 1;
-        } else if (ct == COL_DOUBLE) {
-            double *dv = arena_alloc(a, sizeof(double));
-            dv[0] = v->n;
-            batch->values[i + 1] = dv;
+        } else if (v->type == JV_NUMBER) {
+            /* Format the number to TEXT from v->n. NOTE: JVal is a union — for a
+             * JV_NUMBER, v->s aliases v->n, so the generic text branch below
+             * (arena_strndup(v->s,v->len)) would read garbage. Format here.
+             * %.10g matches the engine's numeric rendering and prints integers
+             * cleanly (5 -> "5", 123.45 -> "123.45"). */
+            char numbuf[40];
+            snprintf(numbuf, sizeof(numbuf), "%.10g", v->n);
+            char **sv = arena_alloc(a, sizeof(char *));
+            sv[0] = arena_strdup(a, numbuf);
+            batch->values[i + 1] = sv;
         } else if (ct == COL_BOOL) {
             int64_t *iv = arena_alloc(a, sizeof(int64_t));
             iv[0] = v->b ? 1 : 0;
@@ -405,10 +467,16 @@ static ColBatch *batch_from_avro(KafkaCtx *ctx, Arena *a,
 
     for (int f = 0; f < schema->nfields; f++) {
         char **col = arena_alloc(a, sizeof(char *));
-        col[0] = values[f];                 /* NULL for union-null (mirrors JSON path) */
+        /* NULL contract: an Avro union-null field becomes DFO_NULL_SENTINEL
+         * (not a NULL pointer), mirroring the JSON path; the null bitmap is
+         * kept set so null-aware consumers also see it. */
+        if (nulls[f] || !values[f])
+            col[0] = arena_strdup(a, DFO_NULL_SENTINEL);
+        else
+            col[0] = values[f];
         batch->values[f + 1]      = col;
         batch->null_bitmap[f + 1] = arena_calloc(a, 1);
-        if (nulls[f]) batch->null_bitmap[f + 1][0] = 0x01;  /* row 0 is null */
+        if (nulls[f] || !values[f]) batch->null_bitmap[f + 1][0] = 0x01;  /* row 0 is null */
     }
 
     return batch;
@@ -480,6 +548,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
     snprintf(ctx->brokers,     sizeof(ctx->brokers),     "localhost:9092");
     snprintf(ctx->group_id,    sizeof(ctx->group_id),    "dfo-consumer");
     snprintf(ctx->data_format, sizeof(ctx->data_format), "json");
+    snprintf(ctx->addr_family, sizeof(ctx->addr_family), "v4");
     ctx->schema_registry_url[0] = '\0';
     ctx->sr_auth[0]             = '\0';
 
@@ -488,6 +557,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"group_id\"",    ctx->group_id,    sizeof(ctx->group_id));
         cfg_str(config_json, "\"topic\"",       ctx->topic_name,  sizeof(ctx->topic_name));
         cfg_str(config_json, "\"data_format\"", ctx->data_format, sizeof(ctx->data_format));
+        cfg_str(config_json, "\"broker_address_family\"", ctx->addr_family, sizeof(ctx->addr_family));
         cfg_str(config_json, "\"schema_registry_url\"",  ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
         cfg_str(config_json, "\"schema_registry_auth\"", ctx->sr_auth,             sizeof(ctx->sr_auth));
         /* security (optional — empty keeps plaintext) */
@@ -646,6 +716,85 @@ static int kafka_describe(void *vctx, Arena *a, const char *entity, Schema **out
     return 0;
 }
 
+/* Preflight check before polling: confirms the cluster is reachable and that the
+ * topic actually exists. Without this a typo'd topic or a wholly-down cluster
+ * just yields 0 rows and a green run. Returns 0 when it's safe to consume; <0 and
+ * fills ctx->last_err otherwise:
+ *   - metadata RPC fails / all brokers down  → broker connectivity error
+ *   - topic absent from metadata, or its .err is UNKNOWN_TOPIC_OR_PART → topic
+ *     does not exist (distinct from an existing-but-empty topic, which is OK). */
+static int kafka_preflight(KafkaCtx *ctx, const char *topic)
+{
+    /* The metadata round-trip below (with its own timeout) is the authority on
+     * reachability — we do NOT short-circuit on the error_cb's all_brokers_down
+     * latch here, because librdkafka emits ALL_BROKERS_DOWN transiently during
+     * normal bootstrap before the first successful connect. Trusting that latch
+     * pre-metadata falsely fails a healthy cluster on the first run. */
+
+    /* Topic-scoped metadata: cheaper than all_topics and gives us the topic .err
+     * the broker reports for THIS topic. */
+    rd_kafka_topic_t *rkt = rd_kafka_topic_new(ctx->rk, topic, NULL);
+    if (!rkt) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "kafka: failed to create topic handle for '%s'", topic);
+        LOG_ERROR("%s", ctx->last_err);
+        return -1;
+    }
+
+    const struct rd_kafka_metadata *meta = NULL;
+    rd_kafka_resp_err_t err =
+        rd_kafka_metadata(ctx->rk, 0 /*only this topic*/, rkt, &meta, 5000 /*ms*/);
+
+    if (err != RD_KAFKA_RESP_ERR_NO_ERROR || !meta) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "kafka: cannot reach brokers (%s): %s",
+                 ctx->brokers, rd_kafka_err2str(err));
+        LOG_ERROR("%s", ctx->last_err);
+        rd_kafka_topic_destroy(rkt);
+        return -1;
+    }
+
+    /* Metadata round-trip succeeded → brokers ARE reachable. Clear any transient
+     * ALL_BROKERS_DOWN the error_cb latched during bootstrap, so a healthy
+     * cluster is not falsely reported down. A genuine outage still fails above
+     * (rd_kafka_metadata returns an error / times out). */
+    atomic_store(&ctx->all_brokers_down, 0);
+
+    /* Locate our topic in the response and inspect its broker-reported error. */
+    int found = 0, rc = 0;
+    for (int i = 0; i < meta->topic_cnt; i++) {
+        if (strcmp(meta->topics[i].topic, topic) != 0) continue;
+        found = 1;
+        rd_kafka_resp_err_t terr = meta->topics[i].err;
+        if (terr == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART ||
+            terr == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_ID ||
+            meta->topics[i].partition_cnt == 0) {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "kafka: topic '%s' does not exist (%s)",
+                     topic, rd_kafka_err2str(terr));
+            LOG_ERROR("%s", ctx->last_err);
+            rc = -1;
+        } else if (terr != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "kafka: topic '%s' metadata error: %s",
+                     topic, rd_kafka_err2str(terr));
+            LOG_ERROR("%s", ctx->last_err);
+            rc = -1;
+        }
+        break;
+    }
+    if (!found) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "kafka: topic '%s' does not exist (not in cluster metadata)", topic);
+        LOG_ERROR("%s", ctx->last_err);
+        rc = -1;
+    }
+
+    rd_kafka_metadata_destroy(meta);
+    rd_kafka_topic_destroy(rkt);
+    return rc;
+}
+
 /* Читает до `limit` сообщений, разбирает каждое по формату и сливает в один
  * ColBatch (схема — от первого сообщения). Курсор req->cursor = последний offset.
  * Возвращает 0 и *out=NULL, если сообщений пока нет. */
@@ -654,7 +803,17 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
     if (!ctx->rk) return -1;
-    (void)entity;
+
+    /* S18/S19: detect a down cluster or a non-existent (e.g. mistyped) topic up
+     * front so the run fails (status!=0) instead of reporting a green 0 rows. An
+     * existing-but-empty topic passes this and drains to 0 rows as before. */
+    const char *check_topic = (entity && entity[0]) ? entity : ctx->topic_name;
+    if (check_topic && check_topic[0]) {
+        if (kafka_preflight(ctx, check_topic) != 0) {
+            *out = NULL;
+            return -1;
+        }
+    }
 
     int64_t limit = (req->limit > 0 && req->limit < BATCH_SIZE) ? req->limit : BATCH_SIZE;
     int64_t last_offset = -1;
@@ -679,6 +838,17 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                            + (tn.tv_nsec - t0.tv_nsec) / 1000000;
         if (elapsed_ms >= deadline_ms) break;
 
+        /* If the cluster dropped while we were polling, stop and surface it
+         * rather than spinning to the deadline and reporting a green 0 rows. */
+        if (!got_any && atomic_load(&ctx->all_brokers_down)) {
+            if (!ctx->last_err[0])
+                snprintf(ctx->last_err, sizeof(ctx->last_err),
+                         "all brokers down (%s)", ctx->brokers);
+            LOG_ERROR("kafka: %s", ctx->last_err);
+            *out = NULL;
+            return -1;
+        }
+
         rd_kafka_message_t *msg = rd_kafka_consumer_poll(ctx->rk, 500 /*ms*/);
         if (!msg) { if (got_any) break; else continue; }  /* drained after first msg */
         if (msg->err) {
@@ -694,13 +864,20 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         size_t      plen    = msg->len;
         last_offset         = (int64_t)msg->offset;
 
+        /* Guard against NULL-value messages (Kafka tombstones / log compaction):
+         * a successful message can carry payload==NULL with len==0. The format
+         * parsers dereference the payload (memchr / msg[0] / json_parse), so feed
+         * them an empty buffer instead of NULL to avoid a NULL-deref crash. */
+        const char *safe_payload = payload ? payload : "";
+        size_t      safe_plen    = payload ? plen : 0;
+
         ColBatch *b;
         if (strcasecmp(ctx->data_format, "avro") == 0)
-            b = batch_from_avro(ctx, a, (const uint8_t *)payload, plen, last_offset);
+            b = batch_from_avro(ctx, a, (const uint8_t *)safe_payload, safe_plen, last_offset);
         else if (strcasecmp(ctx->data_format, "json") == 0)
-            b = batch_from_json(a, payload, plen, last_offset);
+            b = batch_from_json(a, safe_payload, safe_plen, last_offset);
         else
-            b = batch_from_raw(a, payload, plen, last_offset);
+            b = batch_from_raw(a, safe_payload, safe_plen, last_offset);
 
         msgs[msg_count++] = b;
         rd_kafka_message_destroy(msg);

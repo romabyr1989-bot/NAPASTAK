@@ -11,6 +11,7 @@
 #include "qengine.h"
 #include "../core/log.h"
 #include "../core/json.h"
+#include "../storage/storage.h"   /* DFO_NULL_SENTINEL */
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -19,6 +20,52 @@
 
 /* ── Forward declarations ── */
 static bool is_agg_func(Expr *e, const char **fn_out, Expr **arg_out);
+
+/* NULL sentinel: a text cell carrying this exact value means SQL NULL. */
+static inline bool qe_is_null_sentinel(const char *s) {
+    return s && strcmp(s, DFO_NULL_SENTINEL) == 0;
+}
+
+/* If a scalar is a TEXT cell carrying the NULL sentinel, normalise it to a
+ * proper SQL NULL so every downstream operator (IS NULL, COALESCE, COUNT,
+ * comparisons, MIN/MAX, …) treats it uniformly. */
+static inline Scalar qe_denull(Scalar s) {
+    if (s.type == SV_TEXT && qe_is_null_sentinel(s.val.sval)) {
+        Scalar n = {SV_NULL};
+        return n;
+    }
+    return s;
+}
+
+/* Decode a UTF-8 string into an arena-backed array of Unicode code points.
+ * Returns the array (may be NULL when nout==0) and writes the count to *nout.
+ * Invalid/continuation bytes are passed through as single code points so the
+ * routine never loses data on malformed input. */
+static uint32_t *qe_utf8_decode(const char *s, Arena *a, size_t *nout) {
+    size_t blen = s ? strlen(s) : 0;
+    /* code points are never more numerous than bytes */
+    uint32_t *cp = blen ? arena_alloc(a, blen * sizeof(uint32_t)) : NULL;
+    size_t n = 0, i = 0;
+    while (i < blen) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t u; size_t len;
+        if (c < 0x80)              { u = c;            len = 1; }
+        else if ((c & 0xE0)==0xC0) { u = c & 0x1F;     len = 2; }
+        else if ((c & 0xF0)==0xE0) { u = c & 0x0F;     len = 3; }
+        else if ((c & 0xF8)==0xF0) { u = c & 0x07;     len = 4; }
+        else                       { u = c;            len = 1; } /* stray byte */
+        if (i + len > blen) { u = c; len = 1; }                   /* truncated */
+        for (size_t k = 1; k < len; k++) {
+            unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { u = c; len = 1; break; }   /* bad cont. */
+            u = (u << 6) | (cc & 0x3F);
+        }
+        cp[n++] = u;
+        i += len;
+    }
+    *nout = n;
+    return cp;
+}
 
 /* ── Expression evaluator ── */
 static bool bit_is_null(uint8_t *bm, int i) {
@@ -37,9 +84,14 @@ static const char *qe_text(Scalar s, Arena *a) {
     }
 }
 
-/* Levenshtein edit distance (two-row DP, arena-backed). */
+/* Levenshtein edit distance (two-row DP, arena-backed).
+ * Operates over Unicode CODE POINTS, not bytes, so multi-byte UTF-8 text
+ * (e.g. Cyrillic, where each letter is 2 bytes) is measured per-character:
+ * one substituted letter counts as distance 1, not 2. */
 int qe_levenshtein(const char *x, const char *y, Arena *a) {
-    size_t lx = strlen(x), ly = strlen(y);
+    size_t lx, ly;
+    uint32_t *cx = qe_utf8_decode(x, a, &lx);
+    uint32_t *cy = qe_utf8_decode(y, a, &ly);
     if (lx == 0) return (int)ly;
     if (ly == 0) return (int)lx;
     int *prev = arena_alloc(a, (ly + 1) * sizeof(int));
@@ -48,7 +100,7 @@ int qe_levenshtein(const char *x, const char *y, Arena *a) {
     for (size_t i = 1; i <= lx; i++) {
         cur[0] = (int)i;
         for (size_t j = 1; j <= ly; j++) {
-            int cost = (x[i-1] == y[j-1]) ? 0 : 1;
+            int cost = (cx[i-1] == cy[j-1]) ? 0 : 1;
             int del = prev[j] + 1, ins = cur[j-1] + 1, sub = prev[j-1] + cost;
             int m = del < ins ? del : ins;
             cur[j] = m < sub ? m : sub;
@@ -58,9 +110,16 @@ int qe_levenshtein(const char *x, const char *y, Arena *a) {
     return prev[ly];
 }
 
-/* Jaro-Winkler similarity in [0,1] (prefix weight p=0.1, max prefix 4). */
+/* Jaro-Winkler similarity in [0,1] (prefix weight p=0.1, max prefix 4).
+ * Operates over Unicode CODE POINTS, not bytes, so multi-byte UTF-8 text
+ * (e.g. Cyrillic, where letters share leading bytes 0xD0/0xD1) is compared
+ * character-by-character. Comparing bytes made distinct Cyrillic names like
+ * Анна/Алла or Олег/Глеб share their leading bytes and score above threshold,
+ * falsely merging them. Latin text (1 byte/char) behaves exactly as before. */
 double qe_jaro_winkler(const char *s1, const char *s2, Arena *a) {
-    size_t l1 = strlen(s1), l2 = strlen(s2);
+    size_t l1, l2;
+    uint32_t *c1 = qe_utf8_decode(s1, a, &l1);
+    uint32_t *c2 = qe_utf8_decode(s2, a, &l2);
     if (l1 == 0 || l2 == 0) return (l1 == l2) ? 1.0 : 0.0;
     size_t maxl = l1 > l2 ? l1 : l2;
     long win = (long)(maxl / 2) - 1; if (win < 0) win = 0;
@@ -71,32 +130,36 @@ double qe_jaro_winkler(const char *s1, const char *s2, Arena *a) {
         long lo = (long)i - win; if (lo < 0) lo = 0;
         long hi = (long)i + win; if (hi >= (long)l2) hi = (long)l2 - 1;
         for (long j = lo; j <= hi; j++)
-            if (!m2[j] && s1[i] == s2[j]) { m1[i] = 1; m2[j] = 1; matches++; break; }
+            if (!m2[j] && c1[i] == c2[j]) { m1[i] = 1; m2[j] = 1; matches++; break; }
     }
     if (matches == 0) return 0.0;
     size_t t = 0, k = 0;
     for (size_t i = 0; i < l1; i++) {
         if (!m1[i]) continue;
         while (!m2[k]) k++;
-        if (s1[i] != s2[k]) t++;
+        if (c1[i] != c2[k]) t++;
         k++;
     }
     double mm = (double)matches, tt = (double)t / 2.0;
     double jaro = (mm/(double)l1 + mm/(double)l2 + (mm - tt)/mm) / 3.0;
     size_t pref = 0;
     for (size_t i = 0; i < l1 && i < l2 && i < 4; i++) {
-        if (s1[i] == s2[i]) pref++; else break;
+        if (c1[i] == c2[i]) pref++; else break;
     }
     return jaro + (double)pref * 0.1 * (1.0 - jaro);
 }
 
 /* Trigram word similarity: fraction of query trigrams found in document.
  * Mirrors pg_trgm word_similarity(query, document). Returns [0.0, 1.0].
- * Byte-level (works for UTF-8 as long as both sides share the encoding). */
+ * Trigrams are formed over Unicode CODE POINTS (not bytes) so that
+ * multi-byte UTF-8 text (e.g. Cyrillic) is compared character-by-character
+ * rather than byte-by-byte — otherwise a 3-byte window would straddle two
+ * different Cyrillic letters and similarity scores would be meaningless. */
 double qe_word_similarity(const char *query, const char *doc, Arena *a) {
-    (void)a;
     if (!query || !doc) return 0.0;
-    size_t qlen = strlen(query), dlen = strlen(doc);
+    size_t qlen, dlen;
+    uint32_t *q = qe_utf8_decode(query, a, &qlen);
+    uint32_t *d = qe_utf8_decode(doc, a, &dlen);
     if (qlen < 3 && dlen < 3) return (strcasecmp(query, doc) == 0) ? 1.0 : 0.0;
     if (qlen < 3) return 0.0;
 
@@ -106,9 +169,8 @@ double qe_word_similarity(const char *query, const char *doc, Arena *a) {
 
     int matches = 0;
     for (int i = 0; i < q_ntri; i++) {
-        const char *qt = query + i;   /* 3-char trigram at position i */
         for (int j = 0; j < d_ntri; j++) {
-            if (doc[j] == qt[0] && doc[j+1] == qt[1] && doc[j+2] == qt[2]) {
+            if (d[j] == q[i] && d[j+1] == q[i+1] && d[j+2] == q[i+2]) {
                 matches++;
                 break;   /* count each query trigram at most once */
             }
@@ -195,7 +257,7 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
             case COL_BOOL:   s.type=SV_BOOL;   s.val.bval=((int*)ctx->batch->values[c])[ctx->row]!=0; break;
             default: break;
             }
-            return s;
+            return qe_denull(s);   /* sentinel text cell → SQL NULL */
         }
         return s;
     }
@@ -214,7 +276,7 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
                     case COL_TEXT:   s.type=SV_TEXT;   s.val.sval=((char**)ctx->batch->values[c])[ctx->row];   break;
                     default: break;
                     }
-                    return s;
+                    return qe_denull(s);   /* sentinel text cell → SQL NULL */
                 }
             }
         }
@@ -224,10 +286,27 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
         /* variadic string builtins (handle their own args) */
         if (!strcasecmp(fn,"coalesce") && e->nargs > 0) {
             for (int i = 0; i < e->nargs; i++) {
-                Scalar v = eval_expr(e->args[i], ctx, a);
+                Scalar v = qe_denull(eval_expr(e->args[i], ctx, a));
                 if (v.type != SV_NULL) return v;
             }
             return s;  /* all NULL */
+        }
+        /* NULLIF(a,b): NULL when a == b, else a. Sentinel is treated as NULL. */
+        if (!strcasecmp(fn,"nullif") && e->nargs >= 2) {
+            Scalar va = qe_denull(eval_expr(e->args[0], ctx, a));
+            Scalar vb = qe_denull(eval_expr(e->args[1], ctx, a));
+            if (va.type == SV_NULL) return s;          /* NULLIF(NULL, x) = NULL */
+            bool eq = false;
+            if (va.type==SV_TEXT && vb.type==SV_TEXT)
+                eq = va.val.sval && vb.val.sval && !strcmp(va.val.sval, vb.val.sval);
+            else if ((va.type==SV_INT||va.type==SV_DOUBLE) &&
+                     (vb.type==SV_INT||vb.type==SV_DOUBLE)) {
+                double da = va.type==SV_INT?(double)va.val.ival:va.val.fval;
+                double db = vb.type==SV_INT?(double)vb.val.ival:vb.val.fval;
+                eq = (da == db);
+            } else if (va.type==SV_BOOL && vb.type==SV_BOOL)
+                eq = (va.val.bval == vb.val.bval);
+            return eq ? s : va;
         }
         if (!strcasecmp(fn,"concat") && e->nargs > 0) {
             size_t cap = 64, off = 0;
@@ -325,7 +404,7 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
         return s;
     }
     case EXPR_BINOP: {
-        Scalar L = eval_expr(e->left, ctx, a);
+        Scalar L = qe_denull(eval_expr(e->left, ctx, a));
         /* short-circuit for AND/OR */
         if (e->op == OP_AND) {
             bool lb = (L.type==SV_BOOL)?L.val.bval:(L.type!=SV_NULL);
@@ -339,7 +418,7 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
             Scalar R = eval_expr(e->right, ctx, a);
             s.type=SV_BOOL; s.val.bval=(R.type==SV_BOOL)?R.val.bval:(R.type!=SV_NULL); return s;
         }
-        Scalar R = eval_expr(e->right, ctx, a);
+        Scalar R = qe_denull(eval_expr(e->right, ctx, a));
         /* numeric coercion */
         double lv=0, rv=0; bool numeric=false;
         if ((L.type==SV_INT||L.type==SV_DOUBLE)&&(R.type==SV_INT||R.type==SV_DOUBLE)) {
@@ -398,11 +477,11 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
     }
     case EXPR_UNOP: {
         if (e->op==OP_IS_NULL) {
-            Scalar inner=eval_expr(e->left,ctx,a);
+            Scalar inner=qe_denull(eval_expr(e->left,ctx,a));
             s.type=SV_BOOL; s.val.bval=(inner.type==SV_NULL); return s;
         }
         if (e->op==OP_IS_NOT_NULL) {
-            Scalar inner=eval_expr(e->left,ctx,a);
+            Scalar inner=qe_denull(eval_expr(e->left,ctx,a));
             s.type=SV_BOOL; s.val.bval=(inner.type!=SV_NULL); return s;
         }
         if (e->op==OP_NOT) {
@@ -975,9 +1054,16 @@ static int agg_next(Operator *op, ColBatch **out_batch) {
                     Expr *e = st->out_exprs[oi];
                     const char *fn = NULL; Expr *arg = NULL;
                     if (is_agg_func(e, &fn, &arg)) {
-                        Scalar val = (arg && strcasecmp(fn,"count")!=0)
-                            ? eval_expr(arg, &ctx, a)
+                        /* COUNT(col) must skip NULL/sentinel cells; COUNT(*)
+                         * (arg is EXPR_STAR, or no arg) counts every row.
+                         * Other aggregates always evaluate their argument. */
+                        bool is_count = !strcasecmp(fn,"count");
+                        bool is_star  = arg && arg->type == EXPR_STAR;
+                        Scalar val = (arg && !is_star)
+                            ? qe_denull(eval_expr(arg, &ctx, a))
                             : (Scalar){SV_INT, {.ival=1}};
+                        if (is_count && arg && !is_star && val.type == SV_NULL)
+                            continue;   /* COUNT(col): do not count NULL */
                         agg_accumulate(st, g, oi, fn, val, a);
                     } else {
                         /* non-agg: store value from first row in group */
@@ -1535,6 +1621,7 @@ int qengine_exec_json(Operator *root, Arena *a, RowJsonCb cb, void *ud, int *row
                     case COL_BOOL:   s.type=SV_BOOL; s.val.bval=((int*)batch->values[c])[r]!=0; break;
                     default: break;
                     }
+                    s = qe_denull(s);   /* sentinel text cell → JSON null */
                     scalar_to_json(&s,&jb);
                 }
             }

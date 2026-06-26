@@ -28,6 +28,7 @@ typedef struct {
     char    last_err[512];       /* human-readable reason of the last failure */
     char    read_mode[16];       /* "full" | "cursor" | "cdc" */
     char    cdc_slot[128];       /* logical replication slot name (cdc mode) */
+    char    primary_key[256];    /* sink: comma-separated PK cols → idempotent UPSERT */
 } PgCtx;
 
 /* ── Маппинг pg-типа (строка из information_schema) в ColType ── */
@@ -96,10 +97,23 @@ static void *pg_create(const char *cfg, Arena *a) {
     cfg_get(cfg, "cursor_column",   ctx->cursor_column, sizeof(ctx->cursor_column), "");
     cfg_get(cfg, "read_mode",       ctx->read_mode,     sizeof(ctx->read_mode),     "full");
     cfg_get(cfg, "cdc_slot",        ctx->cdc_slot,      sizeof(ctx->cdc_slot),      "dfo_cdc");
+    /* primary_key (sink): when set, write_batch creates the table with a PRIMARY
+     * KEY and INSERTs become idempotent UPSERTs (ON CONFLICT DO UPDATE). One or
+     * more column names, comma-separated. Empty → legacy append/overwrite. */
+    cfg_get(cfg, "primary_key",     ctx->primary_key,   sizeof(ctx->primary_key),   "");
 
     ctx->batch_size = atoi(bsz);
     if (ctx->batch_size <= 0 || ctx->batch_size > BATCH_SIZE)
         ctx->batch_size = PG_DEFAULT_BATCH;
+
+    /* Clamp connect_timeout to a sane positive value so an unreachable host
+     * fails fast instead of hanging (0/empty disables the timeout in libpq). */
+    {
+        int ct = atoi(ctimeout);
+        if (ct <= 0)  ct = 10;
+        if (ct > 120) ct = 120;
+        snprintf(ctimeout, sizeof(ctimeout), "%d", ct);
+    }
 
     /* Build keyword=value DSN */
     int n = snprintf(ctx->dsn, sizeof(ctx->dsn),
@@ -383,6 +397,14 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         for (int c = 0; c < ncols; c++) {
             if (PQgetisnull(res, r, c)) {
                 batch->null_bitmap[c][r/8] |= (uint8_t)(1u << (r % 8));
+                /* NULL contract: keep the null_bitmap bit set AND, for TEXT
+                 * columns (which is every column here — type is forced TEXT),
+                 * place the NULL sentinel so downstream paths that read the
+                 * cell string (materialization, SQL engine, sinks) see a real
+                 * NULL rather than an empty/garbage value. Numeric stores keep
+                 * their zero slot; the bitmap remains authoritative for them. */
+                if (sc->cols[c].type == COL_TEXT)
+                    ((char **)batch->values[c])[r] = (char *)DFO_NULL_SENTINEL;
                 continue;
             }
             const char *v = PQgetvalue(res, r, c);
@@ -434,40 +456,125 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
  * written or <0 on error. */
 #define PG_INS_CHUNK 250
 /* Выполнить SQL и проверить успех (COMMAND_OK/TUPLES_OK); логирует ошибку. 0 — ok, -1 — сбой. */
-static int pg_exec_ok(PGconn *c, const char *sql) {
+static int pg_exec_ok_ctx(PgCtx *ctx, const char *sql) {
+    PGconn *c = ctx->conn;
     PGresult *r = PQexec(c, sql);
     int ok = (PQresultStatus(r) == PGRES_COMMAND_OK || PQresultStatus(r) == PGRES_TUPLES_OK);
-    if (!ok) LOG_ERROR("pg sink: %s — %s", sql, PQerrorMessage(c));
+    if (!ok) {
+        const char *em = PQerrorMessage(c);
+        LOG_ERROR("pg sink: %s — %s", sql, em);
+        /* Propagate the real libpq reason to run.error via last_error() instead
+         * of the gateway's generic "write_batch failed". */
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", em ? em : "exec failed");
+        size_t L = strlen(ctx->last_err);
+        while (L && (ctx->last_err[L-1]=='\n' || ctx->last_err[L-1]=='\r')) ctx->last_err[--L] = '\0';
+    }
     PQclear(r);
     return ok ? 0 : -1;
 }
+/* Split a comma-separated "primary_key" config into up to PG_PK_MAX trimmed
+ * column names. Returns the count; names point into the caller-provided buf
+ * copy (NUL-separated in place). Empty/blank entries are skipped. */
+#define PG_PK_MAX 16
+static int pg_pk_split(const char *pk, char *buf, size_t bufsz, const char *names[PG_PK_MAX]) {
+    if (!pk || !pk[0]) return 0;
+    strncpy(buf, pk, bufsz - 1); buf[bufsz - 1] = '\0';
+    int n = 0;
+    char *p = buf;
+    while (*p && n < PG_PK_MAX) {
+        while (*p == ' ' || *p == '\t') p++;          /* skip leading ws */
+        char *start = p;
+        while (*p && *p != ',') p++;
+        char *end = p;
+        if (*p == ',') *p++ = '\0';
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (*start) names[n++] = start;
+    }
+    return n;
+}
+
+/* Build an escaped, comma-joined identifier list "\"a\", \"b\"" from PK column
+ * names, into out (size outsz). Returns 0 on success, -1 if a name fails to
+ * escape or the buffer would overflow. */
+static int pg_pk_ident_list(PGconn *conn, const char *names[], int n, char *out, size_t outsz) {
+    size_t off = 0; out[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        char *id = PQescapeIdentifier(conn, names[i], strlen(names[i]));
+        if (!id) return -1;
+        int need = snprintf(out + off, outsz - off, "%s%s", i ? ", " : "", id);
+        PQfreemem(id);
+        if (need < 0 || off + (size_t)need >= outsz) return -1;
+        off += (size_t)need;
+    }
+    return 0;
+}
+
 static int pg_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode) {
     (void)a;
     PgCtx *ctx = vctx;
-    if (!ctx || !ctx->conn) { LOG_ERROR("pg sink: no connection"); return -1; }
-    if (!entity || !entity[0]) { LOG_ERROR("pg sink: empty target table"); return -1; }
+    if (!ctx || !ctx->conn) {
+        if (ctx) snprintf(ctx->last_err, sizeof(ctx->last_err),
+                          "pg sink: нет подключения (проверьте host/port/creds)");
+        LOG_ERROR("pg sink: no connection"); return -1;
+    }
+    if (!entity || !entity[0]) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "pg sink: целевая таблица не задана (target_table шага пуст)");
+        LOG_ERROR("pg sink: empty target table"); return -1;
+    }
     int ncols = batch->ncols;
 
     char *eident = PQescapeIdentifier(ctx->conn, entity, strlen(entity));
     if (!eident) return -1;
 
-    /* CREATE TABLE IF NOT EXISTS <entity> (col TEXT, ...) */
+    /* Optional primary key (sink config). When non-empty we emit a PRIMARY KEY
+     * in the DDL and turn INSERTs into idempotent UPSERTs (ON CONFLICT). The
+     * escaped, comma-joined identifier list "\"a\", \"b\"" is reused for both
+     * the DDL constraint and the ON CONFLICT target. */
+    char pkbuf[256]; const char *pk_names[PG_PK_MAX];
+    int npk = pg_pk_split(ctx->primary_key, pkbuf, sizeof(pkbuf), pk_names);
+    char pk_idents[1024]; pk_idents[0] = '\0';
+    if (npk > 0) {
+        if (pg_pk_ident_list(ctx->conn, pk_names, npk, pk_idents, sizeof(pk_idents)) < 0) {
+            LOG_ERROR("pg sink: failed to build primary_key identifier list");
+            PQfreemem(eident); return -1;
+        }
+    }
+    /* Mark which schema columns belong to the PK (raw-name match) so the UPSERT
+     * SET clause updates only non-key columns. */
+    unsigned char *col_is_pk = calloc((size_t)(ncols > 0 ? ncols : 1), 1);
+    if (!col_is_pk) { PQfreemem(eident); return -1; }
+    int n_nonpk = ncols;
+    if (npk > 0) {
+        n_nonpk = 0;
+        for (int c = 0; c < ncols; c++) {
+            int hit = 0;
+            for (int k = 0; k < npk; k++)
+                if (strcmp(schema->cols[c].name, pk_names[k]) == 0) { hit = 1; break; }
+            col_is_pk[c] = (unsigned char)hit;
+            if (!hit) n_nonpk++;
+        }
+    }
+
+    /* CREATE TABLE IF NOT EXISTS <entity> (col TEXT, ...[, PRIMARY KEY (...)]) */
     {
-        size_t cap = 64 + (size_t)ncols * 80; char *ddl = malloc(cap); size_t off = 0;
+        size_t cap = 64 + (size_t)ncols * 80 + sizeof(pk_idents); char *ddl = malloc(cap); size_t off = 0;
         off += (size_t)snprintf(ddl+off, cap-off, "CREATE TABLE IF NOT EXISTS %s (", eident);
         for (int c = 0; c < ncols; c++) {
             char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
             off += (size_t)snprintf(ddl+off, cap-off, "%s%s TEXT", c?", ":"", col ? col : "\"col\"");
             if (col) PQfreemem(col);
         }
+        if (npk > 0)
+            off += (size_t)snprintf(ddl+off, cap-off, ", PRIMARY KEY (%s)", pk_idents);
         snprintf(ddl+off, cap-off, ")");
-        int rc = pg_exec_ok(ctx->conn, ddl); free(ddl);
-        if (rc < 0) { PQfreemem(eident); return -1; }
+        int rc = pg_exec_ok_ctx(ctx, ddl); free(ddl);
+        if (rc < 0) { free(col_is_pk); PQfreemem(eident); return -1; }
     }
     if (mode == DFO_SINK_OVERWRITE) {
         char trunc[512]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE %s", eident);
-        if (pg_exec_ok(ctx->conn, trunc) < 0) { PQfreemem(eident); return -1; }
+        if (pg_exec_ok_ctx(ctx, trunc) < 0) { free(col_is_pk); PQfreemem(eident); return -1; }
     }
 
     /* Column list "(c1, c2, ...)" reused for every INSERT. */
@@ -479,6 +586,36 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
         if (col) PQfreemem(col);
     }
     snprintf(collist+co, sizeof(collist)-co, ")");
+
+    /* UPSERT suffix (built once, reused per chunk). When a primary_key is set we
+     * append "ON CONFLICT (pk) DO UPDATE SET c = EXCLUDED.c" for every non-key
+     * column → idempotent merge-by-key (re-runs update in place, never duplicate
+     * — fixes K3). EXCLUDED carries the would-be-inserted row, so NULLs flow
+     * through correctly (a SQL NULL in VALUES becomes NULL in EXCLUDED). If every
+     * column is part of the PK there is nothing to update, so we emit
+     * "ON CONFLICT (pk) DO NOTHING" instead (still idempotent). With no PK the
+     * suffix is empty → legacy append/overwrite behaviour, byte-for-byte. */
+    char conflict[8192]; conflict[0] = '\0';
+    if (npk > 0) {
+        size_t fo = 0;
+        fo += (size_t)snprintf(conflict+fo, sizeof(conflict)-fo,
+                               " ON CONFLICT (%s) DO ", pk_idents);
+        if (n_nonpk == 0) {
+            snprintf(conflict+fo, sizeof(conflict)-fo, "NOTHING");
+        } else {
+            fo += (size_t)snprintf(conflict+fo, sizeof(conflict)-fo, "UPDATE SET ");
+            int first = 1;
+            for (int c = 0; c < ncols; c++) {
+                if (col_is_pk[c]) continue;
+                char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
+                const char *cn = col ? col : "\"col\"";
+                fo += (size_t)snprintf(conflict+fo, sizeof(conflict)-fo,
+                                       "%s%s = EXCLUDED.%s", first?"":", ", cn, cn);
+                if (col) PQfreemem(col);
+                first = 0;
+            }
+        }
+    }
 
     int written = 0;
     for (int start = 0; start < batch->nrows; start += PG_INS_CHUNK) {
@@ -502,20 +639,26 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
                     case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
                     default:         v = ((char**)batch->values[c])[r]; if(!v) v=""; break;
                 }
+                /* NULL contract: a TEXT cell holding the sentinel is a real NULL,
+                 * not the literal string — emit SQL NULL so the column stays NULL. */
+                if (v && strcmp(v, DFO_NULL_SENTINEL) == 0) { PG_APP("%sNULL", c?", ":""); continue; }
                 char *lit = PQescapeLiteral(ctx->conn, v, strlen(v));
                 PG_APP("%s%s", c?", ":"", lit ? lit : "''");
                 if (lit) PQfreemem(lit);
             }
             PG_APP(")");
         }
+        if (conflict[0]) PG_APP("%s", conflict);
         #undef PG_APP
-        int rc = pg_exec_ok(ctx->conn, sql); free(sql);
-        if (rc < 0) { PQfreemem(eident); return -1; }
+        int rc = pg_exec_ok_ctx(ctx, sql); free(sql);
+        if (rc < 0) { free(col_is_pk); PQfreemem(eident); return -1; }
         written += (end - start);
     }
+    free(col_is_pk);
     PQfreemem(eident);
-    LOG_INFO("pg sink: %d rows → %s (%s)", written, entity,
-             mode==DFO_SINK_OVERWRITE?"overwrite":"append");
+    LOG_INFO("pg sink: %d rows → %s (%s%s)", written, entity,
+             mode==DFO_SINK_OVERWRITE?"overwrite":"append",
+             npk>0?", upsert":"");
     return written;
 }
 

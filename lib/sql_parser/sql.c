@@ -48,7 +48,13 @@ typedef struct {
     Token       peek;
     bool        has_peek;
     Arena      *a;
+    const char *error;   /* первая обнаруженная синтаксическая ошибка (NULL = нет) */
 } Lexer;
+
+/* Зафиксировать первую синтаксическую ошибку парсинга (последующие не перетирают). */
+static void lex_set_error(Lexer *l, const char *msg) {
+    if (!l->error) l->error = msg;
+}
 
 /* Таблица ключевых слов (регистронезависимо); терминируется записью {NULL, TK_EOF}. */
 static struct { const char *kw; TkType tk; } KEYWORDS[] = {
@@ -453,6 +459,9 @@ static Expr *parse_primary(Lexer *l) {
             return e;
         }
         default:
+            /* Ожидалось первичное выражение, но встретился неподходящий токен
+               (ключевое слово-разделитель, EOF, мусор и т.п.) — это структурная ошибка. */
+            lex_set_error(l, "syntax error: expected expression");
             e->type = EXPR_LITERAL_NULL; return e;
     }
 }
@@ -693,8 +702,9 @@ static SelectStmt parse_select(Lexer *l) {
                 /* VALUES or other — skip */
                 while (!lex_peek_is(l, TK_RPAREN) && !lex_peek_is(l, TK_EOF)) lex_consume(l);
             }
-            lex_eat(l, TK_RPAREN);
+            if (!lex_eat(l, TK_RPAREN)) lex_set_error(l, "syntax error: expected ')' in FROM");
         } else {
+            if (!lex_peek_is(l, TK_IDENT)) lex_set_error(l, "syntax error: expected table name in FROM");
             fi->table = consume_ident(l);
         }
         if (lex_eat(l, TK_AS)) fi->alias = consume_ident(l);
@@ -787,7 +797,28 @@ static SelectStmt parse_select(Lexer *l) {
         else if(t.type==TK_IDENT && strcmp(t.start,"ALL")==0) s.limit=-1; /* LIMIT ALL */
     }
     if (lex_eat(l,TK_OFFSET)){Token t=lex_consume(l);if(t.type==TK_NUM_INT)s.offset=t.ival;}
-    /* also accept: OFFSET n ROWS FETCH NEXT m ROWS ONLY */
+    /* also accept: OFFSET n ROWS / FETCH FIRST|NEXT m ROWS ONLY —
+       поглощаем «пагинационный» хвост (ROW[S]/FIRST/NEXT/FETCH/ONLY и числа
+       между ними), чтобы стандартная пагинация не считалась мусором. */
+    {
+        bool saw_pgkw = false;  /* видели хотя бы одно пагинационное ключевое слово */
+        for (;;) {
+            Token pt = lex_peek(l);
+            bool kw = (pt.type == TK_ROWS) || (pt.type == TK_ROW) ||
+                      (pt.type == TK_FIRST) ||
+                      (pt.type == TK_IDENT && pt.len == 5 &&
+                       (pt.start[0]=='F'||pt.start[0]=='f') &&
+                       (pt.start[1]=='E'||pt.start[1]=='e')) /* FETCH */ ||
+                      (pt.type == TK_IDENT && pt.len == 4 &&
+                       (pt.start[0]=='N'||pt.start[0]=='n')) /* NEXT */ ||
+                      (pt.type == TK_IDENT && pt.len == 4 &&
+                       (pt.start[0]=='O'||pt.start[0]=='o')) /* ONLY */;
+            if (kw) { saw_pgkw = true; lex_consume(l); continue; }
+            /* число допускаем только как часть FETCH FIRST n ROWS */
+            if (saw_pgkw && pt.type == TK_NUM_INT) { lex_consume(l); continue; }
+            break;
+        }
+    }
 
     return s;
 }
@@ -967,13 +998,28 @@ static Stmt *parse_stmt(Lexer *l) {
         s = combined;
     }
 
+    /* Прокинуть наверх первую обнаруженную лексическую/структурную ошибку
+       (в т.ч. из подзапросов и выражений), если она ещё не зафиксирована. */
+    if (l->error && !s->error) s->error = l->error;
+
     return s;
 }
 
 /* Публичный API: разобрать SQL-запрос длиной len в AST (Stmt), размещённый в Arena a. */
 Stmt *sql_parse(Arena *a, const char *query, size_t len) {
     Lexer l = {query, 0, len, {0}, false, a};
-    return parse_stmt(&l);
+    Stmt *s = parse_stmt(&l);
+
+    /* На верхнем уровне после оператора допустимы только необязательные ';' и EOF.
+       Любые «висячие» токены (мусор, оборванное выражение, лишние скобки) — ошибка. */
+    while (lex_eat(&l, TK_SEMICOLON)) { /* поглотить разделители операторов */ }
+    if (!lex_peek_is(&l, TK_EOF)) lex_set_error(&l, "syntax error: unexpected trailing tokens");
+
+    if (l.error && (!s || !s->error)) {
+        if (!s) { s = arena_calloc(a, sizeof(Stmt)); s->type = STMT_UNKNOWN; }
+        s->error = l.error;
+    }
+    return s;
 }
 
 /* ── Planner ── */

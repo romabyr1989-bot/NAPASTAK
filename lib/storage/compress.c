@@ -501,8 +501,12 @@ CompressedBatch *compress_batch(const ColBatch *batch, Arena *a) {
         compress_col(&cb->cols[c], batch->values[c], batch->null_bitmap[c],
                      batch->nrows, t, enc, a);
 
-        /* Rough size estimate for ratio */
-        if (t == COL_INT64 || t == COL_BOOL) orig += (size_t)batch->nrows * 8;
+        /* Rough size estimate for ratio. Fixed-width numeric columns (INT64,
+         * BOOL, DOUBLE) store 8-byte values, NOT char* — treating DOUBLE as text
+         * here cast double* to char** and ran strlen() on a double's bit pattern,
+         * faulting on any native floating-point source (Kafka JSON numbers,
+         * Parquet, Greenplum). */
+        if (t == COL_INT64 || t == COL_BOOL || t == COL_DOUBLE) orig += (size_t)batch->nrows * 8;
         else { char **vs = (char**)batch->values[c]; for (int i=0;i<batch->nrows;i++) orig += vs && vs[i] ? strlen(vs[i])+1 : 1; }
     }
     cb->original_bytes = orig > 0 ? orig : 1;

@@ -205,6 +205,11 @@ Scheduler *scheduler_create(RunCallback cb, void *userdata);
 void       scheduler_add(Scheduler *s, Pipeline *p);
 void       scheduler_remove(Scheduler *s, const char *id);
 Pipeline  *scheduler_find(Scheduler *s, const char *id);
+/* Atomically (under the scheduler lock) write a finished run's status back to
+ * the live pipeline identified by id. Safe to call from a worker thread while
+ * the event loop may concurrently add/remove pipelines; no-op if id is gone. */
+void       scheduler_finish_run(Scheduler *s, const char *id, int run_status,
+                                int last_run_failed, const char *error_msg);
 void       scheduler_start(Scheduler *s);
 void       scheduler_stop(Scheduler *s);
 

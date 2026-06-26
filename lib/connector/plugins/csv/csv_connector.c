@@ -31,20 +31,48 @@ static ColType infer_type(const char *s) {
     return COL_TEXT;
 }
 
-/* Разбивает строку CSV на поля по разделителю с учётом кавычек RFC-4180
- * (экранированные "" внутри поля). Возвращает массив, n_out — число полей. */
-static char **split_line(Arena *a, const char *line, char delim, int *n_out) {
+/* Разбивает строку CSV на поля по разделителю с учётом кавычек RFC-4180.
+ * Экранированные двойные кавычки "" внутри кавыченного поля сворачиваются в
+ * одну ". Возвращает массив, n_out — число полей. Если err != NULL, в него
+ * записывается ненулевое значение при ошибке парсинга (незакрытая кавычка,
+ * мусор после закрывающей кавычки); в этом случае возвращается NULL. */
+static char **split_line_ex(Arena *a, const char *line, char delim, int *n_out, int *err) {
+    if (err) *err = 0;
     int cap=16; char **parts=arena_alloc(a,cap*sizeof(char*)); int n=0;
     const char *p = line;
     while (1) {
-        const char *start = p;
         bool in_quote = (*p == '"');
-        if (in_quote) { start=++p; while(*p && !(*p=='"'&&*(p+1)!='"')) p++; }
-        else { while(*p && *p!=delim && *p!='\r' && *p!='\n') p++; }
-        size_t len=(size_t)(p-start);
+        char *field; size_t flen;
+        if (in_quote) {
+            /* Quoted field: scan, collapsing "" -> " into a freshly built buffer.
+             * Worst case the unescaped content is no longer than the raw input. */
+            p++; /* skip opening quote */
+            char *buf = arena_alloc(a, strlen(p) + 1);
+            size_t bi = 0;
+            int closed = 0;
+            while (*p) {
+                if (*p == '"') {
+                    if (*(p+1) == '"') { buf[bi++] = '"'; p += 2; continue; } /* escaped quote */
+                    p++; closed = 1; break; /* closing quote */
+                }
+                buf[bi++] = *p++;
+            }
+            if (!closed) { if (err) *err = 1; return NULL; } /* unterminated quote */
+            buf[bi] = '\0';
+            /* After a closing quote only a delimiter or end-of-line is valid. */
+            if (*p && *p != delim && *p != '\r' && *p != '\n') { if (err) *err = 1; return NULL; }
+            field = buf; flen = bi;
+        } else {
+            const char *start = p;
+            while (*p && *p!=delim && *p!='\r' && *p!='\n') {
+                if (*p == '"') { if (err) *err = 1; return NULL; } /* stray quote in unquoted field */
+                p++;
+            }
+            flen = (size_t)(p - start);
+            field = arena_strndup(a, start, flen);
+        }
         if (n==cap){cap*=2;char**nb=arena_alloc(a,cap*sizeof(char*));memcpy(nb,parts,n*sizeof(char*));parts=nb;}
-        parts[n++]=arena_strndup(a,start,len);
-        if (in_quote && *p=='"') p++;
+        parts[n++]=field; (void)flen;
         if (*p==delim) p++; else break;
     }
     *n_out=n; return parts;
@@ -73,7 +101,8 @@ static void *csv_create(const char *cfg, Arena *a) {
     if (!f) return ctx;
     char line[65536];
     if (fgets(line, sizeof(line), f)) {
-        int n; char **hdrs=split_line(a,line,ctx->delimiter,&n);
+        int n; int perr=0; char **hdrs=split_line_ex(a,line,ctx->delimiter,&n,&perr);
+        if (perr || !hdrs) { fclose(f); return ctx; } /* malformed header — leave schema NULL */
         ctx->ncols=n;
         if (ctx->has_header) {
             ctx->headers=hdrs;
@@ -163,11 +192,27 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     char line[65536]; int row=0;
     if (ctx->has_header) fgets(line,sizeof(line),f); /* skip header */
     while (row<BATCH_SIZE && fgets(line,sizeof(line),f)) {
-        int n; char **vals=split_line(a,line,ctx->delimiter,&n);
-        for(int c=0;c<ncols&&c<n;c++){
-            const char *v=vals[c];
-            if(!v||!*v||strcasecmp(v,"null")==0||strcasecmp(v,"na")==0){
-                bit_set(batch->null_bitmap[c],row); continue;
+        int n; int perr=0; char **vals=split_line_ex(a,line,ctx->delimiter,&n,&perr);
+        /* RFC-4180 strictness: a quote-parse error (unterminated/stray quote) is a
+         * hard failure — do not silently succeed with a truncated/garbled row. */
+        if (perr || !vals) { fclose(f); return -1; }
+        /* More fields than the header advertises => probable schema shift or an
+         * unescaped delimiter. Reject rather than silently dropping the tail. */
+        if (n > ncols) { fclose(f); return -1; }
+        for(int c=0;c<ncols;c++){
+            /* Trailing fields absent in this short row => real NULL (sentinel). */
+            const char *v = (c < n) ? vals[c] : DFO_NULL_SENTINEL;
+            if(!v||!*v||strcasecmp(v,"null")==0||strcasecmp(v,"na")==0
+               ||strcmp(v,DFO_NULL_SENTINEL)==0){
+                bit_set(batch->null_bitmap[c],row);
+                /* For TEXT-backed columns also materialise the sentinel so that
+                 * downstream materialisation (api.c) sees the NULL contract value
+                 * even if it reads the cell pointer directly. */
+                switch(ctx->schema->cols[c].type){
+                    case COL_INT64: case COL_DOUBLE: case COL_BOOL: break;
+                    default: ((char**)sv[c])[row]=arena_strdup(a,DFO_NULL_SENTINEL); break;
+                }
+                continue;
             }
             switch(ctx->schema->cols[c].type){
                 case COL_INT64:  iv[c][row]=strtoll(v,NULL,10); break;
@@ -207,7 +252,13 @@ static const char *csv_cell_text(const ColBatch *b, int c, int r, char *tmp, siz
     switch (t) {
         case COL_INT64:  snprintf(tmp, tn, "%lld", (long long)((int64_t*)b->values[c])[r]); return tmp;
         case COL_DOUBLE: snprintf(tmp, tn, "%.10g", ((double*)b->values[c])[r]); return tmp;
-        default: { char *s = ((char**)b->values[c])[r]; return s ? s : ""; }
+        default: {
+            char *s = ((char**)b->values[c])[r];
+            /* NULL contract: a sentinel cell renders as an empty (unquoted) CSV
+             * field, i.e. a real absent value — never the raw sentinel bytes. */
+            if (s && strcmp(s, DFO_NULL_SENTINEL)==0) return "";
+            return s ? s : "";
+        }
     }
 }
 

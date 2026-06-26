@@ -10,6 +10,16 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* ── NULL sentinel (shared NULL contract across DataFlow OS) ──
+ * A textual cell equal to this exact byte string represents a SQL NULL that
+ * has been carried through the row/string layer (sources, materialization,
+ * sinks, query engine, JSON output). The leading \x01\x02 bytes make it
+ * collision-proof with real textual data and keep it distinct from the WAL
+ * op bytes (DELETE=0x02 / UPDATE=0x03) and the compressed-record marker
+ * (0x01 followed by a serialized batch, never by 0x02). The storage layer
+ * treats it as ordinary opaque text — no special trimming or NULL forcing. */
+#define DFO_NULL_SENTINEL "\x01\x02__DFO_NULL__"
+
 /* ── Column types ── */
 typedef enum { COL_INT64=0, COL_DOUBLE, COL_TEXT, COL_BOOL, COL_NULL } ColType;
 

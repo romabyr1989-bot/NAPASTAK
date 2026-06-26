@@ -391,8 +391,11 @@ static void jh_json_escape(CurlBuf *b, const char *s) {
 /* ── Sink: POST the batch as a JSON array of row-objects ──
  * Target URL = `entity` if it starts with http(s)://, else the configured
  * "url". Auth headers (bearer / api_key) from config are reused. Returns rows
- * written on HTTP 2xx, -1 otherwise. mode is ignored (every call POSTs its own
- * batch; the remote endpoint decides append vs replace). */
+ * written on HTTP 2xx, -1 otherwise (with a detailed reason left in
+ * ctx->last_err: libcurl transport error+URL, or "HTTP <code> from <url>" plus
+ * the start of the response body — surfaced by gateway via last_error()).
+ * mode is ignored (every call POSTs its own batch; the remote endpoint decides
+ * append vs replace). */
 /* Проверка NULL по битмапу: возвращает "" (sentinel) если ячейка NULL, иначе NULL. */
 static const char *bit_isnull(const ColBatch *b, int c, int r) {
     const uint8_t *bm = b->null_bitmap[c];
@@ -404,7 +407,11 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
     JHCtx *ctx = vctx;
     const char *url = (entity && (strncmp(entity,"http://",7)==0 || strncmp(entity,"https://",8)==0))
                       ? entity : ctx->url;
-    if (!url || !url[0]) return -1;
+    if (!url || !url[0]) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "json_http sink: URL не задан (config \"url\" пуст и entity не URL)");
+        return -1;
+    }
 
     /* Build JSON body: [{"col":"val",...},...] (cells are TEXT).
      * Собираем вручную через curl_write в растущий буфер; строки экранируем. */
@@ -436,7 +443,10 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
     curl_write((void*)"]", 1, 1, &body);
 
     CURL *curl = curl_easy_init();
-    if (!curl) { free(body.data); return -1; }
+    if (!curl) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err), "json_http sink: curl_easy_init failed");
+        free(body.data); return -1;
+    }
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     if (strcasecmp(ctx->auth_type,"bearer")==0 && ctx->auth_token[0]) {
@@ -463,10 +473,40 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
-    free(body.data); free(resp.data);
+    free(body.data);
 
-    if (res != CURLE_OK) { LOG_ERROR("json_http sink: curl: %s", curl_easy_strerror(res)); return -1; }
-    if (code < 200 || code >= 300) { LOG_ERROR("json_http sink: HTTP %ld", code); return -1; }
+    /* Транспортная ошибка libcurl: connection refused, DNS, TLS и т.п.
+     * Сохраняем человекочитаемую причину + URL в ctx->last_err, чтобы gateway
+     * показал её вместо обобщённого "write_batch failed". */
+    if (res != CURLE_OK) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "Ошибка соединения с %s: %s", url, curl_easy_strerror(res));
+        LOG_ERROR("json_http sink: curl: %s (%s)", curl_easy_strerror(res), url);
+        free(resp.data);
+        return -1;
+    }
+    /* HTTP-статус вне 2xx: формируем "HTTP <code> from <url>" + первые ~200
+     * символов тела ответа (накоплено в resp через curl_write callback). */
+    if (code < 200 || code >= 300) {
+        if (resp.data && resp.len) {
+            char snippet[200];
+            size_t n = resp.len < sizeof(snippet) - 1 ? resp.len : sizeof(snippet) - 1;
+            memcpy(snippet, resp.data, n);
+            snippet[n] = '\0';
+            /* Переводы строк в теле → пробелы, чтобы ошибка осталась одной строкой. */
+            for (size_t i = 0; i < n; i++)
+                if (snippet[i] == '\n' || snippet[i] == '\r') snippet[i] = ' ';
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "HTTP %ld from %s: %s", code, url, snippet);
+        } else {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "HTTP %ld from %s", code, url);
+        }
+        LOG_ERROR("json_http sink: HTTP %ld → %s", code, url);
+        free(resp.data);
+        return -1;
+    }
+    free(resp.data);
     LOG_INFO("json_http sink: POST %d rows → %s (HTTP %ld)", batch->nrows, url, code);
     return batch->nrows;
 }

@@ -44,7 +44,18 @@ ThreadPool *tp_create(int n, int qmax) {
     pthread_cond_init(&p->cond_work, NULL);
     pthread_cond_init(&p->cond_idle, NULL);
     p->threads = malloc(n * sizeof(pthread_t));
-    for (int i = 0; i < n; i++) pthread_create(&p->threads[i], NULL, worker, p);
+    /* Worker tasks run full pipeline execution (deep SQL eval, large stack
+     * frames). The macOS pthread default stack is only 512 KiB — far less than
+     * the main thread's 8 MiB — which overflows and faults. Match 8 MiB so a
+     * task that runs fine on the main thread also runs fine on a worker. */
+    pthread_attr_t attr;
+    pthread_attr_t *attrp = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+        attrp = &attr;
+    }
+    for (int i = 0; i < n; i++) pthread_create(&p->threads[i], attrp, worker, p);
+    if (attrp) pthread_attr_destroy(attrp);
     return p;
 }
 

@@ -18,6 +18,7 @@
 #include "../../lib/storage/compress.h"
 #include "../../lib/storage/txn.h"
 #include "../../lib/connector/connector.h"
+#include "../../lib/core/threadpool.h"   /* tp_submit — async pipeline execution */
 #include "../../lib/auth/auth.h"
 #include "../../lib/auth/rbac.h"
 #include "../../lib/auth/audit.h"
@@ -44,6 +45,13 @@
  * for change detection, not a security primitive). */
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/md5.h>
+
+/* NULL contract sentinel: a cell equal to this string is a true SQL NULL.
+ * Canonically defined in lib/storage/storage.h; this fallback guarantees api.c
+ * compiles even if include ordering hides that define. Value MUST stay in sync. */
+#ifndef DFO_NULL_SENTINEL
+#define DFO_NULL_SENTINEL "\x01\x02__DFO_NULL__"
+#endif
 
 /* Thread-local: txn_id active during exec_stmt call (0 = auto-commit) */
 static _Thread_local TxnId g_txn_current = 0;
@@ -179,6 +187,50 @@ static void split_line_simple(char *line, char delim, char **out, int max_cols, 
     *nout = n;
 }
 
+/* RFC-4180 CSV field splitter (strict). Mirrors split_line_ex() in the csv
+ * connector — that one is static there, so the strict logic is duplicated here
+ * to keep the HTTP CSV ingest path on the same NULL/quoting contract:
+ *   - honours double-quoted fields, collapsing "" -> " inside them;
+ *   - rejects an unterminated quote, a stray '"' in an unquoted field, and any
+ *     garbage after a closing quote (sets *err and returns NULL);
+ * Field-count enforcement (vs. header) is the caller's job. */
+static char **split_line_rfc4180(Arena *a, const char *line, char delim, int *n_out, int *err) {
+    if (err) *err = 0;
+    int cap=16; char **parts=arena_alloc(a,(size_t)cap*sizeof(char*)); int n=0;
+    const char *p = line;
+    while (1) {
+        bool in_quote = (*p == '"');
+        char *field;
+        if (in_quote) {
+            p++; /* skip opening quote */
+            char *buf = arena_alloc(a, strlen(p) + 1);
+            size_t bi = 0; int closed = 0;
+            while (*p) {
+                if (*p == '"') {
+                    if (*(p+1) == '"') { buf[bi++] = '"'; p += 2; continue; }
+                    p++; closed = 1; break;
+                }
+                buf[bi++] = *p++;
+            }
+            if (!closed) { if (err) *err = 1; return NULL; }
+            buf[bi] = '\0';
+            if (*p && *p != delim && *p != '\r' && *p != '\n') { if (err) *err = 1; return NULL; }
+            field = buf;
+        } else {
+            const char *start = p;
+            while (*p && *p!=delim && *p!='\r' && *p!='\n') {
+                if (*p == '"') { if (err) *err = 1; return NULL; }
+                p++;
+            }
+            field = arena_strndup(a, start, (size_t)(p - start));
+        }
+        if (n==cap){cap*=2;char**nb=arena_alloc(a,(size_t)cap*sizeof(char*));memcpy(nb,parts,(size_t)n*sizeof(char*));parts=nb;}
+        parts[n++]=field;
+        if (*p==delim) p++; else break;
+    }
+    *n_out=n; return parts;
+}
+
 /* ═══════════════════════════════════════════════════════
    QUERY ENGINE — full SQL executor
    ═══════════════════════════════════════════════════════ */
@@ -233,6 +285,17 @@ static const char *val_str(Val v, Arena *a) {
         return arena_sprintf(a, "%.10g", n);
     }
     return "";
+}
+
+/* Materialize a Val into a stored result/table cell. Unlike val_str (which
+ * renders NULL as "" for display/concat contexts), this preserves the NULL
+ * contract: an is_null Val becomes the sentinel so that SQL-produced NULLs
+ * (LEFT JOIN unmatched, NULLIF, COALESCE-all-null, …) round-trip identically
+ * to connector-produced NULLs through EXPR_COL / IS NULL / COUNT and reach the
+ * sink as a recognizable NULL rather than an empty string. */
+static const char *val_cell(Val v, Arena *a) {
+    if (v.is_null) return DFO_NULL_SENTINEL;
+    return val_str(v, a);
 }
 
 static int vcmp(Val a, Val b) {
@@ -817,6 +880,10 @@ static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
         /* correlated subquery: fall back to outer context if not found */
         if (!s && tl_outer_ctx) s = jctx_col(tl_outer_ctx, e->table, e->name);
         if (!s) return vnull();
+        /* NULL contract: a cell carrying the sentinel is a true SQL NULL.
+         * Map it back to a NULL-Val so IS NULL / COUNT(col) / COALESCE and
+         * projection treat it as NULL rather than leaking the literal text. */
+        if (!strcmp(s, DFO_NULL_SENTINEL)) return vnull();
         Val v = vstr_s(s);
         double n;
         if (pnum(s, &n)) { v.is_num=true; v.num=n; }
@@ -1217,17 +1284,17 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
                         /* Convert batch row to char** cells */
                         char **row = arena_alloc(a, (size_t)ncols * sizeof(char*));
                         for (int c = 0; c < ncols; c++) {
-                            if (c >= batch->ncols) { row[c] = ""; continue; }
+                            if (c >= batch->ncols) { row[c] = DFO_NULL_SENTINEL; continue; }
                             if (batch->null_bitmap[c]) {
-                                int bi=r/8; if (batch->null_bitmap[c][bi] & (1u<<(r%8))) { row[c]=""; continue; }
+                                int bi=r/8; if (batch->null_bitmap[c][bi] & (1u<<(r%8))) { row[c]=DFO_NULL_SENTINEL; continue; }
                             }
                             ColType t = (batch->schema && c < batch->schema->ncols) ? batch->schema->cols[c].type : COL_TEXT;
                             switch (t) {
                                 case COL_INT64: row[c]=arena_sprintf(a,"%lld",(long long)((int64_t*)batch->values[c])[r]); break;
                                 case COL_DOUBLE: row[c]=arena_sprintf(a,"%.10g",((double*)batch->values[c])[r]); break;
                                 case COL_BOOL:  row[c]=((int64_t*)batch->values[c])[r]?"true":"false"; break;
-                                case COL_TEXT:  row[c]=((char**)batch->values[c])[r]?:""; break;
-                                default:        row[c]=""; break;
+                                case COL_TEXT:  row[c]=((char**)batch->values[c])[r]?:DFO_NULL_SENTINEL; break;
+                                default:        row[c]=DFO_NULL_SENTINEL; break;
                             }
                         }
                         if(n==cap){cap*=2;char***nb=arena_alloc(a,(size_t)cap*sizeof(char**));memcpy(nb,rows,(size_t)n*sizeof(char**));rows=nb;}
@@ -1387,7 +1454,7 @@ static void emit_groups(ExecState *st) {
             } else if (expr_has_agg(base)) {
                 /* expression wrapping aggregate (e.g. ROUND(AVG(x))) — eval with group ctx */
                 Val v=eval_val(se,&empty_ctx,st->a);
-                cells[s]=arena_strdup(st->a,val_str(v,st->a));
+                cells[s]=arena_strdup(st->a,val_cell(v,st->a));
             } else {
                 cells[s]=g->first_str[s]?g->first_str[s]:"";
             }
@@ -1469,7 +1536,7 @@ static void collect_row(ExecState *st, JoinCtx *ctx) {
             Expr *se=st->sel->select_list[s];
             Expr *base=(se->type==EXPR_ALIAS)?se->expr:se;
             Val v=eval_val(base,ctx,st->a);
-            cells[s]=arena_strdup(st->a,val_str(v,st->a));
+            cells[s]=arena_strdup(st->a,val_cell(v,st->a));
         }
     }
 
@@ -1961,7 +2028,7 @@ static void apply_windows(Arena *a, RS *rs, const SelectStmt *sel) {
             JoinCtx ctx = {0}; ctx.n=1; ctx.schemas[0]=out_sc;
             ctx.rows[0]=rs->rows[r].cells; ctx.tnames[0]=""; ctx.aliases[0]="";
             Val v = eval_val(base, &ctx, a);
-            rs->rows[r].cells[si] = arena_strdup(a, val_str(v, a));
+            rs->rows[r].cells[si] = arena_strdup(a, val_cell(v, a));
         }
     }
 
@@ -2003,7 +2070,7 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
         JoinCtx ctx={0};
         for(int i=0;i<nc;i++){
             Val v=eval_val(sel->select_list[i],&ctx,a);
-            cells[i]=arena_strdup(a,val_str(v,a));
+            cells[i]=arena_strdup(a,val_cell(v,a));
         }
         rs_add(rs,a,cells,NULL);
         return rs;
@@ -2349,10 +2416,10 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
                 for (int r = 0; r < rcount; r++) {
                     char **cells = arena_alloc(a, (size_t)ncols * sizeof(char *));
                     for (int ci = 0; ci < ncols; ci++) {
-                        if (ci >= batch->ncols) { cells[ci] = (char *)""; continue; }
+                        if (ci >= batch->ncols) { cells[ci] = (char *)DFO_NULL_SENTINEL; continue; }
                         if (batch->null_bitmap[ci] &&
                             (batch->null_bitmap[ci][r/8] & (1u << (r%8)))) {
-                            cells[ci] = (char *)"";
+                            cells[ci] = (char *)DFO_NULL_SENTINEL;
                             continue;
                         }
                         ColType t = (batch->schema && ci < batch->schema->ncols)
@@ -2369,7 +2436,7 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
                                                       ? "true" : "false"); break;
                             default:
                                 cells[ci] = ((char **)batch->values[ci])[r]
-                                              ? ((char **)batch->values[ci])[r] : (char *)"";
+                                              ? ((char **)batch->values[ci])[r] : (char *)DFO_NULL_SENTINEL;
                                 break;
                         }
                     }
@@ -2668,8 +2735,8 @@ static void h_query(HttpReq *req, HttpResp *resp) {
         for(int r=0;r<rs->nrows;r++){
             jb_arr_begin(&jb);
             for(int c=0;c<rs->ncols;c++){
-                const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:"";
-                jb_str(&jb, v?v:"");
+                const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
+                if(!v||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
             }
             jb_arr_end(&jb);
         }
@@ -2800,8 +2867,8 @@ static void h_query_named(HttpReq *req, HttpResp *resp) {
         for(int r=0;r<rs->nrows;r++){
             jb_arr_begin(&jb);
             for(int c=0;c<rs->ncols;c++){
-                const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:"";
-                jb_str(&jb, v?v:"");
+                const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
+                if(!v||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
             }
             jb_arr_end(&jb);
         }
@@ -3262,21 +3329,23 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     const char *nl=memchr(body,'\n',req->body_len);
     if(!nl){http_resp_error(resp,400,"no header");arena_destroy(a);return;}
 
-    int ncols=0; char *header=arena_strndup(a,body,(size_t)(nl-body));
+    char *header=arena_strndup(a,body,(size_t)(nl-body));
     char delim = detect_delim(body, (size_t)(nl-body));
-    for(char*p=header;*p;p++) if(*p==delim) ncols++;
-    ncols++;
+    char dstr[2] = {delim, '\0'};
+    /* Parse the header with the strict RFC-4180 splitter so the column count is
+     * authoritative even when header fields are quoted (e.g. "a,b"). */
+    int ncols=0; int herr=0;
+    char **hcols = split_line_rfc4180(a, header, delim, &ncols, &herr);
+    if (herr || !hcols || ncols < 1) { arena_destroy(a); http_resp_error(resp, 400, "malformed CSV header"); return; }
     if (ncols > MAX_COLS) { arena_destroy(a); http_resp_error(resp, 400, "too many columns"); return; }
 
     Schema *schema=arena_calloc(a,sizeof(Schema));
     schema->ncols=ncols; schema->cols=arena_alloc(a,ncols*sizeof(ColDef));
-    char dstr[2] = {delim, '\0'};
-    char *tok=strtok(header,dstr);
-    for(int i=0;i<ncols&&tok;i++){
+    for(int i=0;i<ncols;i++){
+        char *tok=hcols[i];
         size_t tl=strlen(tok); while(tl>0&&(tok[tl-1]=='\r'||tok[tl-1]==' ')) tok[--tl]='\0';
         schema->cols[i].name=arena_strdup(a,tok);
         schema->cols[i].type=COL_TEXT; schema->cols[i].nullable=true;
-        tok=strtok(NULL,dstr);
     }
 
     pthread_mutex_lock(&g_app.tables_mu);
@@ -3308,9 +3377,39 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         memcpy(row_copy, p, rlen);
         if (rlen > 0 && row_copy[rlen-1] == '\r') rlen--;
         row_copy[rlen] = '\0';
-        int col = 0; char *cell = strtok(row_copy, dstr);
-        while (cell && col < ncols) { col_vals[col][batch.nrows] = arena_strdup(a, cell); col++; cell = strtok(NULL, dstr); }
-        for (; col < ncols; col++) col_vals[col][batch.nrows] = arena_strdup(a, "");
+        /* Strict RFC-4180 parse: reject malformed quoting and any row whose
+         * field count exceeds the header (silent column loss is a data hazard
+         * in a banking sink). A short row pads the missing tail with the NULL
+         * sentinel so it round-trips as a true NULL, not "". */
+        int nfields = 0; int perr = 0;
+        char **fields = split_line_rfc4180(a, row_copy, delim, &nfields, &perr);
+        if (perr || !fields) {
+            arena_destroy(a);
+            http_resp_error(resp, 400, "malformed CSV row (bad quoting)");
+            return;
+        }
+        if (nfields > ncols) {
+            arena_destroy(a);
+            http_resp_error(resp, 400, "CSV row has more fields than header");
+            return;
+        }
+        for (int col = 0; col < ncols; col++) {
+            int rr = batch.nrows;
+            const char *cv = (col < nfields) ? fields[col] : DFO_NULL_SENTINEL;
+            if (strcmp(cv, DFO_NULL_SENTINEL) == 0) {
+                /* True NULL (missing tail or explicit sentinel): flag the
+                 * null_bitmap so the stored cell is a real NULL, matching how
+                 * SQL-materialized NULLs are persisted. */
+                if (!batch.null_bitmap[col])
+                    batch.null_bitmap[col] = arena_calloc(a, (BATCH_SIZE + 7) / 8);
+                batch.null_bitmap[col][rr / 8] |= (uint8_t)(1u << (rr % 8));
+                col_vals[col][rr] = (char *)"";
+            } else {
+                if (batch.null_bitmap[col])
+                    batch.null_bitmap[col][rr / 8] &= (uint8_t)~(1u << (rr % 8));
+                col_vals[col][rr] = arena_strdup(a, cv);
+            }
+        }
         batch.nrows++; row_count++;
         if (batch.nrows == BATCH_SIZE) {
             if (req->txn_id != 0) {
@@ -3595,8 +3694,8 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
     if (rs) for (int r = 0; r < rs->nrows; r++) {
         jb_arr_begin(&jb);
         for (int c = 0; c < rs->ncols; c++) {
-            const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
-            jb_str(&jb, v ? v : "");
+            const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : NULL;
+            if(!v||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
         }
         jb_arr_end(&jb);
     }
@@ -3812,7 +3911,19 @@ static int write_rs_to_table(App *app, Arena *a, const char *tname, RS *rs) {
     for (int r = 0; r < rs->nrows; r++) {
         for (int c = 0; c < rs->ncols; c++) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
-            cv[c][batch.nrows] = (char *)(v ? v : "");
+            int rr = batch.nrows;
+            if (v && strcmp(v, DFO_NULL_SENTINEL) == 0) {
+                /* True SQL NULL: flag in null_bitmap (lazily allocated, zeroed)
+                 * so the stored cell is NULL rather than the sentinel text. */
+                if (!batch.null_bitmap[c])
+                    batch.null_bitmap[c] = arena_calloc(a, (BATCH_SIZE + 7) / 8);
+                batch.null_bitmap[c][rr / 8] |= (uint8_t)(1u << (rr % 8));
+                cv[c][rr] = (char *)"";
+            } else {
+                if (batch.null_bitmap[c])
+                    batch.null_bitmap[c][rr / 8] &= (uint8_t)~(1u << (rr % 8));
+                cv[c][rr] = (char *)(v ? v : "");
+            }
         }
         if (++batch.nrows == BATCH_SIZE) { table_append(t, &batch); batch.nrows = 0; }
         total++;
@@ -4079,7 +4190,16 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
         ColBatch *batch = NULL;
         /* rc: <0 = error; 0 = ok (more pages); 1 = ok, last/only page. */
         int rc = api->read_batch(ctx, a, &req, entity, &batch);
-        if (rc < 0 || !batch || batch->nrows == 0)
+        if (rc < 0) {
+            /* A read error is a real failure — surface the connector's reason
+             * instead of silently treating it as a successful 0-row read. */
+            const char *why = api->last_error ? api->last_error(ctx) : NULL;
+            snprintf(errbuf, errsz, "connector step %s: read_batch failed%s%s", st->id,
+                     (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+            connector_unload(inst);
+            return -1;
+        }
+        if (!batch || batch->nrows == 0)
             break;
 
         /* Create the table on first non-empty batch */
@@ -4190,12 +4310,27 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     for (int r = 0; r < rs->nrows; r++) {
         for (int c = 0; c < rs->ncols; c++) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
-            cv[c][batch.nrows] = (char *)(v ? v : "");
+            int rr = batch.nrows;
+            if (v && strcmp(v, DFO_NULL_SENTINEL) == 0) {
+                /* True SQL NULL → flag null_bitmap so write_batch emits a real
+                 * NULL to the sink instead of the sentinel text. */
+                if (!batch.null_bitmap[c])
+                    batch.null_bitmap[c] = arena_calloc(a, (BATCH_SIZE + 7) / 8);
+                batch.null_bitmap[c][rr / 8] |= (uint8_t)(1u << (rr % 8));
+                cv[c][rr] = (char *)"";
+            } else {
+                if (batch.null_bitmap[c])
+                    batch.null_bitmap[c][rr / 8] &= (uint8_t)~(1u << (rr % 8));
+                cv[c][rr] = (char *)(v ? v : "");
+            }
         }
         if (++batch.nrows == BATCH_SIZE) {
             int n = api->write_batch(ctx, a, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
-            if (n < 0) { connector_unload(inst);
-                snprintf(errbuf, errsz, "sink step %s: write_batch failed", st->id); return -1; }
+            if (n < 0) {
+                const char *why = api->last_error ? api->last_error(ctx) : NULL;
+                snprintf(errbuf, errsz, "sink step %s: write_batch failed%s%s", st->id,
+                         (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+                connector_unload(inst); return -1; }
             total += batch.nrows; batch.nrows = 0; first = 0;
         }
     }
@@ -4203,8 +4338,11 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
      * the destination is truncated even when there are 0 rows. */
     if (batch.nrows > 0 || first) {
         int n = api->write_batch(ctx, a, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
-        if (n < 0) { connector_unload(inst);
-            snprintf(errbuf, errsz, "sink step %s: write_batch failed", st->id); return -1; }
+        if (n < 0) {
+            const char *why = api->last_error ? api->last_error(ctx) : NULL;
+            snprintf(errbuf, errsz, "sink step %s: write_batch failed%s%s", st->id,
+                     (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+            connector_unload(inst); return -1; }
         total += batch.nrows;
     }
 
@@ -4768,6 +4906,18 @@ static bool scd2_truthy(const char *v) {
     return true;
 }
 
+/* True iff any business-key component of this row is NULL (sentinel) or empty.
+ * Such a row must NOT be historised: merging under an empty/NULL key would
+ * collapse unrelated entities into one dimension lineage (a banking-grade data
+ * integrity hazard), so the SCD2 run is failed instead. */
+static bool scd2_key_is_null_or_empty(char **cells, const int *idx, int nidx) {
+    for (int i = 0; i < nidx; i++) {
+        const char *v = (idx[i] >= 0 && cells[idx[i]]) ? cells[idx[i]] : "";
+        if (!v[0] || !strcmp(v, DFO_NULL_SENTINEL)) return true;
+    }
+    return false;
+}
+
 /* Compute MD5 hex over cmp_cols values (unit-separator delimited) for a single
  * source row. Used by scd2_hash_col change detection: one hash compare replaces
  * N column strcmps, and a stored hash distinguishes "" from a genuinely
@@ -4952,9 +5102,28 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     /* 3. Classify each source row. */
     char *closed_keys[MAX_RS_ROWS]; int n_closed = 0;       /* CHANGED ∪ DELETED */
     int   new_rows[MAX_RS_ROWS];    int n_new = 0;           /* source-row indices to insert */
+    /* Track business keys already seen in this batch: a duplicate key would
+     * otherwise classify as two NEW/CHANGED rows and open two concurrent
+     * versions for the same entity. */
+    char *seen_keys[MAX_RS_ROWS]; int n_seen = 0;
     for (int r = 0; r < src->nrows; r++) {
         char **cells = src->rows[r].cells;
+        /* (a) Reject NULL/empty business keys — never merge under an empty key. */
+        if (scd2_key_is_null_or_empty(cells, bk_idx_src, nbk)) {
+            snprintf(errbuf, errsz,
+                     "scd2 step %s: source row %d has a NULL/empty business key", st->id, r);
+            return -1;
+        }
         char  *key = scd2_build_key(a, cells, bk_idx_src, nbk);
+        /* (b) Reject duplicate business keys within the same batch. */
+        for (int s = 0; s < n_seen; s++) {
+            if (!strcmp(seen_keys[s], key)) {
+                snprintf(errbuf, errsz,
+                         "scd2 step %s: duplicate business key in source batch (row %d)", st->id, r);
+                return -1;
+            }
+        }
+        if (n_seen < MAX_RS_ROWS) seen_keys[n_seen++] = key;
         bool deleted = del_idx_src >= 0 && scd2_truthy(cells[del_idx_src]);
 
         /* Locate the current version of this key. */
@@ -5239,12 +5408,95 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
     return out->nrows;
 }
 
+/* Topologically sort pipeline steps by their deps[] so a step always runs
+ * after every step it depends on (merge/branch steps after their inputs).
+ * Writes the execution order (original step indices) into `order` and returns
+ * the count; returns -1 on a dependency cycle (errbuf gets the offending ids).
+ * Out-of-range dep indices are ignored (treated as "no such dependency").
+ * Steps with equal dependency depth keep their original array order, so simple
+ * linear pipelines (no deps) run exactly as before. Kahn's algorithm. */
+static int pipeline_topo_order(const Pipeline *p, int *order, char *errbuf, size_t errsz) {
+    int n = p->nsteps;
+    int indeg[MAX_STEPS] = {0};
+
+    /* Count in-degrees from valid dep edges (dep -> step). */
+    for (int i = 0; i < n; i++) {
+        for (int d = 0; d < p->steps[i].ndeps; d++) {
+            int dep = p->steps[i].deps[d];
+            if (dep >= 0 && dep < n && dep != i) indeg[i]++;
+        }
+    }
+
+    int out = 0;
+    bool done_[MAX_STEPS] = {false};
+    /* Repeatedly emit the lowest-index ready step (in-degree 0, not yet done) to
+     * keep output stable/deterministic and original-order-preserving. */
+    for (int emitted = 0; emitted < n; emitted++) {
+        int pick = -1;
+        for (int i = 0; i < n; i++) {
+            if (!done_[i] && indeg[i] == 0) { pick = i; break; }
+        }
+        if (pick < 0) {
+            /* No ready step but steps remain → cycle. List the stuck ids. */
+            char ids[256]; size_t off = 0; ids[0] = '\0';
+            for (int i = 0; i < n; i++) {
+                if (!done_[i]) {
+                    int w = snprintf(ids + off, sizeof(ids) - off, "%s%s",
+                                     off ? "," : "", p->steps[i].id[0] ? p->steps[i].id : "?");
+                    if (w > 0 && (size_t)w < sizeof(ids) - off) off += (size_t)w;
+                }
+            }
+            snprintf(errbuf, errsz, "dependency cycle among steps: %s", ids);
+            return -1;
+        }
+        done_[pick] = true;
+        order[out++] = pick;
+        /* Relax: decrement in-degree of steps that depend on `pick`. */
+        for (int i = 0; i < n; i++) {
+            if (done_[i]) continue;
+            for (int d = 0; d < p->steps[i].ndeps; d++) {
+                int dep = p->steps[i].deps[d];
+                if (dep == pick) { if (indeg[i] > 0) indeg[i]--; }
+            }
+        }
+    }
+    return out;
+}
+
 /* ── Execute all steps of a pipeline ── */
 /* Internal: execute pipeline steps with optional run-logging/broadcast.
  * `report=false` is used by the preview-step endpoint so transient one-shot
  * runs don't clutter catalog's runs history or fire pipeline_done WS events.
  * `external_arena=non-NULL` skips internal arena create/destroy so the
  * caller can keep Schema/table allocations alive for follow-up queries. */
+/* Retry-DoS guard: cap on total wall-clock seconds spent sleeping across all
+ * retry backoffs of a single run, so a step that fails with an ever-growing
+ * backoff cannot freeze the (synchronous) gateway worker indefinitely. */
+#define RETRY_TOTAL_DELAY_CAP_SEC 30
+
+/* True for deterministic, non-transient failures where retrying just burns
+ * the worker: SQL parse errors, auth/permission/credential problems, unknown
+ * roles, missing objects and unreachable/unresolvable hosts. Matched on the
+ * step error text (case-insensitive substring) — best-effort but safe: a
+ * false negative only means we still retry, never that we skip a real retry
+ * of a transient error. */
+static bool error_is_nonretryable(const char *msg) {
+    if (!msg || !msg[0]) return false;
+    static const char *needles[] = {
+        "parse", "syntax",
+        "auth", "unauthorized", "forbidden", "permission", "denied",
+        "credential", "password", "login",
+        "role", "rbac",
+        "no such", "not found", "does not exist", "unknown table", "unknown column",
+        "no route to host", "name or service not known", "could not resolve",
+        "connection refused", "unknown host",
+        NULL
+    };
+    for (const char **n = needles; *n; n++)
+        if (strcasestr(msg, *n)) return true;
+    return false;
+}
+
 static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, Arena *external_arena) {
     Arena *a = external_arena ? external_arena : arena_create(4194304); /* 4 MiB */
     int64_t started = (int64_t)time(NULL);
@@ -5252,11 +5504,27 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
     int total_rows = 0;
     const char *run_error = NULL;
     int total_retries = 0;
+    int total_delay_sec = 0;   /* cumulative retry sleep — capped to avoid DoS */
 
     p->nstep_results = 0;   /* fresh {@step:...} cache for this run */
     const char *prev_output = NULL;   /* previous step's output table → {@prev} */
 
-    for (int si = 0; si < p->nsteps; si++) {
+    /* Order steps by their deps[] (topological): a merge/branch step must run
+     * after every step it reads from, regardless of array order. Cycles fail the
+     * run up-front with a clear message. No-deps pipelines keep array order. */
+    int topo[MAX_STEPS];
+    char topo_err[320];
+    int topo_n = pipeline_topo_order(p, topo, topo_err, sizeof(topo_err));
+    if (topo_n < 0) {
+        snprintf(p->error_msg, sizeof(p->error_msg), "%s", topo_err);
+        LOG_ERROR("pipeline %s: %s", p->id, p->error_msg);
+        p->run_status = RUN_FAILED;
+        run_error = p->error_msg;
+        goto done;
+    }
+
+    for (int oi = 0; oi < topo_n; oi++) {
+        int si = topo[oi];
         PipelineStep *st = &p->steps[si];
         st->retry_count = 0;
         st->retry_after = 0;
@@ -5382,6 +5650,17 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                 break;
             }
 
+            /* Don't retry deterministic failures (auth/parse/missing/unreachable):
+             * they will fail identically on every attempt and only freeze the
+             * synchronous gateway worker through the backoff sleeps. */
+            if (error_is_nonretryable(p->error_msg)) {
+                LOG_WARN("step %s: non-retryable failure, not retrying: %s",
+                         st->id, p->error_msg);
+                p->run_status = RUN_FAILED;
+                run_error = p->error_msg[0] ? p->error_msg : "step failed";
+                goto done;
+            }
+
             if (st->retry_count >= st->max_retries) {
                 p->run_status = RUN_FAILED;
                 run_error = p->error_msg[0] ? p->error_msg : "step failed";
@@ -5391,6 +5670,18 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
             st->retry_count++;
             total_retries += 1;
             int delay = st->retry_delay_sec * (1 << (st->retry_count - 1));
+            /* Cap the cumulative sleep across the whole run. Once the budget is
+             * spent, fail fast instead of sleeping the worker any longer. */
+            if (total_delay_sec >= RETRY_TOTAL_DELAY_CAP_SEC) {
+                LOG_WARN("step %s: retry delay budget (%ds) exhausted, failing run",
+                         st->id, RETRY_TOTAL_DELAY_CAP_SEC);
+                p->run_status = RUN_FAILED;
+                run_error = p->error_msg[0] ? p->error_msg : "step failed";
+                goto done;
+            }
+            if (delay > RETRY_TOTAL_DELAY_CAP_SEC - total_delay_sec)
+                delay = RETRY_TOTAL_DELAY_CAP_SEC - total_delay_sec;
+            total_delay_sec += delay;
             st->retry_after = (int64_t)time(NULL) + delay;
             st->status = STEP_PENDING;
             LOG_WARN("step %s: retry %d/%d in %ds", st->id, st->retry_count, st->max_retries, delay);
@@ -5424,6 +5715,27 @@ void pipeline_execute_steps(Pipeline *p, App *app) {
     pipeline_execute_steps_internal(p, app, /*report=*/true, /*external_arena=*/NULL);
 }
 
+/* ── Async pipeline execution ───────────────────────────────────────────────
+ * A /run request copies the (fully-inline) Pipeline into a heap task and hands
+ * it to the worker pool, returning immediately. This frees the single HTTP
+ * event-loop thread: a long or blocking run can no longer wedge the whole
+ * gateway. The copy is self-contained — Pipeline owns no heap members except the
+ * run-scoped step_results cache (cleared below; the executor also resets it), so
+ * it is immune to concurrent scheduler add/remove (which swap-compacts the live
+ * array). The live pipeline stays RUN_RUNNING (set by the handler) until the
+ * worker writes the final status back atomically via scheduler_finish_run. */
+typedef struct { Pipeline pipe; App *app; } RunTask;
+
+static void run_task_fn(void *arg) {
+    RunTask *t = (RunTask *)arg;
+    memset(t->pipe.step_results, 0, sizeof(t->pipe.step_results));
+    t->pipe.nstep_results = 0;
+    pipeline_execute_steps_internal(&t->pipe, t->app, /*report=*/true, /*external_arena=*/NULL);
+    scheduler_finish_run(t->app->scheduler, t->pipe.id, t->pipe.run_status,
+                         t->pipe.run_status == RUN_SUCCESS ? 0 : 1, t->pipe.error_msg);
+    free(t);
+}
+
 /* ── POST /api/pipelines/:id/run ── */
 static void h_pipeline_run(HttpReq *req, HttpResp *resp) {
     const char *id=hm_get(&req->params,"id");
@@ -5436,8 +5748,17 @@ static void h_pipeline_run(HttpReq *req, HttpResp *resp) {
     Arena *ba=arena_create(256);
     app_ws_broadcast(&g_app,arena_sprintf(ba,"{\"event\":\"pipeline_run_started\",\"id\":\"%s\"}",id));
     arena_destroy(ba);
-    pipeline_execute_steps(p, &g_app);
-    http_resp_json(resp,200,"{\"status\":\"triggered\"}");
+    /* Hand the run to the worker pool so the HTTP thread returns at once. */
+    RunTask *t = malloc(sizeof(RunTask));
+    if (!t) {                                  /* OOM: degrade to a synchronous run */
+        pipeline_execute_steps(p, &g_app);
+        http_resp_json(resp,200,"{\"status\":\"triggered\"}");
+        return;
+    }
+    t->pipe = *p;                              /* full inline copy — stable for the worker */
+    t->app  = &g_app;
+    tp_submit(g_app.workers, run_task_fn, t);  /* executes off the HTTP event loop */
+    http_resp_json(resp,200,"{\"status\":\"queued\"}");
 }
 
 /* True if `tbl` occurs as a whole identifier token inside `hay` (so "orders"
@@ -5478,6 +5799,11 @@ static bool table_used_by_other_pipeline(const char *table, const char *exclude_
 static void h_pipeline_delete(HttpReq *req, HttpResp *resp) {
     const char *id=hm_get(&req->params,"id");
     if(!id){http_resp_error(resp,400,"missing id");return;}
+
+    /* Refuse to delete while a run is in flight on the worker pool: the worker
+     * still writes this pipeline's tables and logs its run. */
+    Pipeline *rp = scheduler_find(g_app.scheduler, id);
+    if(rp && rp->run_status==RUN_RUNNING){http_resp_error(resp,409,"pipeline is running");return;}
 
     /* Drop the engine tables this pipeline produced, using the same names the
      * runner assigns: an explicit target_table, else the pipeline name for the

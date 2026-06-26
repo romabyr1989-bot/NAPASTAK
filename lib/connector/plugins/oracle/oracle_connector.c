@@ -101,15 +101,56 @@ static void cfg_get(const char *json, const char *key, char *out, size_t outsz, 
 static void str_upper(char *s) { for (; *s; s++) *s = (char)toupper((unsigned char)*s); }
 static void str_lower(char *s) { for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
 
-/* Последняя ошибка ODPI-C из глобального контекста → лог. */
-static void ora_log_err(const char *what) {
-    dpiErrorInfo err;
-    if (gContextOk) {
-        dpiContext_getError(gContext, &err);
-        LOG_ERROR("oracle %s: %.*s", what, err.messageLength, err.message);
+/* Скопировать ODPI-C сообщение об ошибке в out, обрезав хвостовые CR/LF.
+ * Безопасно при err.message == NULL (ODPI-C может вернуть пустой error при
+ * отсутствии pending-ошибки — иначе %.*s по NULL даёт SIGSEGV). Если в out
+ * ничего осмысленного не попало, пишем fallback. */
+static void ora_copy_err(const dpiErrorInfo *err, char *out, size_t outsz,
+                         const char *fallback) {
+    if (!out || outsz == 0) return;
+    if (err && err->message && err->messageLength > 0) {
+        int n = (int)err->messageLength;
+        if ((size_t)n >= outsz) n = (int)outsz - 1;
+        memcpy(out, err->message, (size_t)n);
+        out[n] = '\0';
     } else {
-        LOG_ERROR("oracle %s: (no context)", what);
+        snprintf(out, outsz, "%s", fallback ? fallback : "Oracle error");
     }
+    size_t L = strlen(out);
+    while (L > 0 && (out[L-1] == '\n' || out[L-1] == '\r')) out[--L] = '\0';
+}
+
+/* Последняя ошибка ODPI-C из глобального контекста → лог + (опц.) в ctx->last_err.
+ * Текст сообщения ODPI-C уже содержит реальный ORA-код (напр. "ORA-01017: ...")
+ * — пробрасываем его как есть, не обобщая. */
+static void ora_capture_err(OraCtx *ctx, const char *what) {
+    char msg[512];
+    if (gContextOk) {
+        dpiErrorInfo err;
+        memset(&err, 0, sizeof(err));
+        dpiContext_getError(gContext, &err);
+        ora_copy_err(&err, msg, sizeof(msg),
+                     "Oracle error (no diagnostic available)");
+    } else {
+        snprintf(msg, sizeof(msg), "%s",
+                 gInitErr[0] ? gInitErr : "ODPI-C context unavailable");
+    }
+    LOG_ERROR("oracle %s: %s", what ? what : "error", msg);
+    if (ctx) snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", msg);
+}
+
+/* Старая сигнатура — только лог, без записи в ctx (для путей без ctx). */
+static void ora_log_err(const char *what) { ora_capture_err(NULL, what); }
+
+/* Гарантировать осмысленный last_err, когда подключения нет. ctx->last_err
+ * обычно уже содержит реальный ORA из create() (напр. ORA-01017) — сохраняем
+ * его. Если по какой-то причине пуст, ставим внятный fallback (а не пустоту,
+ * которая downstream обобщается до "list_entities failed"). */
+static int ora_no_conn(OraCtx *ctx, const char *what) {
+    if (ctx && !ctx->last_err[0])
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "oracle %s: подключение не установлено", what ? what : "operation");
+    return -1;
 }
 
 /* Маппинг Oracle data_type (строка из ALL_TAB_COLUMNS) + precision/scale в
@@ -212,17 +253,10 @@ static void *ora_create(const char *cfg, Arena *a) {
                        pass, (uint32_t)strlen(pass),
                        connstr, (uint32_t)strlen(connstr),
                        NULL, NULL, &ctx->conn) != DPI_SUCCESS) {
-        ora_log_err("connect");
-        if (gContextOk) {
-            dpiErrorInfo err;
-            dpiContext_getError(gContext, &err);
-            snprintf(ctx->last_err, sizeof(ctx->last_err), "%.*s",
-                     err.messageLength, err.message);
-            size_t L = strlen(ctx->last_err);
-            while (L > 0 && (ctx->last_err[L-1] == '\n' || ctx->last_err[L-1] == '\r'))
-                ctx->last_err[--L] = '\0';
-        }
-        ctx->conn = NULL;
+        /* Реальная причина (напр. "ORA-01017: invalid username/password") →
+         * ctx->last_err, чтобы last_error() отдал её downstream без обобщения. */
+        ora_capture_err(ctx, "connect");
+        ctx->conn = NULL;   /* ODPI-C не гарантирует conn==NULL после провала */
         return ctx;
     }
 
@@ -280,6 +314,7 @@ static char *ora_cell_to_str(Arena *a, dpiConn *conn,
                              dpiNativeTypeNum nt, dpiOracleTypeNum ot,
                              dpiData *data) {
     char buf[256];
+    if (!data) return arena_strdup(a, "");   /* защита от null-deref на путях ошибок */
     switch (nt) {
         case DPI_NATIVE_TYPE_INT64:
             snprintf(buf, sizeof(buf), "%lld", (long long)data->value.asInt64);
@@ -302,15 +337,16 @@ static char *ora_cell_to_str(Arena *a, dpiConn *conn,
             return arena_strdup(a, buf);
         case DPI_NATIVE_TYPE_BYTES: {
             uint32_t len = data->value.asBytes.length;
+            const char *ptr = data->value.asBytes.ptr;
             char *s = arena_alloc(a, (size_t)len + 1);
-            memcpy(s, data->value.asBytes.ptr, len);
+            if (ptr && len) memcpy(s, ptr, len);   /* ptr может быть NULL при len==0 */
             s[len] = '\0';
             return s;
         }
         case DPI_NATIVE_TYPE_LOB: {
             dpiLob *lob = data->value.asLOB;
             uint64_t size = 0;
-            if (dpiLob_getSize(lob, &size) != DPI_SUCCESS) return arena_strdup(a, "");
+            if (!lob || dpiLob_getSize(lob, &size) != DPI_SUCCESS) return arena_strdup(a, "");
             int is_blob = (ot == DPI_ORACLE_TYPE_BLOB);
             /* читаем порциями */
             uint64_t cap = is_blob ? size * 2 + 1 : size + 1;   /* BLOB → hex: 2 симв/байт */
@@ -349,7 +385,7 @@ static char *ora_cell_to_str(Arena *a, dpiConn *conn,
 /* ── list_entities(): таблицы и вьюхи схемы через ALL_TABLES/ALL_VIEWS ── */
 static int ora_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     OraCtx *ctx = vctx;
-    if (!ctx || !ctx->conn) return -1;
+    if (!ctx || !ctx->conn) return ora_no_conn(ctx, "list_entities");
 
     const char *sql =
         "SELECT table_name, 'table' AS etype FROM all_tables WHERE owner = :1 "
@@ -360,12 +396,12 @@ static int ora_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     dpiStmt *st;
     uint32_t ncols;
     if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
-        ora_log_err("list_entities prepare"); return -1;
+        ora_capture_err(ctx, "list_entities prepare"); return -1;
     }
     dpiData bind; dpiData_setBytes(&bind, ctx->schema, (uint32_t)strlen(ctx->schema));
     dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &bind);
     if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols) != DPI_SUCCESS) {
-        ora_log_err("list_entities execute"); dpiStmt_release(st); return -1;
+        ora_capture_err(ctx, "list_entities execute"); dpiStmt_release(st); return -1;
     }
 
     /* Соберём в динамический список (число строк заранее неизвестно). */
@@ -402,7 +438,7 @@ static int ora_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
 /* ── describe(): схема через ALL_TAB_COLUMNS ── */
 static int ora_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     OraCtx *ctx = vctx;
-    if (!ctx || !ctx->conn) return -1;
+    if (!ctx || !ctx->conn) return ora_no_conn(ctx, "describe");
 
     char ent[128];
     strncpy(ent, entity ? entity : "", sizeof(ent)-1); ent[sizeof(ent)-1]='\0';
@@ -415,7 +451,7 @@ static int ora_describe(void *vctx, Arena *a, const char *entity, Schema **out) 
 
     dpiStmt *st; uint32_t ncols;
     if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
-        ora_log_err("describe prepare"); return -1;
+        ora_capture_err(ctx, "describe prepare"); return -1;
     }
     dpiData b1, b2;
     dpiData_setBytes(&b1, ctx->schema, (uint32_t)strlen(ctx->schema));
@@ -423,7 +459,7 @@ static int ora_describe(void *vctx, Arena *a, const char *entity, Schema **out) 
     dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &b1);
     dpiStmt_bindValueByPos(st, 2, DPI_NATIVE_TYPE_BYTES, &b2);
     if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols) != DPI_SUCCESS) {
-        ora_log_err("describe execute"); dpiStmt_release(st); return -1;
+        ora_capture_err(ctx, "describe execute"); dpiStmt_release(st); return -1;
     }
 
     int cap = 32, n = 0;
@@ -477,7 +513,7 @@ static int ora_describe(void *vctx, Arena *a, const char *entity, Schema **out) 
 static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                           const char *entity, ColBatch **out_batch) {
     OraCtx *ctx = vctx;
-    if (!ctx || !ctx->conn) return -1;
+    if (!ctx || !ctx->conn) return ora_no_conn(ctx, "read_batch");
 
     int64_t limit = (req && req->limit > 0) ? req->limit : (int64_t)ctx->batch_size;
     if (limit > BATCH_SIZE) limit = BATCH_SIZE;
@@ -491,9 +527,16 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     if (is_subquery) {
         snprintf(src, sizeof(src), "(%s)", raw);
     } else {
+        /* Имя НЕ цитируем: Oracle сам приводит unquoted-идентификатор к UPPER,
+         * поэтому 'qa2_k5_sink' и 'QA2_K5_SINK' резолвятся одинаково. Это даёт
+         * единообразие с sink-путём (write_batch тоже пишет без кавычек) —
+         * иначе sink создаёт точно-регистровую таблицу, а read её не находит
+         * (ORA-942). Схему оставляем без кавычек по той же причине. */
         strncpy(ent, raw, sizeof(ent)-1); ent[sizeof(ent)-1]='\0';
-        str_upper(ent);
-        snprintf(src, sizeof(src), "\"%s\".\"%s\"", ctx->schema, ent);
+        if (ctx->schema[0])
+            snprintf(src, sizeof(src), "%s.%s", ctx->schema, ent);
+        else
+            snprintf(src, sizeof(src), "%s", ent);
     }
 
     bool incremental = ctx->cursor_column[0] != '\0';
@@ -544,14 +587,14 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 
     dpiStmt *st; uint32_t ncols_raw;
     if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
-        ora_log_err("read_batch prepare"); return -1;
+        ora_capture_err(ctx, "read_batch prepare"); return -1;
     }
     if (has_cursor_val) {
         dpiData b; dpiData_setBytes(&b, (char *)cursor, (uint32_t)strlen(cursor));
         dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &b);
     }
     if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols_raw) != DPI_SUCCESS) {
-        ora_log_err("read_batch execute"); dpiStmt_release(st); return -1;
+        ora_capture_err(ctx, "read_batch execute"); dpiStmt_release(st); return -1;
     }
 
     /* Метаданные колонок. Отбрасываем служебную DFO__RN (11g offset). */
@@ -563,18 +606,33 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     int *raw_to_out = arena_alloc(a, (size_t)ncols * sizeof(int));
     for (int c = 0; c < ncols; c++) {
         dpiQueryInfo qi;
-        if (dpiStmt_getQueryInfo(st, (uint32_t)(c+1), &qi) != DPI_SUCCESS) { raw_to_out[c] = -1; continue; }
+        /* getQueryInfo на error-пути может вернуть DPI_FAILURE с реальным ORA —
+         * не «глотаем» молча (это раньше прятало ошибку и шло читать сбойный
+         * stmt), а захватываем текст, освобождаем stmt и выходим. */
+        if (dpiStmt_getQueryInfo(st, (uint32_t)(c+1), &qi) != DPI_SUCCESS) {
+            ora_capture_err(ctx, "read_batch query info");
+            dpiStmt_release(st); return -1;
+        }
         char nm[160];
+        const char *qn = qi.name ? qi.name : "";
         uint32_t nlen = qi.nameLength < sizeof(nm)-1 ? qi.nameLength : (uint32_t)sizeof(nm)-1;
-        memcpy(nm, qi.name, nlen); nm[nlen] = '\0';
+        if (nlen) memcpy(nm, qn, nlen);
+        nm[nlen] = '\0';
         if (!strcasecmp(nm, "DFO__RN")) { raw_to_out[c] = -1; continue; }   /* служебная */
         otype[ncols_out] = qi.typeInfo.oracleTypeNum;
         /* NUMBER читаем нативной строкой (Oracle конвертит → точный десятичный
          * текст), а не через double — иначе 540.20 превращается в
          * 540.20000000000005 и теряется точность для NUMBER > 2^53. */
-        if (qi.typeInfo.oracleTypeNum == DPI_ORACLE_TYPE_NUMBER)
-            dpiStmt_defineValue(st, (uint32_t)(c+1), DPI_ORACLE_TYPE_VARCHAR,
-                                DPI_NATIVE_TYPE_BYTES, 128, 0, NULL);
+        if (qi.typeInfo.oracleTypeNum == DPI_ORACLE_TYPE_NUMBER) {
+            /* Неуспешный defineValue оставляет колонку с невалидным буфером —
+             * последующий getQueryValue вернёт мусорный/NULL dpiData и роняет
+             * gateway. Проверяем результат и выходим по ошибке. */
+            if (dpiStmt_defineValue(st, (uint32_t)(c+1), DPI_ORACLE_TYPE_VARCHAR,
+                                    DPI_NATIVE_TYPE_BYTES, 128, 0, NULL) != DPI_SUCCESS) {
+                ora_capture_err(ctx, "read_batch define value");
+                dpiStmt_release(st); return -1;
+            }
+        }
         /* cursor bookmark column (сравнение без регистра) */
         if (incremental && !strcasecmp(nm, cc)) cursor_out_idx = ncols_out;
         str_lower(nm);
@@ -600,14 +658,29 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     char *last_cursor_val = NULL;
     while (nrows < (int)limit) {
         int found = 0; uint32_t ri;
-        if (dpiStmt_fetch(st, &found, &ri) != DPI_SUCCESS || !found) break;
+        /* Разделяем «чистый конец данных» (found==0) и реальный сбой fetch
+         * (DPI_FAILURE → может нести ORA, напр. ORA-942 на исчезнувшей вьюхе
+         * посреди выборки). На ошибке — захват + release не-NULL stmt + return,
+         * иначе раньше частичный батч молча выдавался как success. */
+        int fr = dpiStmt_fetch(st, &found, &ri);
+        if (fr != DPI_SUCCESS) {
+            ora_capture_err(ctx, "read_batch fetch");
+            dpiStmt_release(st); return -1;
+        }
+        if (!found) break;
         for (int c = 0; c < ncols; c++) {
             int oc = raw_to_out[c];
             if (oc < 0) continue;   /* DFO__RN или сбойная колонка */
-            dpiNativeTypeNum nt; dpiData *d;
-            if (dpiStmt_getQueryValue(st, (uint32_t)(c+1), &nt, &d) != DPI_SUCCESS || d->isNull) {
+            dpiNativeTypeNum nt; dpiData *d = NULL;
+            /* NULL по контракту DFO: ставим и null_bitmap (для приёмников),
+             * и сам сентинел в ячейку — материализация/движок ловят его по
+             * строке, а не по указателю NULL (NULL-указатель downstream даёт
+             * "" и теряет NULL-семантику). d может быть NULL при сбое
+             * getQueryValue — проверяем перед разыменованием d->isNull. */
+            if (dpiStmt_getQueryValue(st, (uint32_t)(c+1), &nt, &d) != DPI_SUCCESS
+                || !d || d->isNull) {
                 batch->null_bitmap[oc][nrows/8] |= (uint8_t)(1u << (nrows % 8));
-                ((char **)batch->values[oc])[nrows] = NULL;
+                ((char **)batch->values[oc])[nrows] = arena_strdup(a, DFO_NULL_SENTINEL);
                 continue;
             }
             char *s = ora_cell_to_str(a, ctx->conn, nt, otype[oc], d);
@@ -659,15 +732,19 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
         for (int c = 0; c < ncols; c++)
             off += (size_t)snprintf(cols+off, cap-off, "%s\"%s\" VARCHAR2(4000)", c?", ":"", schema->cols[c].name);
         size_t dcap = cap + 600; char *ddl = malloc(dcap);
+        /* Имя таблицы НЕ цитируем — Oracle приведёт его к UPPER, ровно так же
+         * её потом находит read_batch (тоже без кавычек). С кавычками sink
+         * создавал таблицу с точным регистром (напр. lower-case), которую
+         * upper-резолвящий read не мог прочитать → ORA-942 на read-back. */
         snprintf(ddl, dcap,
-            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE \"%s\" (%s)'; "
+            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE %s (%s)'; "
             "EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
             entity, cols);
         int rc = ora_exec_chk(ctx->conn, ddl); free(cols); free(ddl);
         if (rc < 0) return -1;
     }
     if (mode == DFO_SINK_OVERWRITE) {
-        char trunc[600]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE \"%s\"", entity);
+        char trunc[600]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE %s", entity);
         ora_exec_chk(ctx->conn, trunc);
     }
 
@@ -687,7 +764,7 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
             off += (size_t)snprintf(sql+off, cap-off, __VA_ARGS__); } while(0)
         ORA_APP("INSERT ALL ");   /* Oracle multi-row: INSERT ALL ... SELECT 1 FROM dual */
         for (int r = start; r < end; r++) {
-            ORA_APP("INTO \"%s\" %s VALUES (", entity, collist);
+            ORA_APP("INTO %s %s VALUES (", entity, collist);
             for (int c = 0; c < ncols; c++) {
                 const uint8_t *bm = batch->null_bitmap[c];
                 if (bm && ((bm[r/8] >> (r%8)) & 1u)) { ORA_APP("%sNULL", c?", ":""); continue; }
@@ -700,6 +777,9 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
                     default: break;
                 }
                 const char *v = ((char**)batch->values[c])[r]; if (!v) v = "";
+                /* Подстраховка: ячейка-сентинел NULL (если sink-путь в api.c не
+                 * выставил null_bitmap) — пишем настоящий NULL, а не литерал. */
+                if (strcmp(v, DFO_NULL_SENTINEL) == 0) { ORA_APP("%sNULL", c?", ":""); continue; }
                 ORA_APP("%s'", c?", ":"");
                 for (const char *p=v; *p; p++) { if (*p=='\'') ORA_APP("''"); else ORA_APP("%c", *p); }
                 ORA_APP("'");
