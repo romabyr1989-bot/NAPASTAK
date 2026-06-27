@@ -493,7 +493,19 @@ void scheduler_finish_run(Scheduler *s, const char *id, int run_status,
 }
 
 /* Запуск/останов фонового потока планировщика; stop дожидается завершения потока. */
-void scheduler_start(Scheduler *s) { s->running=1; pthread_create(&s->thread,NULL,sched_loop,s); }
+void scheduler_start(Scheduler *s) {
+    s->running=1;
+    /* sched_loop runs full pipeline execution inline (deep SQL eval, large
+     * stack frames). The pthread default stack (512 KiB on macOS) overflows and
+     * faults — match the 8 MiB the worker pool and main thread use. */
+    pthread_attr_t attr; pthread_attr_t *ap = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+        ap = &attr;
+    }
+    pthread_create(&s->thread, ap, sched_loop, s);
+    if (ap) pthread_attr_destroy(&attr);
+}
 void scheduler_stop(Scheduler *s)  { s->running=0; pthread_join(s->thread,NULL); }
 
 /* Step 4: webhook-trigger lookup. O(N×T) — fine for typical pipeline counts. */

@@ -274,6 +274,21 @@ static bool pnum(const char *s, double *o) {
     return true;
 }
 
+/* Shortest decimal string that round-trips the double EXACTLY. %.10g (10 sig
+ * figs) silently rounds money over ~1e8 (123456789.99 -> 123456790), which is
+ * unacceptable for a bank's control sums; this tries increasing precision and
+ * stops at the shortest that parses back to the same bits — so simple values
+ * stay clean (0.1 -> "0.1") while large money keeps every kopeck. */
+static const char *dbl_fmt(Arena *a, double d) {
+    /* 15 significant digits (DBL_DIG): exact to the kopeck for any realistic
+     * money value (balances up to ~1e13 with cents) and clean output —
+     * "123456789.99" not "123456790" (the old %.10g) and not the float-noise
+     * "...10000002" that a full round-trip (%.17g) would expose on sums. */
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%.15g", d);
+    return arena_strdup(a, buf);
+}
+
 static const char *val_str(Val v, Arena *a) {
     if (v.is_null)  return "";
     if (v.str)      return v.str;
@@ -282,7 +297,7 @@ static const char *val_str(Val v, Arena *a) {
         double n = v.num;
         if (n == (int64_t)n && fabs(n) < 1e15)
             return arena_sprintf(a, "%lld", (long long)(int64_t)n);
-        return arena_sprintf(a, "%.10g", n);
+        return dbl_fmt(a, n);
     }
     return "";
 }
@@ -467,11 +482,30 @@ typedef struct GrpAcc_s {
     int     total_cnt;
     bool   *min_set, *max_set;
     char  **first_str;
+    /* DISTINCT aggregates (COUNT/SUM/AVG DISTINCT): per-select-column set of
+     * already-seen value strings, so a repeated value is counted/summed once. */
+    char ***dvals;
+    int    *dcnt, *dcap;
 } GrpAcc;
 
 /* Thread-local group context: lets eval_val resolve agg funcs during group emission */
 static __thread GrpAcc           *tl_grp = NULL;
 static __thread const SelectStmt *tl_sel = NULL;
+/* Aggregates referenced ONLY in HAVING/ORDER BY (not the SELECT list) get
+ * accumulator slots appended after the select slots. tl_xagg exposes them to
+ * eval_func during group emission. */
+static __thread Expr            **tl_xagg  = NULL;
+static __thread int               tl_nxagg = 0;
+
+/* Read aggregate fn's accumulated value from group slot s. */
+static Val agg_slot_value(GrpAcc *g, int s, const char *fn) {
+    if (!strcasecmp(fn,"COUNT")) return vnum((double)g->cnts[s]);
+    if (!strcasecmp(fn,"SUM"))   return vnum(g->sums[s]);
+    if (!strcasecmp(fn,"AVG"))   return vnum(g->cnts[s] ? g->sums[s]/g->cnts[s] : 0.0);
+    if (!strcasecmp(fn,"MIN"))   return g->min_set[s] ? vnum(g->mins[s]) : vnull();
+    if (!strcasecmp(fn,"MAX"))   return g->max_set[s] ? vnum(g->maxs[s]) : vnull();
+    return vnull();
+}
 /* Thread-local outer join context: for correlated subqueries */
 static __thread JoinCtx          *tl_outer_ctx = NULL;
 
@@ -480,6 +514,12 @@ typedef struct { Expr *win_expr; char **values; } WinValEntry;
 static __thread WinValEntry *tl_win_vals    = NULL;
 static __thread int          tl_nwin_vals   = 0;
 static __thread int          tl_win_cur_row = -1;
+
+/* Thread-local execution error: set when exec_select hits an unresolvable
+ * source table (no such table). Lets callers distinguish a real failure from a
+ * legitimately empty result. Cleared at the top of each top-level exec_stmt.
+ * NOTE: a missing table is an ERROR; an existing table with 0 rows is NOT. */
+static __thread char tl_exec_error[256] = {0};
 
 /* ── Expression evaluator ── */
 
@@ -542,6 +582,69 @@ static double api_jaro_winkler(const char *s1, const char *s2, Arena *a) {
     return jaro + (double)pref * 0.1 * (1.0 - jaro);
 }
 
+/* ── UTF-8 helpers for length()/substr() ──
+ * length() and substr() must operate on UTF-8 code points, not raw bytes, so
+ * multibyte text (Cyrillic / diacritics in ФИО) is counted and sliced
+ * correctly. We don't decode into code points; instead we walk the byte string
+ * tracking code-point boundaries (lead bytes), which keeps a clean byte slice
+ * for the output. Mirrors the decode logic in qengine.c's qe_utf8_decode but
+ * stays local to api.c per the change scope. */
+
+/* Number of bytes in the UTF-8 sequence starting at lead byte c (1..4); a
+ * stray/continuation byte counts as 1 so latin1/garbage degrades to bytes. */
+static size_t u8_seq_len(unsigned char c) {
+    if (c < 0x80)              return 1;
+    else if ((c & 0xE0)==0xC0) return 2;
+    else if ((c & 0xF0)==0xE0) return 3;
+    else if ((c & 0xF8)==0xF0) return 4;
+    return 1;
+}
+
+/* Count UTF-8 code points in s. Pure ASCII == strlen, so latin text is
+ * unaffected. */
+static size_t u8_cplen(const char *s) {
+    size_t n = 0, i = 0, blen = s ? strlen(s) : 0;
+    while (i < blen) {
+        size_t l = u8_seq_len((unsigned char)s[i]);
+        if (i + l > blen) l = 1;             /* truncated tail */
+        /* validate continuation bytes; if bad, treat lead as 1 byte */
+        for (size_t k = 1; k < l; k++) {
+            if (((unsigned char)s[i+k] & 0xC0) != 0x80) { l = 1; break; }
+        }
+        i += l; n++;
+    }
+    return n;
+}
+
+/* Byte offset of the cp-th (0-based) code point in s; returns strlen(s) if cp
+ * is past the end. */
+static size_t u8_byte_at(const char *s, size_t cp) {
+    size_t i = 0, n = 0, blen = s ? strlen(s) : 0;
+    while (i < blen && n < cp) {
+        size_t l = u8_seq_len((unsigned char)s[i]);
+        if (i + l > blen) l = 1;
+        for (size_t k = 1; k < l; k++) {
+            if (((unsigned char)s[i+k] & 0xC0) != 0x80) { l = 1; break; }
+        }
+        i += l; n++;
+    }
+    return i;
+}
+
+/* substr by code points, 1-based start, len in code points (len<0 → to end). */
+static char *u8_substr(Arena *a, const char *s, int start1, long len, bool have_len) {
+    int start0 = start1 - 1;
+    if (start0 < 0) start0 = 0;
+    size_t total = u8_cplen(s);
+    if ((size_t)start0 >= total) return arena_strdup(a, "");
+    long avail = (long)(total - (size_t)start0);
+    long take = (!have_len || len < 0 || len > avail) ? avail : len;
+    if (take < 0) take = 0;
+    size_t bstart = u8_byte_at(s, (size_t)start0);
+    size_t bend   = u8_byte_at(s, (size_t)start0 + (size_t)take);
+    return arena_strndup(a, s + bstart, bend - bstart);
+}
+
 static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena *a) {
     /* scalar functions */
     if (!strcasecmp(fn,"coalesce") || !strcasecmp(fn,"ifnull") || !strcasecmp(fn,"nvl")) {
@@ -588,6 +691,7 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
             if (a0.is_null) return vnull(); return vnum(ceil(n0));
         }
         if (!strcasecmp(fn,"floor")) { if (a0.is_null) return vnull(); return vnum(floor(n0)); }
+        if (!strcasecmp(fn,"round") && nargs==1) { if (a0.is_null) return vnull(); return vnum(round(n0)); }
         if (!strcasecmp(fn,"sqrt"))  { if (a0.is_null) return vnull(); return vnum(sqrt(n0 > 0 ? n0 : 0)); }
         if (!strcasecmp(fn,"exp"))   { if (a0.is_null) return vnull(); return vnum(exp(n0)); }
         if (!strcasecmp(fn,"ln")   || !strcasecmp(fn,"log"))  {
@@ -616,7 +720,8 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
             return vstr_s((char *)qe_normalize_name(s0, a));
         }
         if (!strcasecmp(fn,"length") || !strcasecmp(fn,"len") || !strcasecmp(fn,"char_length")) {
-            if (a0.is_null) return vnull(); return vnum((double)strlen(s0));
+            /* count UTF-8 code points, not bytes (ASCII == strlen) */
+            if (a0.is_null) return vnull(); return vnum((double)u8_cplen(s0));
         }
         if (!strcasecmp(fn,"ltrim")) {
             if (a0.is_null) return vnull();
@@ -675,6 +780,20 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
                 int dec = (int)n1;
                 double factor = pow(10.0, (double)dec);
                 return vnum(round(n0 * factor) / factor);
+            }
+            /* substr/substring/mid: UTF-8 code-point aware, 1-based start.
+             * 2-arg form substr(str,start) = start..end of string; 3-arg form
+             * substr(str,start,len) takes `len` code points. ASCII behaves as
+             * before; multibyte (Cyrillic) no longer splits a code point. */
+            if (!strcasecmp(fn,"substr") || !strcasecmp(fn,"substring") || !strcasecmp(fn,"mid")) {
+                if (a0.is_null) return vnull();
+                bool have_len = (nargs >= 3);
+                long len = 0;
+                if (have_len) {
+                    Val a2 = eval_val(args[2],ctx,a);
+                    if (a2.is_null) len = 0; else len = (long)a2.num;
+                }
+                return vstr_s(u8_substr(a, s0, (int)n1, len, have_len));
             }
             if (!strcasecmp(fn,"power") || !strcasecmp(fn,"pow")) {
                 if (a0.is_null) return vnull(); return vnum(pow(n0,n1));
@@ -754,15 +873,7 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
             if (nargs >= 3) {
                 Val a2 = eval_val(args[2],ctx,a);
                 const char *s2 = val_str(a2, a);
-                if (!strcasecmp(fn,"substr") || !strcasecmp(fn,"substring") || !strcasecmp(fn,"mid")) {
-                    if (a0.is_null) return vnull();
-                    int start=(int)n1-1; int len=(int)(a2.is_null?0:a2.num); /* 1-based */
-                    if(start<0)start=0;
-                    size_t sl=strlen(s0);
-                    if((size_t)start>=sl) return vstr_s("");
-                    if(len<0||(size_t)(start+len)>sl) len=(int)(sl-start);
-                    return vstr_s(arena_strndup(a,s0+start,(size_t)len));
-                }
+                /* substr/substring/mid handled UTF-8-aware in the nargs>=2 block above */
                 if (!strcasecmp(fn,"replace")) {
                     if (a0.is_null) return vnull();
                     if (!s1||!*s1) return a0;
@@ -829,17 +940,17 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
         if (tl_grp && tl_sel) {
             GrpAcc *g = tl_grp;
             const SelectStmt *sel = tl_sel;
-            /* find matching select slot by expr pointer identity (handles ROUND(AVG(x)) etc.) */
+            /* match an accumulator slot by argument STRUCTURE: first the SELECT
+             * list, then the HAVING/ORDER-only extra slots (so HAVING SUM(x)>N
+             * with x not selected still resolves to a real accumulator). */
             for (int i=0; i<sel->nselect; i++) {
                 Expr *se=sel->select_list[i];
                 Expr *sb=(se->type==EXPR_ALIAS)?se->expr:se;
-                if (!expr_find_agg_args(sb, fn, args, nargs)) continue;
-                if (!strcasecmp(fn,"COUNT")) return vnum((double)g->cnts[i]);
-                if (!strcasecmp(fn,"SUM"))   return vnum(g->sums[i]);
-                if (!strcasecmp(fn,"AVG"))   return vnum(g->cnts[i] ? g->sums[i]/g->cnts[i] : 0.0);
-                if (!strcasecmp(fn,"MIN"))   return g->min_set[i] ? vnum(g->mins[i]) : vnull();
-                if (!strcasecmp(fn,"MAX"))   return g->max_set[i] ? vnum(g->maxs[i]) : vnull();
+                if (expr_find_agg_args(sb, fn, args, nargs)) return agg_slot_value(g, i, fn);
             }
+            for (int e=0; e<tl_nxagg; e++)
+                if (expr_find_agg_args(tl_xagg[e], fn, args, nargs))
+                    return agg_slot_value(g, sel->nselect + e, fn);
             /* fallback: total count for COUNT(*) */
             if (!strcasecmp(fn,"COUNT")) return vnum((double)g->total_cnt);
         }
@@ -879,7 +990,10 @@ static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
         const char *s = jctx_col(ctx, e->table, e->name);
         /* correlated subquery: fall back to outer context if not found */
         if (!s && tl_outer_ctx) s = jctx_col(tl_outer_ctx, e->table, e->name);
-        if (!s) return vnull();
+        /* Treat NULL and any sub-page (non-pointer) cell as SQL NULL: a real
+         * string is never in the first page, so this turns a corrupt/legacy
+         * native-numeric cell into NULL instead of SIGSEGV-ing on strcmp below. */
+        if (!s || (uintptr_t)s < 0x1000) return vnull();
         /* NULL contract: a cell carrying the sentinel is a true SQL NULL.
          * Map it back to a NULL-Val so IS NULL / COUNT(col) / COALESCE and
          * projection treat it as NULL rather than leaking the literal text. */
@@ -1071,7 +1185,7 @@ static const char *expr_name(Expr *e, int pos, Arena *a) {
     if (e->type == EXPR_WINDOW)  return e->func_name ? e->func_name : arena_sprintf(a,"col%d",pos+1);
     if (e->type == EXPR_STAR)  return "*";
     if (e->type == EXPR_LITERAL_INT)   return arena_sprintf(a,"%lld",(long long)e->ival);
-    if (e->type == EXPR_LITERAL_FLOAT) return arena_sprintf(a,"%.10g",e->fval);
+    if (e->type == EXPR_LITERAL_FLOAT) return dbl_fmt(a, e->fval);
     if (e->type == EXPR_LITERAL_STR)   return e->sval;
     return arena_sprintf(a,"col%d",pos+1);
 }
@@ -1291,9 +1405,17 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
                             ColType t = (batch->schema && c < batch->schema->ncols) ? batch->schema->cols[c].type : COL_TEXT;
                             switch (t) {
                                 case COL_INT64: row[c]=arena_sprintf(a,"%lld",(long long)((int64_t*)batch->values[c])[r]); break;
-                                case COL_DOUBLE: row[c]=arena_sprintf(a,"%.10g",((double*)batch->values[c])[r]); break;
+                                case COL_DOUBLE: row[c]=dbl_fmt(a, ((double*)batch->values[c])[r]); break;
                                 case COL_BOOL:  row[c]=((int64_t*)batch->values[c])[r]?"true":"false"; break;
-                                case COL_TEXT:  row[c]=((char**)batch->values[c])[r]?:DFO_NULL_SENTINEL; break;
+                                case COL_TEXT:  {
+                                    char *cv=((char**)batch->values[c])[r];
+                                    /* Robustness: in a legacy/corrupt batch a COL_INT64 value (a tiny
+                                     * integer like a kafka_offset) can sit under a COL_TEXT slot; deref-ing
+                                     * it as a string would SIGSEGV the whole gateway (DoS). A real arena/heap
+                                     * string pointer is never in the first page — treat sub-page values as NULL. */
+                                    row[c]=((uintptr_t)cv < 0x1000) ? DFO_NULL_SENTINEL : cv;
+                                    break;
+                                }
                                 default:        row[c]=DFO_NULL_SENTINEL; break;
                             }
                         }
@@ -1360,6 +1482,8 @@ typedef struct {
     bool              implicit_agg;  /* agg with no GROUP BY */
     GrpAcc           *grps;
     int               ngrps, cap_grps;
+    Expr            **xagg;   /* aggregates only in HAVING/ORDER BY → extra accumulator slots */
+    int               nxagg;
 } ExecState;
 
 
@@ -1374,7 +1498,7 @@ static GrpAcc *find_or_create_grp(ExecState *st, const char *key) {
     GrpAcc *g=&st->grps[st->ngrps++];
     memset(g,0,sizeof(*g));
     g->key=arena_strdup(st->a,key);
-    int nc=st->sel->nselect;
+    int nc=st->sel->nselect + st->nxagg;   /* select slots + HAVING/ORDER extra-agg slots */
     g->sums     =arena_calloc(st->a,(size_t)nc*sizeof(double));
     g->mins     =arena_alloc (st->a,(size_t)nc*sizeof(double)); memset(g->mins,0,(size_t)nc*sizeof(double));
     g->maxs     =arena_alloc (st->a,(size_t)nc*sizeof(double)); memset(g->maxs,0,(size_t)nc*sizeof(double));
@@ -1382,7 +1506,47 @@ static GrpAcc *find_or_create_grp(ExecState *st, const char *key) {
     g->min_set  =arena_calloc(st->a,(size_t)nc*sizeof(bool));
     g->max_set  =arena_calloc(st->a,(size_t)nc*sizeof(bool));
     g->first_str=arena_calloc(st->a,(size_t)nc*sizeof(char*));
+    g->dvals    =arena_calloc(st->a,(size_t)nc*sizeof(char**));
+    g->dcnt     =arena_calloc(st->a,(size_t)nc*sizeof(int));
+    g->dcap     =arena_calloc(st->a,(size_t)nc*sizeof(int));
     return g;
+}
+
+/* For a DISTINCT aggregate on select-column s: returns true if value `sv` is new
+ * (and records it), false if already seen — so the caller counts/sums it once. */
+static bool agg_distinct_first_seen(ExecState *st, GrpAcc *g, int s, const char *sv) {
+    for (int k=0;k<g->dcnt[s];k++) if(!strcmp(g->dvals[s][k],sv)) return false;
+    if (g->dcnt[s]==g->dcap[s]) {
+        int nc=g->dcap[s]?g->dcap[s]*2:8;
+        char **nb=arena_alloc(st->a,(size_t)nc*sizeof(char*));
+        if(g->dcnt[s]) memcpy(nb,g->dvals[s],(size_t)g->dcnt[s]*sizeof(char*));
+        g->dvals[s]=nb; g->dcap[s]=nc;
+    }
+    g->dvals[s][g->dcnt[s]++]=arena_strdup(st->a,sv);
+    return true;
+}
+
+/* Accumulate one aggregate-function value (agg_e) into group slot s. */
+static void agg_accumulate(ExecState *st, GrpAcc *g, int s, Expr *agg_e, JoinCtx *ctx) {
+    const char *fn=agg_e->func_name;
+    bool is_star=(agg_e->nargs>0 && agg_e->args[0]->type==EXPR_STAR);
+    bool distinct=agg_e->func_distinct;   /* COUNT/SUM/AVG(DISTINCT ...) */
+    if (!strcasecmp(fn,"COUNT")) {
+        if (is_star) g->cnts[s]++;
+        else {
+            Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
+            if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,st->a))))
+                g->cnts[s]++;
+        }
+    } else {
+        Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
+        if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,st->a)))) {
+            double n=v.num; if (!v.is_num) pnum(val_str(v,st->a),&n);
+            g->sums[s]+=n; g->cnts[s]++;
+            if (!g->min_set[s]||n<g->mins[s]){g->mins[s]=n;g->min_set[s]=true;}
+            if (!g->max_set[s]||n>g->maxs[s]){g->maxs[s]=n;g->max_set[s]=true;}
+        }
+    }
 }
 
 static void agg_row(ExecState *st, GrpAcc *g, JoinCtx *ctx) {
@@ -1392,32 +1556,15 @@ static void agg_row(ExecState *st, GrpAcc *g, JoinCtx *ctx) {
         Expr *base=(se->type==EXPR_ALIAS)?se->expr:se;
         Expr *agg_e = (base->type==EXPR_FUNC && base->func_name && is_agg_name(base->func_name))
                       ? base : find_first_agg(base);
-        if (agg_e) {
-            const char *fn=agg_e->func_name;
-            bool is_star=(agg_e->nargs>0&&agg_e->args[0]->type==EXPR_STAR);
-            if (!strcasecmp(fn,"COUNT")) {
-                if (is_star) g->cnts[s]++;
-                else {
-                    Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
-                    if (!v.is_null) g->cnts[s]++;
-                }
-            } else {
-                Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
-                if (!v.is_null) {
-                    double n=v.num; if (!v.is_num) pnum(val_str(v,st->a),&n);
-                    g->sums[s]+=n; g->cnts[s]++;
-                    if (!g->min_set[s]||n<g->mins[s]){g->mins[s]=n;g->min_set[s]=true;}
-                    if (!g->max_set[s]||n>g->maxs[s]){g->maxs[s]=n;g->max_set[s]=true;}
-                }
-            }
-        } else {
-            /* non-agg: keep first value */
-            if (!g->first_str[s]) {
-                Val v=eval_val(base,ctx,st->a);
-                g->first_str[s]=arena_strdup(st->a,val_str(v,st->a));
-            }
+        if (agg_e) agg_accumulate(st, g, s, agg_e, ctx);
+        else if (!g->first_str[s]) {       /* non-agg: keep first value */
+            Val v=eval_val(base,ctx,st->a);
+            g->first_str[s]=arena_strdup(st->a,val_str(v,st->a));
         }
     }
+    /* aggregates appearing only in HAVING/ORDER BY → appended accumulator slots */
+    for (int e=0;e<st->nxagg;e++)
+        agg_accumulate(st, g, st->sel->nselect + e, st->xagg[e], ctx);
 }
 
 static void emit_groups(ExecState *st) {
@@ -1436,6 +1583,7 @@ static void emit_groups(ExecState *st) {
         /* expose group to eval_val so ROUND(AVG(x)) etc. work */
         tl_grp = g;
         tl_sel = st->sel;
+        tl_xagg = st->xagg; tl_nxagg = st->nxagg;
 
         char **cells=arena_alloc(st->a,(size_t)nc*sizeof(char*));
         JoinCtx empty_ctx={0};
@@ -1446,10 +1594,10 @@ static void emit_groups(ExecState *st) {
                 /* pure aggregate at top level — read directly from accumulator */
                 const char *fn=base->func_name;
                 if (!strcasecmp(fn,"COUNT")) cells[s]=arena_sprintf(st->a,"%d",g->cnts[s]);
-                else if (!strcasecmp(fn,"SUM")) cells[s]=arena_sprintf(st->a,"%.10g",g->sums[s]);
-                else if (!strcasecmp(fn,"AVG")) cells[s]=g->cnts[s]?arena_sprintf(st->a,"%.10g",g->sums[s]/g->cnts[s]):"";
-                else if (!strcasecmp(fn,"MIN")) cells[s]=g->min_set[s]?arena_sprintf(st->a,"%.10g",g->mins[s]):"";
-                else if (!strcasecmp(fn,"MAX")) cells[s]=g->max_set[s]?arena_sprintf(st->a,"%.10g",g->maxs[s]):"";
+                else if (!strcasecmp(fn,"SUM")) cells[s]=dbl_fmt(st->a, g->sums[s]);
+                else if (!strcasecmp(fn,"AVG")) cells[s]=g->cnts[s]?dbl_fmt(st->a, g->sums[s]/g->cnts[s]):"";
+                else if (!strcasecmp(fn,"MIN")) cells[s]=g->min_set[s]?dbl_fmt(st->a, g->mins[s]):"";
+                else if (!strcasecmp(fn,"MAX")) cells[s]=g->max_set[s]?dbl_fmt(st->a, g->maxs[s]):"";
                 else cells[s]="";
             } else if (expr_has_agg(base)) {
                 /* expression wrapping aggregate (e.g. ROUND(AVG(x))) — eval with group ctx */
@@ -1661,15 +1809,47 @@ static Expr *find_first_agg(Expr *e) {
 }
 
 /* Return true if expr tree contains an agg function named fn with identical args (by ptr) */
+/* Structural equality of two expression trees. Needed so an aggregate restated
+ * in HAVING/ORDER BY (a separately-parsed Expr) resolves to the SELECT-list
+ * accumulator slot: matching by pointer identity failed there, silently turning
+ * HAVING SUM(x)>N into SUM=0 (empty/wrong result with no error). */
+static bool expr_equal(const Expr *a, const Expr *b) {
+    if (a==b) return true;
+    if (!a || !b || a->type!=b->type) return false;
+    switch (a->type) {
+        case EXPR_COL:
+            return ((!a->name)==(!b->name)) && (!a->name || !strcasecmp(a->name,b->name)) &&
+                   ((!a->table)==(!b->table)) && (!a->table || !strcasecmp(a->table,b->table));
+        case EXPR_STAR:
+        case EXPR_LITERAL_NULL:  return true;
+        case EXPR_LITERAL_INT:   return a->ival==b->ival;
+        case EXPR_LITERAL_FLOAT: return a->fval==b->fval;
+        case EXPR_LITERAL_STR:   return a->sval && b->sval && !strcmp(a->sval,b->sval);
+        case EXPR_LITERAL_BOOL:  return a->bval==b->bval;
+        case EXPR_FUNC:
+            if ((!a->func_name)!=(!b->func_name)) return false;
+            if (a->func_name && strcasecmp(a->func_name,b->func_name)) return false;
+            if (a->func_distinct!=b->func_distinct || a->nargs!=b->nargs) return false;
+            for (int i=0;i<a->nargs;i++) if(!expr_equal(a->args[i],b->args[i])) return false;
+            return true;
+        case EXPR_BINOP: case EXPR_UNOP:
+            return a->op==b->op && expr_equal(a->left,b->left) && expr_equal(a->right,b->right);
+        case EXPR_ALIAS:  return expr_equal(a->expr,b->expr);
+        default: return false;
+    }
+}
+
 static bool expr_find_agg_args(Expr *e, const char *fn, Expr **call_args, int nargs) {
     if (!e) return false;
     if (e->type==EXPR_ALIAS) return expr_find_agg_args(e->expr, fn, call_args, nargs);
     if (e->type==EXPR_FUNC && e->func_name) {
         if (!strcasecmp(e->func_name, fn) && is_agg_name(fn)) {
-            /* match by argument pointer identity */
+            /* match by argument STRUCTURE (not pointer): a HAVING/ORDER BY
+             * aggregate is a separately-parsed tree, so SUM(amount) there must
+             * still resolve to the SELECT-list SUM(amount) accumulator slot. */
             if (e->nargs == nargs) {
                 bool ok=true;
-                for(int i=0;i<nargs;i++) if(e->args[i]!=call_args[i]){ok=false;break;}
+                for(int i=0;i<nargs;i++) if(!expr_equal(e->args[i],call_args[i])){ok=false;break;}
                 if (ok) return true;
             }
             /* COUNT(*) special: accept if both have EXPR_STAR first arg */
@@ -1688,6 +1868,29 @@ static bool expr_find_agg_args(Expr *e, const char *fn, Expr **call_args, int na
         return expr_find_agg_args(e->else_expr,fn,call_args,nargs);
     }
     return false;
+}
+
+/* Collect every distinct aggregate-function node in `e` into *list (dedup by
+ * structure). Used to give HAVING/ORDER-BY-only aggregates accumulator slots. */
+static void collect_aggs(Expr *e, Expr ***list, int *n, int *cap, Arena *a) {
+    if (!e) return;
+    if (e->type==EXPR_FUNC && e->func_name && is_agg_name(e->func_name)) {
+        for (int i=0;i<*n;i++) if (expr_equal((*list)[i], e)) return;  /* already have it */
+        if (*n==*cap) { int nc=*cap?*cap*2:4; Expr **nb=arena_alloc(a,(size_t)nc*sizeof(Expr*));
+                        if(*n) memcpy(nb,*list,(size_t)*n*sizeof(Expr*)); *list=nb; *cap=nc; }
+        (*list)[(*n)++]=e;
+        return;  /* SQL aggregates do not nest */
+    }
+    switch (e->type) {
+        case EXPR_ALIAS: collect_aggs(e->expr,list,n,cap,a); break;
+        case EXPR_FUNC:  for(int i=0;i<e->nargs;i++) collect_aggs(e->args[i],list,n,cap,a); break;
+        case EXPR_BINOP: case EXPR_UNOP:
+            collect_aggs(e->left,list,n,cap,a); collect_aggs(e->right,list,n,cap,a); break;
+        case EXPR_CASE:
+            for(int i=0;i<e->nwhens;i++){ collect_aggs(e->whens[i],list,n,cap,a); collect_aggs(e->thens[i],list,n,cap,a); }
+            collect_aggs(e->else_expr,list,n,cap,a); break;
+        default: break;
+    }
 }
 
 /* ── Build column names for a star expansion ── */
@@ -1995,10 +2198,10 @@ static void apply_windows(Arena *a, RS *rs, const SelectStmt *sel) {
                         }
                         const char *res;
                         if      (!strcasecmp(fn,"count")) res = arena_sprintf(a,"%.0f",cnt);
-                        else if (!strcasecmp(fn,"sum"))   res = arena_sprintf(a,"%.10g",sum);
-                        else if (!strcasecmp(fn,"avg"))   res = cnt>0 ? arena_sprintf(a,"%.10g",sum/cnt) : "";
-                        else if (!strcasecmp(fn,"min"))   res = min_set ? arena_sprintf(a,"%.10g",minv) : "";
-                        else if (!strcasecmp(fn,"max"))   res = max_set ? arena_sprintf(a,"%.10g",maxv) : "";
+                        else if (!strcasecmp(fn,"sum"))   res = dbl_fmt(a, sum);
+                        else if (!strcasecmp(fn,"avg"))   res = cnt>0 ? dbl_fmt(a, sum/cnt) : "";
+                        else if (!strcasecmp(fn,"min"))   res = min_set ? dbl_fmt(a, minv) : "";
+                        else if (!strcasecmp(fn,"max"))   res = max_set ? dbl_fmt(a, maxv) : "";
                         else res = "";
                         wve[wi].values[ri] = arena_strdup(a, res);
                     }
@@ -2100,7 +2303,16 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
             tables[i].alias=alias;
         } else if (tname) {
             if (load_tbl(a,tname,alias,vt,&tables[i],&ih)!=0) {
-                /* table not found: empty schema */
+                /* Unresolvable source table: NOT in the virtual registry
+                 * (CTE/derived) and NOT in the catalog → "no such table". This
+                 * is a real error, not a phantom empty result. Flag it so the
+                 * caller (h_query / run paths) reports status=1 instead of a
+                 * silent 0-row success. We still fill an empty schema so the
+                 * rest of this function can unwind without dereferencing NULL.
+                 * (An existing table with 0 rows takes the success path in
+                 * load_tbl and never reaches here, so empty tables stay OK.) */
+                if (!tl_exec_error[0])
+                    snprintf(tl_exec_error, sizeof(tl_exec_error), "no such table: %s", tname);
                 tables[i].schema=arena_calloc(a,sizeof(Schema));
                 tables[i].tname=tname; tables[i].alias=alias;
             }
@@ -2131,6 +2343,23 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     ExecState st={0};
     st.a=a; st.sel=sel; st.vt=vt; st.rs=rs;
     st.do_agg=do_agg; st.implicit_agg=implicit_agg;
+    /* Aggregates used only in HAVING/ORDER BY (not in the SELECT list) need their
+     * own accumulator slots — e.g. HAVING SUM(x)>N where x is not selected. */
+    if (do_agg) {
+        Expr **xl=NULL; int xn=0, xc=0;
+        collect_aggs(sel->having, &xl, &xn, &xc, a);
+        for (int o=0;o<sel->norder;o++) collect_aggs(sel->order_by[o].expr, &xl, &xn, &xc, a);
+        Expr **keep=arena_alloc(a,(size_t)(xn>0?xn:1)*sizeof(Expr*)); int kn=0;
+        for (int i=0;i<xn;i++) {
+            bool in_sel=false;
+            for (int s=0;s<sel->nselect && !in_sel;s++) {
+                Expr *se=sel->select_list[s]; Expr *sb=(se->type==EXPR_ALIAS)?se->expr:se;
+                if (expr_find_agg_args(sb, xl[i]->func_name, xl[i]->args, xl[i]->nargs)) in_sel=true;
+            }
+            if (!in_sel) keep[kn++]=xl[i];
+        }
+        st.xagg=keep; st.nxagg=kn;
+    }
     st.cap_grps=64;
     st.grps=arena_alloc(a,(size_t)st.cap_grps*sizeof(GrpAcc));
 
@@ -2429,8 +2658,7 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
                                 cells[ci] = arena_sprintf(a, "%lld",
                                     (long long)((int64_t *)batch->values[ci])[r]); break;
                             case COL_DOUBLE:
-                                cells[ci] = arena_sprintf(a, "%.10g",
-                                    ((double *)batch->values[ci])[r]); break;
+                                cells[ci] = dbl_fmt(a,                                     ((double *)batch->values[ci])[r]); break;
                             case COL_BOOL:
                                 cells[ci] = (char *)(((int64_t *)batch->values[ci])[r]
                                                       ? "true" : "false"); break;
@@ -2718,8 +2946,18 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     }
 
     g_txn_current = req->txn_id;
+    tl_exec_error[0] = '\0';
     RS *rs = exec_stmt(a, stmt, NULL);
     g_txn_current = 0;
+
+    /* An unresolvable source table is an error, not an empty result: return
+     * HTTP 400 "no such table: X" instead of a phantom header-only success. */
+    if (tl_exec_error[0]) {
+        http_resp_error(resp, 400, tl_exec_error);
+        tl_exec_error[0] = '\0';
+        arena_destroy(a);
+        return;
+    }
 
     JBuf jb; jb_init(&jb, a, 65536);
     jb_obj_begin(&jb);
@@ -2736,7 +2974,7 @@ static void h_query(HttpReq *req, HttpResp *resp) {
             jb_arr_begin(&jb);
             for(int c=0;c<rs->ncols;c++){
                 const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
-                if(!v||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
+                if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
             }
             jb_arr_end(&jb);
         }
@@ -2796,7 +3034,7 @@ static char *named_params_expand(Arena *a, const char *sql, JVal *params) {
         } else if (val->type == JV_NUMBER) {
             char num[64]; double d = json_dbl(val, 0);
             if (d == (double)(long long)d) snprintf(num, sizeof(num), "%lld", (long long)d);
-            else                           snprintf(num, sizeof(num), "%.10g", d);
+            else                           snprintf(num, sizeof(num), "%.15g", d);
             size_t nl = strlen(num); NP_RESERVE(nl); memcpy(out+off, num, nl); off += nl;
         } else if (val->type == JV_BOOL) {
             const char *b = val->b ? "true" : "false"; size_t bl = strlen(b);
@@ -2854,8 +3092,16 @@ static void h_query_named(HttpReq *req, HttpResp *resp) {
     if (stmt->select.limit < 0 || stmt->select.limit > cap) stmt->select.limit = cap;
 
     g_txn_current = req->txn_id;
+    tl_exec_error[0] = '\0';
     RS *rs = exec_stmt(a, stmt, NULL);
     g_txn_current = 0;
+
+    if (tl_exec_error[0]) {
+        http_resp_error(resp, 400, tl_exec_error);
+        tl_exec_error[0] = '\0';
+        arena_destroy(a);
+        return;
+    }
 
     JBuf jb; jb_init(&jb, a, 65536);
     jb_obj_begin(&jb);
@@ -2868,7 +3114,7 @@ static void h_query_named(HttpReq *req, HttpResp *resp) {
             jb_arr_begin(&jb);
             for(int c=0;c<rs->ncols;c++){
                 const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
-                if(!v||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
+                if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
             }
             jb_arr_end(&jb);
         }
@@ -3091,8 +3337,16 @@ void api_pg_execute(PgConn *conn, const char *sql) {
 
     g_txn_current = 0;
     int64_t t0 = (int64_t)clock();
+    tl_exec_error[0] = '\0';
     RS *rs = exec_stmt(a, stmt, NULL);
     g_txn_current = 0;
+    if (tl_exec_error[0]) {
+        /* No such source table → wire-protocol error (SQLSTATE 42P01 undefined
+         * table), not an empty success. */
+        pgwire_send_error(conn, "42P01", tl_exec_error);
+        tl_exec_error[0] = '\0';
+        arena_destroy(a); return;
+    }
     if (!rs) {
         pgwire_send_error(conn, "XX000", "query execution failed");
         arena_destroy(a); return;
@@ -3331,7 +3585,6 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
 
     char *header=arena_strndup(a,body,(size_t)(nl-body));
     char delim = detect_delim(body, (size_t)(nl-body));
-    char dstr[2] = {delim, '\0'};
     /* Parse the header with the strict RFC-4180 splitter so the column count is
      * authoritative even when header fields are quoted (e.g. "a,b"). */
     int ncols=0; int herr=0;
@@ -3347,6 +3600,44 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         schema->cols[i].name=arena_strdup(a,tok);
         schema->cols[i].type=COL_TEXT; schema->cols[i].nullable=true;
     }
+
+    /* ── Atomicity pre-pass (banking sink): validate EVERY data row (quoting +
+     * field count) BEFORE any side effect — no table creation, no table_append.
+     * A single bad row ⇒ HTTP 400 and ZERO rows ingested. Without this, the old
+     * code committed full BATCH_SIZE batches as it went and then 400'd on a late
+     * bad row, leaving a durable partial prefix. Validation runs in a throwaway
+     * arena so the main arena isn't bloated by the double pass. */
+    {
+        Arena *va = arena_create(65536);
+        char *vrow = arena_alloc(va, 65536);
+        const char *vp = nl + 1;
+        while (vp < body + req->body_len) {
+            const char *vne = memchr(vp, '\n', (size_t)(body + req->body_len - vp));
+            if (!vne) vne = body + req->body_len;
+            size_t vrlen = (size_t)(vne - vp);
+            if (vrlen == 0 || (vrlen == 1 && vp[0] == '\r')) { vp = vne + 1; continue; }
+            if (vrlen >= 65536) vrlen = 65535;
+            memcpy(vrow, vp, vrlen);
+            if (vrlen > 0 && vrow[vrlen-1] == '\r') vrlen--;
+            vrow[vrlen] = '\0';
+            int vnf = 0, vperr = 0;
+            char **vf = split_line_rfc4180(va, vrow, delim, &vnf, &vperr);
+            if (vperr || !vf) {
+                arena_destroy(va); arena_destroy(a);
+                http_resp_error(resp, 400, "malformed CSV row (bad quoting)");
+                return;
+            }
+            if (vnf > ncols) {
+                arena_destroy(va); arena_destroy(a);
+                http_resp_error(resp, 400, "CSV row has more fields than header");
+                return;
+            }
+            vp = vne + 1;
+        }
+        arena_destroy(va);
+    }
+    /* Input is fully valid past this point — appends below cannot 400 on row
+     * shape, so the ingest is atomic (all rows or none). */
 
     pthread_mutex_lock(&g_app.tables_mu);
     Table *t=hm_get(&g_app.tables,tname);
@@ -3377,10 +3668,10 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         memcpy(row_copy, p, rlen);
         if (rlen > 0 && row_copy[rlen-1] == '\r') rlen--;
         row_copy[rlen] = '\0';
-        /* Strict RFC-4180 parse: reject malformed quoting and any row whose
-         * field count exceeds the header (silent column loss is a data hazard
-         * in a banking sink). A short row pads the missing tail with the NULL
-         * sentinel so it round-trips as a true NULL, not "". */
+        /* Re-parse (validated already in the atomicity pre-pass, so these error
+         * branches are defensive and cannot fire for a body that reached here).
+         * A short row pads the missing tail with the NULL sentinel so it
+         * round-trips as a true NULL, not "". */
         int nfields = 0; int perr = 0;
         char **fields = split_line_rfc4180(a, row_copy, delim, &nfields, &perr);
         if (perr || !fields) {
@@ -3395,7 +3686,11 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         }
         for (int col = 0; col < ncols; col++) {
             int rr = batch.nrows;
-            const char *cv = (col < nfields) ? fields[col] : DFO_NULL_SENTINEL;
+            /* Map a present-but-empty field (",,") to NULL too, not just a
+             * missing trailing one — otherwise "" silently coerces to 0 in
+             * numeric aggregates (inflating COUNT, deflating AVG/MIN). */
+            const char *cv = (col < nfields && fields[col] && fields[col][0])
+                             ? fields[col] : DFO_NULL_SENTINEL;
             if (strcmp(cv, DFO_NULL_SENTINEL) == 0) {
                 /* True NULL (missing tail or explicit sentinel): flag the
                  * null_bitmap so the stored cell is a real NULL, matching how
@@ -3695,7 +3990,7 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
         jb_arr_begin(&jb);
         for (int c = 0; c < rs->ncols; c++) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : NULL;
-            if(!v||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
+            if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
         }
         jb_arr_end(&jb);
     }
@@ -4140,6 +4435,50 @@ static char *resolve_step_sql(App *app, Arena *a, Pipeline *p, PipelineStep *st,
     return sql_substitute_params(a, raw_sql, params, api_computed_param, &cc, errbuf, errsz);
 }
 
+/* ── CDC cursor persistence (high-watermark) ──
+ * Incremental connector reads (cursor_column set) must remember the last
+ * watermark BETWEEN runs, otherwise every run re-reads the whole source. The
+ * scheduler.h PipelineStep struct can't be extended here, so the watermark is
+ * persisted as a tiny file under data_dir, keyed by the step's output table.
+ * Path: <data_dir>/.cursors/<output>.cur  (output is a validated table name). */
+static void cursor_state_path(App *app, const char *output, char *out, size_t outsz) {
+    out[0] = '\0';
+    if (!output || !output[0]) return;
+    /* keep it filesystem-safe: only table-name chars are expected here */
+    snprintf(out, outsz, "%s/.cursors/%s.cur", app->data_dir, output);
+}
+
+/* Load a previously saved watermark into buf (empty string if none). */
+static void cursor_state_load(App *app, const char *output, char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    char path[1024];
+    cursor_state_path(app, output, path, sizeof(path));
+    if (!path[0]) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    size_t n = fread(buf, 1, bufsz - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    /* strip a trailing newline if present */
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+}
+
+/* Persist the watermark for the next run. Best-effort: a write failure only
+ * costs a re-read next time, never correctness within this run. */
+static void cursor_state_save(App *app, const char *output, const char *val) {
+    char path[1024];
+    cursor_state_path(app, output, path, sizeof(path));
+    if (!path[0] || !val) return;
+    /* ensure <data_dir>/.cursors exists */
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.cursors", app->data_dir);
+    mkdir(dir, 0755);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fwrite(val, 1, strlen(val), f);
+    fclose(f);
+}
+
 /* ── Run one connector step: pull all batches into target_table ── */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
     char so_path[1024];
@@ -4172,6 +4511,20 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     const char *filter = NULL;
     if (strchr(entity, ' ')) { filter = entity; entity = ""; }
 
+    /* Incremental (CDC high-watermark) mode is active when the connector config
+     * carries a non-empty cursor_column. In that mode the connector returns the
+     * next watermark in req.cursor (last cursor_column value of the batch); we
+     * must reuse that value for the next page AND persist it across runs so the
+     * next run starts where this one stopped, rather than re-reading everything. */
+    bool incremental = false;
+    if (st->connector_config[0]) {
+        JVal *cc2 = json_parse(a, st->connector_config, strlen(st->connector_config));
+        if (cc2 && cc2->type == JV_OBJECT) {
+            const char *ccol = json_str(json_get(cc2, "cursor_column"), "");
+            if (ccol[0]) incremental = true;
+        }
+    }
+
     /* Describe schema to create the target table correctly */
     Schema *schema = NULL;
     if (!filter && entity[0] && api->describe) {
@@ -4183,7 +4536,13 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     bool table_created = false;
 
     int total_rows = 0;
-    char cursor_buf[32] = "0";
+    /* Watermark string. For OFFSET mode it's an integer offset ("0" → start of
+     * table). For incremental mode it's the persisted high-watermark from the
+     * previous run (empty → read from the beginning the first time). Sized to
+     * hold timestamps / bigints / arbitrary key values. */
+    char cursor_buf[256] = "0";
+    if (incremental)
+        cursor_state_load(app, step_output(st), cursor_buf, sizeof(cursor_buf));
 
     for (;;) {
         DfoReadReq req = { .cursor = cursor_buf, .limit = BATCH_SIZE, .filter = filter };
@@ -4223,12 +4582,31 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
         table_append(t, batch);
         total_rows += batch->nrows;
 
-        /* Advance cursor */
-        snprintf(cursor_buf, sizeof(cursor_buf), "%d", total_rows);
+        /* Advance the cursor for the NEXT page.
+         *  - Incremental mode: the connector wrote the next high-watermark into
+         *    req.cursor (the last cursor_column value of this batch). Reuse THAT
+         *    value verbatim — never overwrite it with a row count, which was the
+         *    duplication bug (paging restarted from a bogus watermark and
+         *    re-read rows, e.g. 8200 → 15573). If the connector left it pointing
+         *    at our own buffer (no advance), fall back to the row count.
+         *  - OFFSET mode: the connector reads req.cursor as an integer offset and
+         *    does NOT write back, so we advance by the rows pulled so far. */
+        if (incremental && req.cursor && req.cursor != cursor_buf) {
+            snprintf(cursor_buf, sizeof(cursor_buf), "%s", req.cursor);
+        } else {
+            snprintf(cursor_buf, sizeof(cursor_buf), "%d", total_rows);
+        }
 
         /* rc==1 = last/only page; a short batch also signals the end. */
         if (rc == 1 || batch->nrows < BATCH_SIZE) break;
     }
+
+    /* Persist the final watermark so the next run resumes from here instead of
+     * re-reading the whole source. Only meaningful (and only saved) in
+     * incremental mode; we save even on a 0-row run so an empty re-poll keeps
+     * the existing watermark file in place (cursor_buf still holds it). */
+    if (incremental)
+        cursor_state_save(app, step_output(st), cursor_buf);
 
     if (table_created)
         catalog_update_table_meta(app->catalog, step_output(st), st->connector_type, (int64_t)total_rows);
@@ -4260,7 +4638,16 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
         return -1;
     }
+    tl_exec_error[0] = '\0';
     RS *rs = exec_stmt(a, stmt, NULL);
+    if (tl_exec_error[0]) {
+        /* Source table doesn't exist → fail the sink step (status=1) instead of
+         * silently writing 0 rows out. Distinct from an existing-but-empty
+         * source, which yields a valid 0-row rs and takes the success path. */
+        snprintf(errbuf, errsz, "sink step %s: %s", st->id, tl_exec_error);
+        tl_exec_error[0] = '\0';
+        return -1;
+    }
     if (!rs) {
         snprintf(errbuf, errsz, "sink step %s: исходный SELECT вернул NULL", st->id);
         return -1;
@@ -4387,7 +4774,13 @@ static int script_step_input_csv(Arena *a, PipelineStep *st, const char *label,
                      label, stmt && stmt->error ? stmt->error : "null");
             return -1;
         }
+        tl_exec_error[0] = '\0';
         RS *rs = exec_stmt(a, stmt, NULL);
+        if (tl_exec_error[0]) {
+            snprintf(errbuf, errsz, "%s: %s", label, tl_exec_error);
+            tl_exec_error[0] = '\0';
+            return -1;
+        }
         if (!rs) {
             snprintf(errbuf, errsz, "%s: input SQL exec failed", label);
             return -1;
@@ -5005,7 +5398,13 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         return -1;
     }
     LOG_INFO("scd2 step '%s': source SQL → %s: %s", st->id, src_tbl, scd2_sql);
+    tl_exec_error[0] = '\0';
     RS *src = exec_stmt(a, sstmt, NULL);
+    if (tl_exec_error[0]) {
+        snprintf(errbuf, errsz, "scd2 step %s: %s", st->id, tl_exec_error);
+        tl_exec_error[0] = '\0';
+        return -1;
+    }
     if (!src) { snprintf(errbuf, errsz, "scd2 step %s: source SQL exec failed", st->id); return -1; }
     write_rs_to_table(app, a, src_tbl, src);
 
@@ -5285,7 +5684,13 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
                  st->id, sstmt && sstmt->error ? sstmt->error : "null");
         return -1;
     }
+    tl_exec_error[0] = '\0';
     RS *cand = exec_stmt(a, sstmt, NULL);
+    if (tl_exec_error[0]) {
+        snprintf(errbuf, errsz, "match step %s: %s", st->id, tl_exec_error);
+        tl_exec_error[0] = '\0';
+        return -1;
+    }
     if (!cand) { snprintf(errbuf, errsz, "match step %s: SQL exec failed", st->id); return -1; }
 
     /* Output RS — always created (empty candidate set → empty result table). */
@@ -5347,12 +5752,19 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
         char **test_str = arena_alloc(a, (size_t)cand->nrows * sizeof(char *));
         for (int r = 0; r < cand->nrows; r++) {
             char sbuf[1024] = {0}, tbuf[1024] = {0};
+            bool key_null = false;
             for (int k = 0; k < nscan; k++) {
                 const char *v = (scan_idx[k] >= 0 && cand->rows[r].cells[scan_idx[k]])
                                 ? cand->rows[r].cells[scan_idx[k]] : "";
+                /* NULL-aware grouping (NULL != NULL, as in industrial MDM/SQL): a
+                 * missing/NULL/sentinel scan-key component makes the whole key
+                 * un-matchable, so rows with an unknown identifier (e.g. no INN)
+                 * are never clustered together. */
+                if (!v[0] || !strcmp(v, DFO_NULL_SENTINEL)) { key_null = true; break; }
                 if (k) strncat(sbuf, "\x1f", sizeof(sbuf) - strlen(sbuf) - 1);
                 strncat(sbuf, v, sizeof(sbuf) - strlen(sbuf) - 1);
             }
+            if (key_null) sbuf[0] = '\0';   /* empty key → skipped by the guard below */
             for (int k = 0; k < ntest; k++) {
                 const char *v = (test_idx[k] >= 0 && cand->rows[r].cells[test_idx[k]])
                                 ? cand->rows[r].cells[test_idx[k]] : "";
@@ -5490,8 +5902,9 @@ static bool error_is_nonretryable(const char *msg) {
         "no such", "not found", "does not exist", "unknown table", "unknown column",
         "no route to host", "name or service not known", "could not resolve",
         "connection refused", "unknown host",
-        /* transport refusals (libcurl/libpq phrasings) */
+        /* transport refusals + connect timeouts (libcurl/libpq phrasings) */
         "couldn't connect", "could not connect", "no connection",
+        "timeout expired", "timed out", "timeout", "connection timed",
         /* deterministic sink/config errors — these fail identically every time, so
          * burning the whole retry-backoff budget on them only delays the failure */
         "target table", "empty target",
@@ -5640,8 +6053,15 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     st->status = STEP_FAILED;
                     snprintf(p->error_msg, sizeof(p->error_msg), "step[%d] parse: %s", si, stmt->error);
                 } else {
+                    tl_exec_error[0] = '\0';
                     RS *rs = exec_stmt(a, stmt, NULL);
-                    if (!rs) {
+                    if (tl_exec_error[0]) {
+                        /* Unresolvable source table → fail the step, not a silent
+                         * 0-row success (existing-but-empty source still succeeds). */
+                        st->status = STEP_FAILED;
+                        snprintf(p->error_msg, sizeof(p->error_msg), "step[%d]: %s", si, tl_exec_error);
+                        tl_exec_error[0] = '\0';
+                    } else if (!rs) {
                         st->status = STEP_FAILED;
                         snprintf(p->error_msg, sizeof(p->error_msg), "step[%d]: execution returned null", si);
                     } else {
@@ -6681,8 +7101,12 @@ static int matview_exec_fn(const char *def_sql, const char *target_table, void *
     int n = -1;
     Stmt *stmt = sql_parse(a, def_sql, strlen(def_sql));
     if (stmt && !stmt->error) {
+        tl_exec_error[0] = '\0';
         RS *rs = exec_stmt(a, stmt, NULL);
-        if (rs) n = write_rs_to_table(app, a, target_table, rs);
+        /* A missing source table fails the refresh (n stays -1) rather than
+         * silently materialising an empty datamart. */
+        if (rs && !tl_exec_error[0]) n = write_rs_to_table(app, a, target_table, rs);
+        tl_exec_error[0] = '\0';
     }
     arena_destroy(a);
     return n;

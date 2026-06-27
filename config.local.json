@@ -1,6 +1,7 @@
 {
   "port": 8080,
   "data_dir": "./data",
+  "pipelines_dir": "./pipelines",
   "plugins_dir": "./build/release/lib",
   "connector_dir": "./build/release/lib",
   "auth_enabled": true,

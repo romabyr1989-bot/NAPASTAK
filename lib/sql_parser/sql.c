@@ -425,6 +425,8 @@ static Expr *parse_primary(Lexer *l) {
                 lex_consume(l);
                 e->type = EXPR_FUNC; e->func_name = name;
                 int cap=4; e->args=arena_alloc(l->a,cap*sizeof(Expr*)); e->nargs=0;
+                /* optional leading DISTINCT in aggregate args, e.g. COUNT(DISTINCT col) */
+                if (lex_eat(l, TK_DISTINCT)) e->func_distinct = true;
                 if (!lex_peek_is(l, TK_RPAREN) && !lex_peek_is(l, TK_STAR)) {
                     do {
                         if (lex_peek_is(l, TK_RPAREN)) break;

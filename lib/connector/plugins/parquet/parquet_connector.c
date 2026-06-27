@@ -936,6 +936,88 @@ static void tw_str(WBuf *b,int *last,int fid,const char *s){ tw_field(b,last,fid
 static void tw_lh(WBuf *b,int size,int ect){ if(size<15) wb_u8(b,(uint8_t)((size<<4)|ect)); else { wb_u8(b,(uint8_t)(0xF0|ect)); wb_uv(b,(uint64_t)size);} }
 static void tw_stop(WBuf *b){ wb_u8(b,0); }
 
+/* Маппинг DFO ColType → Parquet physical type. */
+static int pq_phys_type(ColType t) {
+    switch (t) {
+        case COL_INT64: return PQ_INT64;
+        case COL_DOUBLE:return PQ_DOUBLE;
+        case COL_BOOL:  return PQ_BOOLEAN;
+        default:        return PQ_BYTEARRAY; /* COL_TEXT и прочее */
+    }
+}
+
+/* true, если ячейка (col c, row r) — настоящий SQL NULL:
+ * либо помечена в null_bitmap, либо текстовое значение равно DFO_NULL_SENTINEL.
+ * В sink-пути ячейки всегда хранятся текстом, поэтому сентинел проверяем для
+ * всех типов колонок (подстраховка, если null_bitmap не выставлен). */
+static bool pq_cell_is_null(const Schema *schema, const ColBatch *batch, int c, int r) {
+    (void)schema;
+    const uint8_t *bm = batch->null_bitmap[c];
+    if (bm && ((bm[r/8] >> (r%8)) & 1u)) return true;
+    const char *v = ((const char**)batch->values[c])[r];
+    if (v && strcmp(v, DFO_NULL_SENTINEL) == 0) return true;
+    return false;
+}
+
+/* Кодирует уровни определения (bit_width=1) bit-packed RLE/hybrid-форматом и
+ * пишет в out: [4-байтный LE размер блока][RLE-hybrid]. def[i]=1 -> значение,
+ * def[i]=0 -> NULL. Совместимо с rle_bp_dec и внешними parquet-ридерами. */
+static void pq_write_def_levels(WBuf *out, const uint8_t *def, int n) {
+    WBuf lv; wb_init(&lv);
+    int groups = (n + 7) / 8;                     /* округление вверх до 8 значений */
+    wb_uv(&lv, ((uint64_t)groups << 1) | 1u);     /* bit-packed header */
+    for (int g = 0; g < groups; g++) {
+        uint8_t byte = 0;
+        for (int v = 0; v < 8; v++) {
+            int idx = g*8 + v;
+            if (idx < n && def[idx]) byte |= (uint8_t)(1u << v);
+        }
+        wb_u8(&lv, byte);
+    }
+    wb_le32(out, (uint32_t)lv.len);
+    wb_raw(out, lv.d, lv.len);
+    free(lv.d);
+}
+
+/* Текстовое представление ячейки. В sink-пути gateway (run_sink_step) все
+ * значения ColBatch хранятся как char* строки независимо от логического типа
+ * колонки, поэтому числовые/булевы значения парсятся именно отсюда. */
+static const char *pq_cell_text(const ColBatch *batch, int c, int r) {
+    const char *v = ((const char**)batch->values[c])[r];
+    return v ? v : "";
+}
+
+/* Парсит булеву строку ("true"/"false"/"t"/"1"/"0"...) в 0/1. */
+static int pq_parse_bool(const char *v) {
+    if (!v || !v[0]) return 0;
+    if (v[0]=='t'||v[0]=='T'||v[0]=='y'||v[0]=='Y') return 1;
+    if (v[0]=='f'||v[0]=='F'||v[0]=='n'||v[0]=='N') return 0;
+    return strtoll(v,NULL,10)!=0;
+}
+
+/* Пишет одно НЕ-NULL значение колонки c, строки r в PLAIN-кодировке в vals.
+ * Ячейка приходит текстом (sink-контракт), числовые/булевы колонки парсятся
+ * в нативный Parquet-вид. BOOLEAN обрабатывается отдельно (бит-паковка). */
+static void pq_write_plain_value(WBuf *vals, const Schema *schema,
+                                  const ColBatch *batch, int c, int r) {
+    ColType ct = schema->cols[c].type;
+    const char *v = pq_cell_text(batch,c,r);
+    switch (ct) {
+        case COL_INT64: {
+            int64_t iv = strtoll(v,NULL,10);
+            uint8_t t[8]; for (int i=0;i<8;i++) t[i]=(uint8_t)((uint64_t)iv>>(i*8));
+            wb_raw(vals,t,8); break;
+        }
+        case COL_DOUBLE: {
+            double dv = strtod(v,NULL);
+            uint8_t t[8]; memcpy(t,&dv,8); wb_raw(vals,t,8); break;
+        }
+        default: { /* COL_TEXT и прочее → BYTE_ARRAY(UTF8) */
+            uint32_t L=(uint32_t)strlen(v); wb_le32(vals,L); wb_raw(vals,v,L); break;
+        }
+    }
+}
+
 static int pq_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode) {
     (void)vctx; (void)a; (void)mode;   /* sink всегда пишет файл целиком */
@@ -947,33 +1029,55 @@ static int pq_write_batch(void *vctx, Arena *a, const char *entity,
 
     int64_t *coff=malloc((size_t)ncols*sizeof(int64_t)); /* смещение страницы каждой колонки */
     int64_t *csz =malloc((size_t)ncols*sizeof(int64_t)); /* размер chunk (hdr+vals) каждой колонки */
-    char numbuf[64];
+    int     *cpt =malloc((size_t)ncols*sizeof(int));     /* Parquet physical type каждой колонки */
+    bool    *copt=malloc((size_t)ncols*sizeof(bool));    /* OPTIONAL (nullable либо есть NULL) */
+
+    /* Предрасчёт физического типа и nullability по схеме + фактическим NULL. */
+    for (int c=0;c<ncols;c++) {
+        cpt[c]=pq_phys_type(schema->cols[c].type);
+        bool opt=schema->cols[c].nullable;
+        if (!opt) for (int r=0;r<nrows;r++) if (pq_cell_is_null(schema,batch,c,r)) { opt=true; break; }
+        copt[c]=opt;
+    }
+
     for (int c=0;c<ncols;c++) {
         coff[c]=(int64_t)ftell(f);
-        WBuf vals; wb_init(&vals);
-        for (int r=0;r<nrows;r++) {
-            const uint8_t *bm=batch->null_bitmap[c];
-            const char *v="";
-            if (!(bm&&((bm[r/8]>>(r%8))&1u))) {
-                switch (schema->cols[c].type) {
-                    case COL_INT64: snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
-                    case COL_DOUBLE:snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
-                    default: v=((char**)batch->values[c])[r]; if(!v)v=""; break;
-                }
-            }
-            uint32_t L=(uint32_t)strlen(v); wb_le32(&vals,L); wb_raw(&vals,v,L);
+
+        /* Тело страницы: [def levels (если OPTIONAL)][PLAIN-значения не-NULL ячеек]. */
+        WBuf body; wb_init(&body);
+        if (copt[c]) {
+            uint8_t *def=malloc((size_t)(nrows>0?nrows:1));
+            for (int r=0;r<nrows;r++) def[r]=pq_cell_is_null(schema,batch,c,r)?0:1;
+            pq_write_def_levels(&body,def,nrows);
+            free(def);
         }
+        if (cpt[c]==PQ_BOOLEAN) {
+            /* PLAIN BOOLEAN: бит-паковка по 8 значений в байт (только не-NULL). */
+            uint8_t acc=0; int nb=0;
+            for (int r=0;r<nrows;r++) {
+                if (copt[c] && pq_cell_is_null(schema,batch,c,r)) continue;
+                if (pq_parse_bool(pq_cell_text(batch,c,r))) acc|=(uint8_t)(1u<<(nb&7));
+                if ((++nb&7)==0) { wb_u8(&body,acc); acc=0; }
+            }
+            if (nb&7) wb_u8(&body,acc); /* хвостовые биты */
+        } else {
+            for (int r=0;r<nrows;r++) {
+                if (copt[c] && pq_cell_is_null(schema,batch,c,r)) continue; /* NULL → нет значения */
+                pq_write_plain_value(&body,schema,batch,c,r);
+            }
+        }
+
         WBuf hdr; wb_init(&hdr); int last=0;
         tw_i32(&hdr,&last,1,0);                 /* type = DATA_PAGE */
-        tw_i32(&hdr,&last,2,(int32_t)vals.len); /* uncompressed_page_size */
-        tw_i32(&hdr,&last,3,(int32_t)vals.len); /* compressed_page_size */
+        tw_i32(&hdr,&last,2,(int32_t)body.len); /* uncompressed_page_size */
+        tw_i32(&hdr,&last,3,(int32_t)body.len); /* compressed_page_size */
         tw_field(&hdr,&last,5,TW_STRUCT);       /* data_page_header */
-        { int l2=0; tw_i32(&hdr,&l2,1,nrows); tw_i32(&hdr,&l2,2,0); /* PLAIN */
-          tw_i32(&hdr,&l2,3,3); tw_i32(&hdr,&l2,4,3); tw_stop(&hdr); }
+        { int l2=0; tw_i32(&hdr,&l2,1,nrows); tw_i32(&hdr,&l2,2,0); /* num_values, PLAIN */
+          tw_i32(&hdr,&l2,3,3); tw_i32(&hdr,&l2,4,3); tw_stop(&hdr); } /* def/rep enc = RLE */
         tw_stop(&hdr);
-        fwrite(hdr.d,1,hdr.len,f); fwrite(vals.d,1,vals.len,f);
-        csz[c]=(int64_t)(hdr.len+vals.len);
-        free(hdr.d); free(vals.d);
+        fwrite(hdr.d,1,hdr.len,f); fwrite(body.d,1,body.len,f);
+        csz[c]=(int64_t)(hdr.len+body.len);
+        free(hdr.d); free(body.d);
     }
 
     /* FileMetaData */
@@ -983,10 +1087,10 @@ static int pq_write_batch(void *vctx, Arena *a, const char *entity,
     tw_lh(&m,ncols+1,TW_STRUCT);
     { int l2=0; tw_str(&m,&l2,4,"schema"); tw_i32(&m,&l2,5,ncols); tw_stop(&m); }  /* root */
     for (int c=0;c<ncols;c++){ int l2=0;
-        tw_i32(&m,&l2,1,6);                      /* type = BYTE_ARRAY */
-        tw_i32(&m,&l2,3,0);                      /* repetition = REQUIRED */
+        tw_i32(&m,&l2,1,cpt[c]);                 /* physical type */
+        tw_i32(&m,&l2,3,copt[c]?1:0);            /* repetition: 1=OPTIONAL, 0=REQUIRED */
         tw_str(&m,&l2,4,schema->cols[c].name);
-        tw_i32(&m,&l2,6,0);                      /* converted_type = UTF8 */
+        if (cpt[c]==PQ_BYTEARRAY) tw_i32(&m,&l2,6,0); /* converted_type = UTF8 (только для строк) */
         tw_stop(&m); }
     tw_i64(&m,&last,3,(int64_t)nrows);           /* num_rows */
     tw_field(&m,&last,4,TW_LIST);                /* row_groups list (1) */
@@ -999,7 +1103,7 @@ static int pq_write_batch(void *vctx, Arena *a, const char *entity,
           tw_i64(&m,&cc,2,coff[c]);              /* file_offset */
           tw_field(&m,&cc,3,TW_STRUCT);          /* meta_data */
           { int md=0;
-            tw_i32(&m,&md,1,6);                  /* type = BYTE_ARRAY */
+            tw_i32(&m,&md,1,cpt[c]);             /* physical type */
             tw_field(&m,&md,2,TW_LIST); tw_lh(&m,1,TW_I32); wb_zz32(&m,0);   /* encodings=[PLAIN] */
             tw_field(&m,&md,3,TW_LIST); tw_lh(&m,1,TW_BIN);
             { size_t n=strlen(schema->cols[c].name); wb_uv(&m,n); wb_raw(&m,schema->cols[c].name,n); } /* path */
@@ -1017,7 +1121,7 @@ static int pq_write_batch(void *vctx, Arena *a, const char *entity,
     uint32_t mlen=(uint32_t)m.len;
     uint8_t lb[4]={(uint8_t)mlen,(uint8_t)(mlen>>8),(uint8_t)(mlen>>16),(uint8_t)(mlen>>24)};
     fwrite(lb,1,4,f); fwrite("PAR1",1,4,f);
-    free(m.d); free(coff); free(csz); fclose(f);
+    free(m.d); free(coff); free(csz); free(cpt); free(copt); fclose(f);
     LOG_INFO("parquet sink: %d rows × %d cols → %s", nrows, ncols, entity);
     return nrows;
 }

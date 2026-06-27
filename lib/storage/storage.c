@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -516,7 +517,17 @@ int table_create_index(Table *t, int col_idx, Catalog *c) {
 }
 
 /* ── Catalog ── */
-struct Catalog { sqlite3 *db; };
+struct Catalog { sqlite3 *db; pthread_mutex_t mu; };
+
+/* The gateway executes pipelines on a worker pool, so several threads call
+ * catalog_* on this one connection concurrently (worker write_rs_to_table /
+ * catalog_log_run vs the HTTP thread's queries). The system libsqlite3 corrupts
+ * its internal state under that and SIGSEGVs. CAT_GUARD serializes every public
+ * catalog entry point with a recursive mutex; __attribute__((cleanup)) releases
+ * it on EVERY return path. Recursive because some entries nest (register_index
+ * -> ensure_index_table). */
+static inline void _cat_unlock(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }
+#define CAT_GUARD(c) pthread_mutex_t *_catg __attribute__((cleanup(_cat_unlock))) = &(c)->mu; pthread_mutex_lock(_catg)
 
 static const char *CATALOG_SCHEMA =
     "CREATE TABLE IF NOT EXISTS tables("
@@ -542,12 +553,44 @@ static const char *CATALOG_SCHEMA =
    (добавление новых столбцов в существующие таблицы — ошибки игнорируются). */
 Catalog *catalog_open(const char *path) {
     Catalog *c = calloc(1, sizeof(Catalog));
-    if (sqlite3_open(path, &c->db) != SQLITE_OK) {
+    { pthread_mutexattr_t _a; pthread_mutexattr_init(&_a);
+      pthread_mutexattr_settype(&_a, PTHREAD_MUTEX_RECURSIVE);
+      pthread_mutex_init(&c->mu, &_a); pthread_mutexattr_destroy(&_a); }
+    /* FULLMUTEX: the gateway runs pipelines on a worker pool, so several threads
+     * share this one catalog connection (catalog_log_run etc.). The serialized
+     * threading mode makes every call on the connection internally mutex-guarded,
+     * preventing the SQLite-internal corruption / SIGSEGV that concurrent runs hit
+     * with the default open. busy_timeout absorbs WAL writer-lock contention. */
+    if (sqlite3_open_v2(path, &c->db,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+            NULL) != SQLITE_OK) {
         LOG_ERROR("catalog_open %s: %s", path, sqlite3_errmsg(c->db));
         free(c); return NULL;
     }
+    sqlite3_busy_timeout(c->db, 5000);
     sqlite3_exec(c->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(c->db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+    /* Self-heal: an unclean shutdown can corrupt indexes (e.g. a duplicate
+     * sqlite_autoindex), which makes existing tables invisible ("no such
+     * table") even though their data is intact. Detect on open and REINDEX so
+     * the platform recovers instead of silently losing the catalog. */
+    {
+        sqlite3_stmt *qst = NULL; int healthy = 1;
+        if (sqlite3_prepare_v2(c->db, "PRAGMA quick_check", -1, &qst, NULL) == SQLITE_OK) {
+            if (sqlite3_step(qst) == SQLITE_ROW) {
+                const char *r = (const char*)sqlite3_column_text(qst, 0);
+                healthy = (r && strcmp(r, "ok") == 0);
+                if (!healthy) LOG_ERROR("catalog integrity: %s — rebuilding", r ? r : "?");
+            }
+            sqlite3_finalize(qst);
+        }
+        if (!healthy) {
+            if (sqlite3_exec(c->db, "REINDEX; VACUUM;", NULL, NULL, NULL) == SQLITE_OK)
+                LOG_INFO("catalog rebuilt (REINDEX+VACUUM) — recovered");
+            else
+                LOG_ERROR("catalog rebuild failed — manual recovery may be needed");
+        }
+    }
     char *err = NULL;
     if (sqlite3_exec(c->db, CATALOG_SCHEMA, NULL, NULL, &err) != SQLITE_OK) {
         LOG_ERROR("catalog schema: %s", err); sqlite3_free(err);
@@ -559,7 +602,7 @@ Catalog *catalog_open(const char *path) {
     return c;
 }
 
-void catalog_close(Catalog *c) { sqlite3_close(c->db); free(c); }
+void catalog_close(Catalog *c) { sqlite3_close(c->db); pthread_mutex_destroy(&c->mu); free(c); }
 
 /* Schema → JSON helper */
 static char *schema_to_json(Schema *s, Arena *a) {
@@ -582,6 +625,7 @@ static char *schema_to_json(Schema *s, Arena *a) {
 }
 
 int catalog_register_table(Catalog *c, const char *name, Schema *schema) {
+    CAT_GUARD(c);
     Arena *a = arena_create(4096);
     char *sj = schema_to_json(schema, a);
     sqlite3_stmt *st;
@@ -595,6 +639,7 @@ int catalog_register_table(Catalog *c, const char *name, Schema *schema) {
 }
 
 int catalog_list_tables(Catalog *c, char ***names_out, int *count_out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"SELECT name FROM tables ORDER BY name",-1,&st,NULL);
     int cap=16,n=0;
@@ -609,6 +654,7 @@ int catalog_list_tables(Catalog *c, char ***names_out, int *count_out, Arena *a)
 }
 
 int catalog_get_schema(Catalog *c, const char *table, Schema **out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"SELECT schema_json FROM tables WHERE name=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
@@ -635,6 +681,7 @@ int catalog_get_schema(Catalog *c, const char *table, Schema **out, Arena *a) {
 }
 
 int catalog_drop_table(Catalog *c, const char *name) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"DELETE FROM tables WHERE name=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,name,-1,SQLITE_STATIC);
@@ -643,6 +690,7 @@ int catalog_drop_table(Catalog *c, const char *name) {
 }
 
 int catalog_update_table_meta(Catalog *c, const char *name, const char *source, int64_t row_count) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "UPDATE tables SET source=?, row_count=? WHERE name=?", -1, &st, NULL);
@@ -655,6 +703,7 @@ int catalog_update_table_meta(Catalog *c, const char *name, const char *source, 
 
 /* Список таблиц с метаданными для UI (имя, источник, число строк, столбцы). */
 int catalog_list_tables_full(Catalog *c, char **json_out, Arena *a) {
+    CAT_GUARD(c);
     /* Returns JSON array: [{name, source, row_count, columns:[{name,type}]}] */
     JBuf jb; jb_init(&jb, a, 4096);
     jb_arr_begin(&jb);
@@ -700,6 +749,7 @@ int catalog_list_tables_full(Catalog *c, char **json_out, Arena *a) {
 }
 
 int catalog_save_pipeline(Catalog *c, const char *id, const char *json) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "INSERT OR REPLACE INTO pipelines(id,json,updated_at) VALUES(?,?,?)",-1,&st,NULL);
@@ -711,6 +761,7 @@ int catalog_save_pipeline(Catalog *c, const char *id, const char *json) {
 }
 
 int catalog_load_pipeline(Catalog *c, const char *id, char **out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"SELECT json FROM pipelines WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
@@ -720,6 +771,7 @@ int catalog_load_pipeline(Catalog *c, const char *id, char **out, Arena *a) {
 }
 
 int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"SELECT id FROM pipelines ORDER BY updated_at DESC",-1,&st,NULL);
     int cap=16,n=0; char **ids=arena_alloc(a,cap*sizeof(char*));
@@ -731,6 +783,7 @@ int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a
 }
 
 int catalog_delete_pipeline(Catalog *c, const char *id) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"DELETE FROM pipelines WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
@@ -745,6 +798,7 @@ int catalog_delete_pipeline(Catalog *c, const char *id) {
 }
 
 int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int status, const char *err, int retry_count) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "INSERT INTO pipeline_runs(pipeline_id,started_at,finished_at,status,error_msg,retry_count) VALUES(?,?,?,?,?,?)",
@@ -759,6 +813,7 @@ int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int statu
 }
 
 int catalog_list_runs(Catalog *c, const char *pid, char **out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "SELECT id,started_at,finished_at,status,error_msg,retry_count FROM pipeline_runs "
@@ -783,6 +838,7 @@ int catalog_list_runs(Catalog *c, const char *pid, char **out, Arena *a) {
 int catalog_save_result(Catalog *c, const char *name, const char *sql_text,
                         const char *columns_json, const char *rows_json,
                         int row_count, int64_t *out_id) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "INSERT INTO saved_results(name,sql_text,columns_json,rows_json,row_count,created_at)"
@@ -801,6 +857,7 @@ int catalog_save_result(Catalog *c, const char *name, const char *sql_text,
 
 /* Список сохранённых результатов без тела строк (rows_json) — превью для UI. */
 int catalog_list_results(Catalog *c, char **out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "SELECT id,name,sql_text,columns_json,row_count,created_at FROM saved_results"
@@ -823,6 +880,7 @@ int catalog_list_results(Catalog *c, char **out, Arena *a) {
 
 /* Получить один сохранённый результат целиком, включая rows_json. */
 int catalog_get_result(Catalog *c, int64_t id, char **out, Arena *a) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
         "SELECT id,name,sql_text,columns_json,rows_json,row_count,created_at"
@@ -844,6 +902,7 @@ int catalog_get_result(Catalog *c, int64_t id, char **out, Arena *a) {
 }
 
 int catalog_delete_result(Catalog *c, int64_t id) {
+    CAT_GUARD(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,"DELETE FROM saved_results WHERE id=?",-1,&st,NULL);
     sqlite3_bind_int64(st,1,id);
@@ -854,6 +913,7 @@ int catalog_delete_result(Catalog *c, int64_t id) {
 /* ── Index registry ── */
 /* The table is created lazily on first use via the migration pragma below */
 static void catalog_ensure_index_table(Catalog *c) {
+    CAT_GUARD(c);
     sqlite3_exec(c->db,
         "CREATE TABLE IF NOT EXISTS table_indexes("
         "  table_name TEXT NOT NULL,"
@@ -866,6 +926,7 @@ static void catalog_ensure_index_table(Catalog *c) {
 
 int catalog_register_index(Catalog *c, const char *table,
                            const char *col, int col_idx) {
+    CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
@@ -881,6 +942,7 @@ int catalog_register_index(Catalog *c, const char *table,
 
 int catalog_list_indexes_json(Catalog *c, const char *table,
                               char **json_out, Arena *a) {
+    CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
@@ -902,6 +964,7 @@ int catalog_list_indexes_json(Catalog *c, const char *table,
 }
 
 int catalog_drop_indexes(Catalog *c, const char *table) {
+    CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
@@ -914,6 +977,7 @@ int catalog_drop_indexes(Catalog *c, const char *table) {
 /* Проверить наличие индекса по столбцу; при наличии вернуть col_idx через out. */
 int catalog_has_index(Catalog *c, const char *table, const char *col,
                       int *col_idx_out) {
+    CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,

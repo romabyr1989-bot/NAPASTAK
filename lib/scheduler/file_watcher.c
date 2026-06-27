@@ -152,10 +152,19 @@ FileWatcher *file_watcher_create(Scheduler *s) {
     }
     if (registered == 0) { close(ifd); free(fw); return NULL; }
 
-    if (pthread_create(&fw->thread, NULL, watcher_loop, fw) != 0) {
+    /* watcher_loop fires pipeline runs inline on file arrival — needs the same
+     * 8 MiB stack as the worker pool / scheduler, not the 512 KiB default. */
+    pthread_attr_t wattr; pthread_attr_t *wap = NULL;
+    if (pthread_attr_init(&wattr) == 0) {
+        pthread_attr_setstacksize(&wattr, 8 * 1024 * 1024);
+        wap = &wattr;
+    }
+    if (pthread_create(&fw->thread, wap, watcher_loop, fw) != 0) {
         LOG_ERROR("file_watcher: pthread_create failed");
+        if (wap) pthread_attr_destroy(&wattr);
         close(ifd); free(fw); return NULL;
     }
+    if (wap) pthread_attr_destroy(&wattr);
     LOG_INFO("file_watcher: %d watch(es) active", registered);
     return fw;
 }

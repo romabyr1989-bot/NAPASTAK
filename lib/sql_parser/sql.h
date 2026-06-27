@@ -37,6 +37,7 @@ typedef struct WindowSpec WindowSpec;
 struct Expr {
     ExprType    type;
     WindowSpec *win_spec;   /* non-NULL for EXPR_WINDOW */
+    bool        func_distinct; /* EXPR_FUNC: true for aggregate DISTINCT, e.g. COUNT(DISTINCT col) */
     union {
         struct { const char *table; const char *name; };    /* EXPR_COL */
         int64_t     ival;                                   /* LITERAL_INT */
