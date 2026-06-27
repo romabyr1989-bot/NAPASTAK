@@ -188,10 +188,11 @@ static ColBatch *batch_from_raw(Arena *a, const char *payload, size_t payload_le
     schema->ncols  = 2;
     schema->cols   = arena_alloc(a, 2 * sizeof(ColDef));
     schema->cols[0].name     = "kafka_offset";
-    schema->cols[0].type     = COL_TEXT;   /* TEXT like every other column — a
-                                            * native COL_INT64 leaks its raw value
-                                            * as a char* on read-back (offset 1 ->
-                                            * (char*)0x1) and crashes SELECT. */
+    schema->cols[0].type     = COL_INT64;  /* logical INT64; the value is stored as
+                                            * text (text-always model) so there is
+                                            * no native read-back crash, while the
+                                            * catalog type renders kafka_offset as a
+                                            * JSON number on output. */
     schema->cols[0].nullable = false;
     schema->cols[1].name     = "value";
     schema->cols[1].type     = COL_TEXT;
@@ -232,10 +233,11 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
     schema->cols   = arena_alloc(a, ncols * sizeof(ColDef));
 
     schema->cols[0].name     = "kafka_offset";
-    schema->cols[0].type     = COL_TEXT;   /* TEXT like every other column — a
-                                            * native COL_INT64 leaks its raw value
-                                            * as a char* on read-back (offset 1 ->
-                                            * (char*)0x1) and crashes SELECT. */
+    schema->cols[0].type     = COL_INT64;  /* logical INT64; the value is stored as
+                                            * text (text-always model) so there is
+                                            * no native read-back crash, while the
+                                            * catalog type renders kafka_offset as a
+                                            * JSON number on output. */
     schema->cols[0].nullable = false;
 
     for (size_t i = 0; i < root->nkeys; i++) {
@@ -245,11 +247,10 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
         if (!v || v->type == JV_NULL)
             schema->cols[i + 1].type = COL_TEXT;
         else if (v->type == JV_NUMBER)
-            /* Numbers are stored as TEXT (like the PG/Oracle connectors and the
-             * engine's text storage). A native COL_DOUBLE column crashes the
-             * engine on read-back (SELECT) — text avoids it and preserves the
-             * value without float surprises. */
-            schema->cols[i + 1].type = COL_TEXT;
+            /* Logical DOUBLE; the value is kept as text (text-always model), so
+             * there is no native read-back crash and money precision is exact,
+             * while the catalog type renders it as a JSON number on output. */
+            schema->cols[i + 1].type = COL_DOUBLE;
         else if (v->type == JV_BOOL)
             schema->cols[i + 1].type = COL_BOOL;
         else

@@ -362,15 +362,17 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
     for (int c = 0; c < ncols; c++) {
         sc->cols[c].name     = arena_strdup(a, PQfname(res, c));
-        /* Force TEXT for every column — same as the CSV connector. The query
-         * engine has a read-back bug on INT64/DOUBLE columns (a typed source
-         * table crashed the gateway on the first SELECT over it). Emitting text
-         * sidesteps it; downstream SQL coerces as needed. The cursor bookmark is
-         * still read straight from the result (PQgetvalue), so cursor mode on a
-         * bigint/timestamp column is unaffected.
-         * TODO(pg): restore native typing once the engine INT64/DOUBLE
-         *   read-back is fixed (would enable B-tree indexes on numeric cols). */
-        sc->cols[c].type     = COL_TEXT;
+        /* LOGICAL type by PG OID — metadata only. VALUES are always stored as
+         * TEXT (below): the platform's "text-always values + logical-type" model
+         * keeps storage/compress/engine string-based (no native read-back crash)
+         * while the catalog carries the logical type so the output renders typed
+         * (numbers as JSON numbers). int/serial -> INT64, float/numeric -> DOUBLE,
+         * bool -> BOOL; timestamps/dates/text stay TEXT. */
+        Oid oid = PQftype(res, c);
+        if (oid==20||oid==21||oid==23||oid==26)            sc->cols[c].type = COL_INT64;
+        else if (oid==700||oid==701||oid==1700)            sc->cols[c].type = COL_DOUBLE;
+        else if (oid==16)                                  sc->cols[c].type = COL_BOOL;
+        else                                               sc->cols[c].type = COL_TEXT;
         sc->cols[c].nullable = true;
     }
 
@@ -379,56 +381,26 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->ncols  = ncols;
     batch->nrows  = nrows;
 
-    /* Allocate column storage */
+    /* All columns store char* TEXT values regardless of logical type. */
     for (int c = 0; c < ncols; c++) {
         batch->null_bitmap[c] = arena_calloc(a, ((size_t)nrows + 7) / 8);
-        switch (sc->cols[c].type) {
-            case COL_INT64:
-                batch->values[c] = arena_alloc(a, (size_t)nrows * sizeof(int64_t)); break;
-            case COL_DOUBLE:
-                batch->values[c] = arena_alloc(a, (size_t)nrows * sizeof(double)); break;
-            default:
-                batch->values[c] = arena_alloc(a, (size_t)nrows * sizeof(char *)); break;
-        }
+        batch->values[c] = arena_alloc(a, (size_t)nrows * sizeof(char *));
     }
 
-    /* Fill values */
+    /* Fill values — always the source text from PQgetvalue (bool normalised to
+     * true/false). NULL -> sentinel + bitmap bit, for every type. */
     for (int r = 0; r < nrows; r++) {
         for (int c = 0; c < ncols; c++) {
             if (PQgetisnull(res, r, c)) {
                 batch->null_bitmap[c][r/8] |= (uint8_t)(1u << (r % 8));
-                /* NULL contract: keep the null_bitmap bit set AND, for TEXT
-                 * columns (which is every column here — type is forced TEXT),
-                 * place the NULL sentinel so downstream paths that read the
-                 * cell string (materialization, SQL engine, sinks) see a real
-                 * NULL rather than an empty/garbage value. Numeric stores keep
-                 * their zero slot; the bitmap remains authoritative for them. */
-                if (sc->cols[c].type == COL_TEXT)
-                    ((char **)batch->values[c])[r] = (char *)DFO_NULL_SENTINEL;
+                ((char **)batch->values[c])[r] = (char *)DFO_NULL_SENTINEL;
                 continue;
             }
             const char *v = PQgetvalue(res, r, c);
-            switch (sc->cols[c].type) {
-                case COL_INT64: {
-                    Oid oid = PQftype(res, c);
-                    int64_t iv;
-                    if (oid == 1114 || oid == 1184 || oid == 1082)
-                        iv = parse_pg_ts(v);
-                    else
-                        iv = (int64_t)strtoll(v, NULL, 10);
-                    ((int64_t *)batch->values[c])[r] = iv;
-                    break;
-                }
-                case COL_DOUBLE:
-                    ((double *)batch->values[c])[r] = strtod(v, NULL);
-                    break;
-                case COL_BOOL:
-                    ((int64_t *)batch->values[c])[r] = (v[0]=='t' || v[0]=='T' || v[0]=='1');
-                    break;
-                default:
-                    ((char **)batch->values[c])[r] = arena_strdup(a, v);
-                    break;
-            }
+            if (sc->cols[c].type == COL_BOOL)
+                ((char **)batch->values[c])[r] = (char *)((v[0]=='t'||v[0]=='T'||v[0]=='1') ? "true" : "false");
+            else
+                ((char **)batch->values[c])[r] = arena_strdup(a, v);
         }
     }
 

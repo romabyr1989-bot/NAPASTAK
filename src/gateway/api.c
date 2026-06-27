@@ -289,6 +289,19 @@ static const char *dbl_fmt(Arena *a, double d) {
     return arena_strdup(a, buf);
 }
 
+/* True if s is a valid JSON number literal — so it can be emitted unquoted
+ * (jb_raw) for INT64/DOUBLE columns, preserving exact precision (no double
+ * round-trip). Rejects anything that would produce invalid JSON. */
+static bool is_json_number(const char *s) {
+    if (!s || !*s) return false;
+    const char *p = s; if (*p=='-') p++;
+    bool dig=false;
+    while (*p>='0'&&*p<='9') { p++; dig=true; }
+    if (*p=='.') { p++; while (*p>='0'&&*p<='9') { p++; dig=true; } }
+    if (*p=='e'||*p=='E') { p++; if (*p=='-'||*p=='+') p++; bool e=false; while (*p>='0'&&*p<='9'){p++;e=true;} if(!e) return false; }
+    return dig && *p=='\0';
+}
+
 static const char *val_str(Val v, Arena *a) {
     if (v.is_null)  return "";
     if (v.str)      return v.str;
@@ -411,6 +424,7 @@ typedef struct {
     char      **col_names;
     int         ncols;
     int         nskeys;
+    ColType    *col_types;   /* logical type per output column → typed JSON output */
 } RS;
 
 static RS *rs_new(Arena *a, int ncols, char **col_names, int nskeys) {
@@ -420,6 +434,11 @@ static RS *rs_new(Arena *a, int ncols, char **col_names, int nskeys) {
     rs->col_names = col_names;
     rs->cap = 64;
     rs->rows = arena_alloc(a, (size_t)rs->cap * sizeof(OutRow));
+    /* Default every output column to TEXT; the executor upgrades column-refs and
+     * aggregates to their logical type for typed rendering. TEXT = string output
+     * (current behaviour) so partial inference never regresses. */
+    rs->col_types = arena_alloc(a, (size_t)(ncols>0?ncols:1) * sizeof(ColType));
+    for (int i=0;i<ncols;i++) rs->col_types[i] = COL_TEXT;
     return rs;
 }
 
@@ -1916,6 +1935,34 @@ static void build_star_col_names(Arena *a, const SelectStmt *sel, TblData *table
     (void)sel;
 }
 
+/* Infer the logical output type of a select expression for typed JSON rendering:
+ * a column ref -> its source column's catalog type; an aggregate -> COUNT:INT64,
+ * SUM/AVG/MIN/MAX:DOUBLE; numeric/bool literals -> their type; else TEXT. */
+static ColType infer_expr_type(Expr *e, TblData *tables, int ntables) {
+    if (!e) return COL_TEXT;
+    if (e->type==EXPR_ALIAS) return infer_expr_type(e->expr, tables, ntables);
+    if (e->type==EXPR_COL) {
+        for (int t=0;t<ntables;t++) {
+            Schema *sc=tables[t].schema; if(!sc) continue;
+            if (e->table && *e->table) {
+                bool m=(tables[t].tname && !strcasecmp(e->table,tables[t].tname)) ||
+                       (tables[t].alias && !strcasecmp(e->table,tables[t].alias));
+                if(!m) continue;
+            }
+            for (int c=0;c<sc->ncols;c++)
+                if (sc->cols[c].name && e->name && !strcasecmp(sc->cols[c].name,e->name))
+                    return sc->cols[c].type;
+        }
+        return COL_TEXT;
+    }
+    if (e->type==EXPR_FUNC && e->func_name && is_agg_name(e->func_name))
+        return !strcasecmp(e->func_name,"COUNT") ? COL_INT64 : COL_DOUBLE;
+    if (e->type==EXPR_LITERAL_INT)   return COL_INT64;
+    if (e->type==EXPR_LITERAL_FLOAT) return COL_DOUBLE;
+    if (e->type==EXPR_LITERAL_BOOL)  return COL_BOOL;
+    return COL_TEXT;
+}
+
 /* ── Window function support ── */
 
 static bool expr_has_window(Expr *e) {
@@ -2339,6 +2386,18 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     }
 
     RS *rs=rs_new(a,ncols,col_names,sel->norder);
+    /* Typed output: tag each output column with its logical type so h_query
+     * renders numbers/bools as JSON numbers/bools (not strings). Star columns
+     * map to source columns in order; explicit columns are inferred. */
+    if (is_star) {
+        int oc=0;
+        for (int t=0;t<ntables && oc<ncols;t++) {
+            Schema *sc=tables[t].schema; if(!sc) continue;
+            for (int c=0;c<sc->ncols && oc<ncols;c++) rs->col_types[oc++]=sc->cols[c].type;
+        }
+    } else {
+        for (int i=0;i<ncols;i++) rs->col_types[i]=infer_expr_type(sel->select_list[i], tables, ntables);
+    }
 
     ExecState st={0};
     st.a=a; st.sel=sel; st.vt=vt; st.rs=rs;
@@ -2974,7 +3033,11 @@ static void h_query(HttpReq *req, HttpResp *resp) {
             jb_arr_begin(&jb);
             for(int c=0;c<rs->ncols;c++){
                 const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
-                if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
+                if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)){ jb_null(&jb); }
+                else { ColType _ct=rs->col_types?rs->col_types[c]:COL_TEXT;
+                       if((_ct==COL_INT64||_ct==COL_DOUBLE)&&is_json_number(v)) jb_raw(&jb,v);
+                       else if(_ct==COL_BOOL&&(!strcmp(v,"true")||!strcmp(v,"false"))) jb_raw(&jb,v);
+                       else jb_str(&jb,v); }
             }
             jb_arr_end(&jb);
         }
@@ -3114,7 +3177,11 @@ static void h_query_named(HttpReq *req, HttpResp *resp) {
             jb_arr_begin(&jb);
             for(int c=0;c<rs->ncols;c++){
                 const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
-                if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
+                if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)){ jb_null(&jb); }
+                else { ColType _ct=rs->col_types?rs->col_types[c]:COL_TEXT;
+                       if((_ct==COL_INT64||_ct==COL_DOUBLE)&&is_json_number(v)) jb_raw(&jb,v);
+                       else if(_ct==COL_BOOL&&(!strcmp(v,"true")||!strcmp(v,"false"))) jb_raw(&jb,v);
+                       else jb_str(&jb,v); }
             }
             jb_arr_end(&jb);
         }
@@ -3990,7 +4057,11 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
         jb_arr_begin(&jb);
         for (int c = 0; c < rs->ncols; c++) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : NULL;
-            if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)) jb_null(&jb); else jb_str(&jb,v);
+            if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)){ jb_null(&jb); }
+            else { ColType _ct=rs->col_types?rs->col_types[c]:COL_TEXT;
+                   if((_ct==COL_INT64||_ct==COL_DOUBLE)&&is_json_number(v)) jb_raw(&jb,v);
+                   else if(_ct==COL_BOOL&&(!strcmp(v,"true")||!strcmp(v,"false"))) jb_raw(&jb,v);
+                   else jb_str(&jb,v); }
         }
         jb_arr_end(&jb);
     }
@@ -4586,7 +4657,21 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
             table_created = true;
         }
 
-        table_append(t, batch);
+        /* Store as TEXT: connector batch values are always char* text, while the
+         * catalog (via recreate_table above) keeps the LOGICAL type. Temporarily
+         * present a COL_TEXT schema to table_append/compress so they read char**
+         * (never reinterpret text as a native int64/double — that crashed SELECT).
+         * Restored immediately so the logical schema survives for later pages. */
+        {
+            ColType _saved[MAX_COLS];
+            int _nc = batch->ncols < MAX_COLS ? batch->ncols : MAX_COLS;
+            for (int c = 0; c < _nc; c++) {
+                _saved[c] = batch->schema->cols[c].type;
+                batch->schema->cols[c].type = COL_TEXT;
+            }
+            table_append(t, batch);
+            for (int c = 0; c < _nc; c++) batch->schema->cols[c].type = _saved[c];
+        }
         total_rows += batch->nrows;
 
         /* Advance the cursor for the NEXT page.
