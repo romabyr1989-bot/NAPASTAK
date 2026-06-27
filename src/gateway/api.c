@@ -4161,6 +4161,7 @@ static void h_pipeline_get(HttpReq *req, HttpResp *resp) {
 static Table *recreate_table(App *app, Arena *a, const char *tname, Schema *schema) {
     pthread_mutex_lock(&app->tables_mu);
     Table *old = hm_get(&app->tables, tname);
+    bool replaced = old != NULL;   /* replacing an existing table → net count unchanged */
     if (old) { table_close(old); hm_del(&app->tables, tname); }
     pthread_mutex_unlock(&app->tables_mu);
 
@@ -4177,6 +4178,12 @@ static Table *recreate_table(App *app, Arena *a, const char *tname, Schema *sche
     hm_set(&app->tables, tname, t);
     pthread_mutex_unlock(&app->tables_mu);
     catalog_register_table(app->catalog, tname, schema);
+    /* Account a genuinely new table so tables_count balances the drops in
+     * h_table_delete / the preview-temp cleanup / the SCD2 scratch teardown.
+     * Without this, tables created through this path were never counted yet
+     * still decremented on drop, driving the gauge negative. A replace
+     * (drop+recreate of an existing name) is net-zero. */
+    if (t && !replaced) __atomic_fetch_add(&g_app.metrics->tables_count, 1, __ATOMIC_RELAXED);
     (void)a;
     return t;
 }
@@ -5299,6 +5306,20 @@ static bool scd2_truthy(const char *v) {
     return true;
 }
 
+/* True iff a stored effective_to cell denotes an OPEN (current) version.
+ * An open end-bound may be materialised either as a real SQL NULL (the
+ * DFO_NULL_SENTINEL when read back through the engine) — the industrial form
+ * that lets downstream "<effective_to> IS NULL" find current versions — or as
+ * a legacy empty string "" (older history written before the NULL contract).
+ * Both must classify as open so the close-pass keeps recognising current
+ * versions across the upgrade. */
+static bool scd2_is_open(const char *v) {
+    if (!v) return true;
+    if (!v[0]) return true;
+    if (!strcmp(v, DFO_NULL_SENTINEL)) return true;
+    return false;
+}
+
 /* True iff any business-key component of this row is NULL (sentinel) or empty.
  * Such a row must NOT be historised: merging under an empty/NULL key would
  * collapse unrelated entities into one dimension lineage (a banking-grade data
@@ -5355,23 +5376,27 @@ static void scd2_compute_hash(const RS *src, int row,
  *      window function ROW_NUMBER() OVER (PARTITION BY <bk>
  *      ORDER BY <transaction_time> DESC) = 1 (falls back to deriving the
  *      open versions from history in memory if the engine rejects the
- *      window query — an open version is an empty <valid_to> cell).
+ *      window query — an open version is a NULL (or, for legacy history,
+ *      empty) <valid_to> cell; see scd2_is_open).
  *   3. Classify each source row: NEW (no current version), CHANGED (a
  *      compare column differs), DELETED (soft-delete flag set), or
  *      unchanged. Closed keys = CHANGED ∪ DELETED.
  *   4. Build the full next table: every existing row, with valid_to set
  *      to now() on the current version of a closed key; plus one new
- *      version (valid_from=now(), valid_to=NULL) for every NEW/CHANGED
- *      key. DELETED keys are only closed. Write it via write_rs_to_table.
- *   5. Return the number of new versions inserted, or <0 with errbuf set.
+ *      version (valid_from=now(), valid_to=SQL NULL) for every NEW/CHANGED
+ *      key. DELETED keys are only closed. Industrial metadata columns are
+ *      materialised when configured: scd2_current_flag_col (1 on the open
+ *      version, 0 on closed) and scd2_version_col (per-key version number,
+ *      max+1 on each new version). Write it via write_rs_to_table.
+ *   5. Drop the scratch __scd2_src table, then return the number of new
+ *      versions inserted, or <0 with errbuf set.
  *
  * TODO(scd2): comparison is plain strcmp with NULL≡"" — a NULL-safe
  *   compare scalar isn't available in the engine yet, so genuine
  *   NULL-vs-'' distinctions are not detected.
  * TODO(scd2): current-version lookup is O(source × current); fine for
- *   modest dimensions, hash it if this grows hot.
- * TODO(scd2): __scd2_src_<id> is left materialised after the run. */
-static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
+ *   modest dimensions, hash it if this grows hot. */
+static int run_scd2_step(App *app, Arena *a, Pipeline *p, PipelineStep *st, char *errbuf, size_t errsz) {
     const char *bk_spec = st->scd2_business_key;
     const char *vf      = st->scd2_effective_from_col;
     const char *vt      = st->scd2_effective_to_col;
@@ -5387,9 +5412,14 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     int   nbk = scd2_split_list(a, bk_spec, bk_cols, SCD2_MAX_COLS);
     if (nbk == 0) { snprintf(errbuf, errsz, "scd2 step %s: empty business key", st->id); return -1; }
 
-    /* 1. Materialise the source slice into a per-step temp table. */
-    char src_tbl[160];
-    snprintf(src_tbl, sizeof(src_tbl), "__scd2_src_%s", st->id);
+    /* 1. Materialise the source slice into a per-(pipeline,step) temp table.
+     * Scoping the name by pipeline id as well as step id keeps two pipelines
+     * that happen to reuse a step id from clobbering each other's scratch table
+     * and avoids orphaning it under the bare step id (the temp is dropped at the
+     * end of the run, see cleanup below). */
+    char src_tbl[200];
+    snprintf(src_tbl, sizeof(src_tbl), "__scd2_src_%s_%s",
+             (p && p->id[0]) ? p->id : "p", st->id);
     const char *scd2_sql = step_sql(st);
     Stmt *sstmt = sql_parse(a, scd2_sql, strlen(scd2_sql));
     if (!sstmt || sstmt->error) {
@@ -5429,6 +5459,8 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         for (int c = 0; c < src->ncols && ncmp < SCD2_MAX_COLS; c++) {
             const char *cn = src->col_names[c]; if (!cn) continue;
             if (!strcasecmp(cn, vf) || !strcasecmp(cn, vt) || !strcasecmp(cn, tt)) continue;
+            if (st->scd2_current_flag_col[0] && !strcasecmp(cn, st->scd2_current_flag_col)) continue;
+            if (st->scd2_version_col[0]      && !strcasecmp(cn, st->scd2_version_col))      continue;
             if (st->scd2_deleted_flag[0] && !strcasecmp(cn, st->scd2_deleted_flag)) continue;
             bool is_bk = false; for (int i = 0; i < nbk; i++) if (!strcasecmp(cn, bk_cols[i])) { is_bk = true; break; }
             if (is_bk) continue;
@@ -5441,6 +5473,16 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     char now_str[32];
     snprintf(now_str, sizeof(now_str), "%lld", (long long)time(NULL));
 
+    /* Industrial SCD2 metadata columns (optional). When configured they are
+     * materialised on the target so downstream readers get a Joker-grade
+     * dimension:
+     *   - current_flag_col: "1"/"0" — 1 on the open (current) version of each
+     *     key, 0 on every closed version.
+     *   - version_col: a monotonic version number per business key, starting at
+     *     1 and incremented on each new version. */
+    const char *cf  = st->scd2_current_flag_col;   /* "" when unused */
+    const char *vc  = st->scd2_version_col;         /* "" when unused */
+
     /* 2. Read full history, then pick the current version per business key.
      *
      * Two engine quirks force the exact shape here (both verified):
@@ -5448,9 +5490,11 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
      *     "SELECT *, <expr>" yields a literal "*" column. So the window
      *     query must list the target columns explicitly, which we learn
      *     from the plain "SELECT * FROM target" history read.
-     *   - an empty cell is the string "" , not SQL NULL, so "<valid_to>
-     *     IS NULL" never matches an open version. The in-memory fallback
-     *     and the close-pass therefore test for an empty string. */
+     *   - open versions are written with a real SQL NULL <valid_to> (so
+     *     downstream "<valid_to> IS NULL" finds current versions). Read back
+     *     through the engine a NULL cell surfaces as DFO_NULL_SENTINEL, and
+     *     legacy history may still carry "". The in-memory fallback and the
+     *     close-pass therefore classify both via scd2_is_open(). */
     bool target_exists;
     pthread_mutex_lock(&g_app.tables_mu);
     target_exists = hm_get(&g_app.tables, st->target_table) != NULL;
@@ -5486,8 +5530,8 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
             int hvt = scd2_rs_col_index(hist, vt);
             cur = rs_new(a, hist->ncols, hist->col_names, 0);
             for (int r = 0; r < hist->nrows; r++) {
-                const char *vtc = (hvt >= 0 && hist->rows[r].cells[hvt]) ? hist->rows[r].cells[hvt] : "";
-                if (!vtc[0]) rs_add(cur, a, hist->rows[r].cells, NULL);
+                const char *vtc = (hvt >= 0) ? hist->rows[r].cells[hvt] : NULL;
+                if (scd2_is_open(vtc)) rs_add(cur, a, hist->rows[r].cells, NULL);
             }
         }
     }
@@ -5587,10 +5631,15 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         tcols = hist->col_names; tncols = hist->ncols;
     } else {
         tncols = 0;
-        tcols = arena_alloc(a, (size_t)(src->ncols + 3) * sizeof(char *));
+        tcols = arena_alloc(a, (size_t)(src->ncols + 5) * sizeof(char *));
         for (int c = 0; c < src->ncols; c++) tcols[tncols++] = src->col_names[c];
         if (scd2_rs_col_index(src, vf) < 0) tcols[tncols++] = arena_strdup(a, vf);
         if (scd2_rs_col_index(src, vt) < 0) tcols[tncols++] = arena_strdup(a, vt);
+        /* Industrial metadata columns (optional; appended once on first run). */
+        if (cf[0] && scd2_rs_col_index(src, cf) < 0 && tncols < MAX_COLS)
+            tcols[tncols++] = arena_strdup(a, cf);
+        if (vc[0] && scd2_rs_col_index(src, vc) < 0 && tncols < MAX_COLS)
+            tcols[tncols++] = arena_strdup(a, vc);
         /* Row-hash column for change detection (optional; off when unset). */
         if (st->scd2_hash_col[0] && scd2_rs_col_index(src, st->scd2_hash_col) < 0
                                  && tncols < MAX_COLS)
@@ -5598,6 +5647,31 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     }
     int t_vt_idx = -1;
     for (int j = 0; j < tncols; j++) if (tcols[j] && !strcasecmp(tcols[j], vt)) { t_vt_idx = j; break; }
+    /* Resolve metadata column positions in the target layout (-1 = absent). */
+    int t_cf_idx = -1, t_vc_idx = -1;
+    if (cf[0]) for (int j = 0; j < tncols; j++) if (tcols[j] && !strcasecmp(tcols[j], cf)) { t_cf_idx = j; break; }
+    if (vc[0]) for (int j = 0; j < tncols; j++) if (tcols[j] && !strcasecmp(tcols[j], vc)) { t_vc_idx = j; break; }
+
+    /* Per-business-key max version number seen in history, so a new version is
+     * stamped with max+1 (first version of a key = 1). Built only when a
+     * version column is configured and present in the target. */
+    char **ver_keys = NULL; long *ver_max = NULL; int n_ver = 0;
+    if (vc[0] && t_vc_idx >= 0 && hist && hist->ncols) {
+        int hvc = scd2_rs_col_index(hist, vc);
+        ver_keys = arena_alloc(a, (size_t)hist->nrows * sizeof(char *));
+        ver_max  = arena_alloc(a, (size_t)hist->nrows * sizeof(long));
+        int *bk_idx_h = arena_alloc(a, (size_t)nbk * sizeof(int));
+        for (int i = 0; i < nbk; i++) bk_idx_h[i] = scd2_rs_col_index(hist, bk_cols[i]);
+        for (int r = 0; r < hist->nrows && hvc >= 0; r++) {
+            char *key = scd2_build_key(a, hist->rows[r].cells, bk_idx_h, nbk);
+            const char *vv = hist->rows[r].cells[hvc];
+            long v = (vv && vv[0] && strcmp(vv, DFO_NULL_SENTINEL)) ? strtol(vv, NULL, 10) : 0;
+            int slot = -1;
+            for (int s = 0; s < n_ver; s++) if (!strcmp(ver_keys[s], key)) { slot = s; break; }
+            if (slot < 0 && n_ver < hist->nrows) { slot = n_ver++; ver_keys[slot] = key; ver_max[slot] = 0; }
+            if (slot >= 0 && v > ver_max[slot]) ver_max[slot] = v;
+        }
+    }
 
     RS *out = rs_new(a, tncols, tcols, 0);
 
@@ -5608,12 +5682,16 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         for (int r = 0; r < hist->nrows; r++) {
             char **cells = arena_alloc(a, (size_t)tncols * sizeof(char *));
             for (int j = 0; j < tncols; j++) cells[j] = hist->rows[r].cells[j] ? hist->rows[r].cells[j] : "";
-            bool is_open = t_vt_idx < 0 || !cells[t_vt_idx][0];
-            if (is_open && t_vt_idx >= 0) {
+            bool was_open = t_vt_idx < 0 || scd2_is_open(cells[t_vt_idx]);
+            bool now_closed = false;
+            if (was_open && t_vt_idx >= 0) {
                 char *key = scd2_build_key(a, hist->rows[r].cells, bk_idx_hist, nbk);
                 for (int k = 0; k < n_closed; k++)
-                    if (!strcmp(key, closed_keys[k])) { cells[t_vt_idx] = now_str; break; }
+                    if (!strcmp(key, closed_keys[k])) { cells[t_vt_idx] = now_str; now_closed = true; break; }
             }
+            /* current_flag: 1 only on versions that remain open after this run. */
+            if (t_cf_idx >= 0)
+                cells[t_cf_idx] = (char *)((was_open && !now_closed) ? "1" : "0");
             rs_add(out, a, cells, NULL);
         }
     }
@@ -5622,10 +5700,21 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     for (int i = 0; i < n_new; i++) {
         char **scells = src->rows[new_rows[i]].cells;
         char **cells = arena_alloc(a, (size_t)tncols * sizeof(char *));
+        /* Next version number for this key: max(history) + 1, defaulting to 1. */
+        char *vbuf = NULL;
+        if (t_vc_idx >= 0) {
+            char *key = scd2_build_key(a, scells, bk_idx_src, nbk);
+            long base = 0;
+            for (int s = 0; s < n_ver; s++) if (!strcmp(ver_keys[s], key)) { base = ver_max[s]; break; }
+            vbuf = arena_sprintf(a, "%ld", base + 1);
+        }
         for (int j = 0; j < tncols; j++) {
             const char *name = tcols[j];
-            if (!strcasecmp(name, vf))      cells[j] = now_str;
-            else if (!strcasecmp(name, vt)) cells[j] = (char *)"";   /* open version */
+            if (j == t_vt_idx)              cells[j] = (char *)DFO_NULL_SENTINEL; /* open: SQL NULL */
+            else if (j == t_cf_idx)         cells[j] = (char *)"1";              /* current */
+            else if (j == t_vc_idx)         cells[j] = vbuf ? vbuf : (char *)"1";
+            else if (!strcasecmp(name, vf)) cells[j] = now_str;
+            else if (!strcasecmp(name, vt)) cells[j] = (char *)DFO_NULL_SENTINEL;
             else {
                 int si = scd2_rs_col_index(src, name);
                 cells[j] = (si >= 0 && scells[si]) ? scells[si] : (char *)"";
@@ -5649,6 +5738,25 @@ static int run_scd2_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     write_rs_to_table(app, a, st->target_table, out);
     LOG_INFO("scd2 step '%s' → %s: %d new version(s), %d closed, %d total rows",
              st->id, st->target_table, n_new, n_closed, out->nrows);
+
+    /* 6. Drop the scratch source table — it is run-private and must not be left
+     * materialised after the step (it would otherwise leak into the table list,
+     * the catalog and the on-disk data dir). Mirrors recreate_table's teardown:
+     * close+evict the engine table, drop from the catalog, remove the WAL/dir,
+     * and balance tables_count (the table was counted when recreate_table built
+     * it). */
+    {
+        pthread_mutex_lock(&app->tables_mu);
+        Table *tmp = hm_get(&app->tables, src_tbl);
+        if (tmp) { table_close(tmp); hm_del(&app->tables, src_tbl); }
+        pthread_mutex_unlock(&app->tables_mu);
+        catalog_drop_table(app->catalog, src_tbl);
+        char dp[1024], wp[1024];
+        snprintf(dp, sizeof(dp), "%s/%s", app->data_dir, src_tbl);
+        snprintf(wp, sizeof(wp), "%s/wal.bin", dp);
+        unlink(wp); rmdir(dp);
+        if (tmp) __atomic_fetch_sub(&g_app.metrics->tables_count, 1, __ATOMIC_RELAXED);
+    }
     return n_new;
 }
 
@@ -6037,7 +6145,7 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                 /* SCD2 historisation step — must be caught before the generic
                  * transform_sql branch because it uses transform_sql as its
                  * source slice (writes via write_rs_to_table). */
-                int n = run_scd2_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                int n = run_scd2_step(app, a, p, st, p->error_msg, sizeof(p->error_msg));
                 if (n < 0) {
                     st->status = STEP_FAILED;
                 } else {

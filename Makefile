@@ -60,6 +60,7 @@ CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
 PG_PLUGIN      = $(LIBDIR)/pg_connector.so
 PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
 JSONHTTP_PLUGIN= $(LIBDIR)/json_http_connector.so
+SIEBEL_PLUGIN  = $(LIBDIR)/siebel_connector.so
 KAFKA_PLUGIN   = $(LIBDIR)/kafka_connector.so
 GP_PLUGIN      = $(LIBDIR)/gp_connector.so
 ORACLE_PLUGIN  = $(LIBDIR)/oracle_connector.so
@@ -113,7 +114,7 @@ endif
         test-integration test-sql test-all bench flight gp oracle
 
 # Base targets always built
-_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
+_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(SIEBEL_PLUGIN)
 ifeq ($(HAS_PQ),yes)
   _ALL_TARGETS += $(PG_PLUGIN) $(GP_PLUGIN)   # Greenplum reuses libpq
 endif
@@ -213,6 +214,15 @@ $(JSONHTTP_PLUGIN): lib/connector/plugins/json_http/json_http_connector.c \
                     $(OUTDIR)/lib/storage/storage.o \
                     $(OUTDIR)/lib/core/log.o \
                     $(OUTDIR)/lib/core/json.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# Siebel/EIM sink connector (requires libcurl — EAI REST Inbound Web Service)
+$(SIEBEL_PLUGIN): lib/connector/plugins/siebel/siebel_connector.c \
+                  $(OUTDIR)/lib/core/arena.o \
+                  $(OUTDIR)/lib/storage/storage.o \
+                  $(OUTDIR)/lib/core/log.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
