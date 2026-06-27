@@ -637,7 +637,20 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         if (incremental && !strcasecmp(nm, cc)) cursor_out_idx = ncols_out;
         str_lower(nm);
         sc->cols[ncols_out].name     = arena_strdup(a, nm);
-        sc->cols[ncols_out].type     = COL_TEXT;   /* TEXT-форсинг, как в pg */
+        /* Logical type — value is read as text (NUMBER is defined as VARCHAR
+         * above to keep precision), so no native read-back; the catalog type
+         * renders numbers as JSON numbers on output. NUMBER with scale 0 -> INT64,
+         * with a fractional scale -> DOUBLE; BOOLEAN -> BOOL; everything else
+         * (dates, varchar, lob, ...) stays TEXT. */
+        {
+            dpiOracleTypeNum _ot = qi.typeInfo.oracleTypeNum;
+            ColType _ct = COL_TEXT;
+            if (_ot == DPI_ORACLE_TYPE_NUMBER)
+                _ct = (qi.typeInfo.scale == 0) ? COL_INT64 : COL_DOUBLE;
+            else if (_ot == DPI_ORACLE_TYPE_BOOLEAN)
+                _ct = COL_BOOL;
+            sc->cols[ncols_out].type = _ct;
+        }
         sc->cols[ncols_out].nullable = true;
         raw_to_out[c] = ncols_out;
         ncols_out++;

@@ -416,11 +416,14 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
     for (int c = 0; c < ncols; c++) {
         sc->cols[c].name = arena_strdup(a, PQfname(res, c));
-        /* Force TEXT for every column — same as pg_connector. The query engine
-         * has a read-back bug on native INT64/DOUBLE columns; emitting text
-         * sidesteps it, downstream SQL coerces as needed. The cursor bookmark
-         * is read straight from PQgetvalue, so cursor mode is unaffected. */
-        sc->cols[c].type     = COL_TEXT;
+        /* Logical type by PG OID — values are stored as text (text-always model),
+         * so no native read-back, but the catalog type renders numbers/bools as
+         * JSON numbers/bools on output. */
+        Oid oid = PQftype(res, c);
+        if (oid==20||oid==21||oid==23||oid==26)            sc->cols[c].type = COL_INT64;
+        else if (oid==700||oid==701||oid==1700)            sc->cols[c].type = COL_DOUBLE;
+        else if (oid==16)                                  sc->cols[c].type = COL_BOOL;
+        else                                               sc->cols[c].type = COL_TEXT;
         sc->cols[c].nullable = true;
     }
 

@@ -501,6 +501,10 @@ typedef struct GrpAcc_s {
     int     total_cnt;
     bool   *min_set, *max_set;
     char  **first_str;
+    /* Actual MIN/MAX value per column (string), so MIN/MAX over TEXT returns the
+     * real value, not a numeric 0. Compared numerically when both look numeric,
+     * else lexically. */
+    char  **min_str, **max_str;
     /* DISTINCT aggregates (COUNT/SUM/AVG DISTINCT): per-select-column set of
      * already-seen value strings, so a repeated value is counted/summed once. */
     char ***dvals;
@@ -521,8 +525,14 @@ static Val agg_slot_value(GrpAcc *g, int s, const char *fn) {
     if (!strcasecmp(fn,"COUNT")) return vnum((double)g->cnts[s]);
     if (!strcasecmp(fn,"SUM"))   return vnum(g->sums[s]);
     if (!strcasecmp(fn,"AVG"))   return vnum(g->cnts[s] ? g->sums[s]/g->cnts[s] : 0.0);
-    if (!strcasecmp(fn,"MIN"))   return g->min_set[s] ? vnum(g->mins[s]) : vnull();
-    if (!strcasecmp(fn,"MAX"))   return g->max_set[s] ? vnum(g->maxs[s]) : vnull();
+    if (!strcasecmp(fn,"MIN")||!strcasecmp(fn,"MAX")) {
+        bool set = !strcasecmp(fn,"MIN") ? g->min_set[s] : g->max_set[s];
+        if (!set) return vnull();
+        const char *sv = !strcasecmp(fn,"MIN") ? g->min_str[s] : g->max_str[s];
+        Val r = vstr_s(sv); double n;          /* real value (numeric or text) */
+        if (pnum(sv,&n)) { r.is_num=true; r.num=n; }
+        return r;
+    }
     return vnull();
 }
 /* Thread-local outer join context: for correlated subqueries */
@@ -1525,6 +1535,8 @@ static GrpAcc *find_or_create_grp(ExecState *st, const char *key) {
     g->min_set  =arena_calloc(st->a,(size_t)nc*sizeof(bool));
     g->max_set  =arena_calloc(st->a,(size_t)nc*sizeof(bool));
     g->first_str=arena_calloc(st->a,(size_t)nc*sizeof(char*));
+    g->min_str  =arena_calloc(st->a,(size_t)nc*sizeof(char*));
+    g->max_str  =arena_calloc(st->a,(size_t)nc*sizeof(char*));
     g->dvals    =arena_calloc(st->a,(size_t)nc*sizeof(char**));
     g->dcnt     =arena_calloc(st->a,(size_t)nc*sizeof(int));
     g->dcap     =arena_calloc(st->a,(size_t)nc*sizeof(int));
@@ -1546,6 +1558,13 @@ static bool agg_distinct_first_seen(ExecState *st, GrpAcc *g, int s, const char 
 }
 
 /* Accumulate one aggregate-function value (agg_e) into group slot s. */
+/* MIN/MAX ordering: numeric when BOTH operands parse as numbers, else lexical. */
+static int agg_val_cmp(const char *a, const char *b) {
+    double na, nb;
+    if (pnum(a,&na) && pnum(b,&nb)) return (na<nb)?-1:(na>nb)?1:0;
+    return strcmp(a?a:"", b?b:"");
+}
+
 static void agg_accumulate(ExecState *st, GrpAcc *g, int s, Expr *agg_e, JoinCtx *ctx) {
     const char *fn=agg_e->func_name;
     bool is_star=(agg_e->nargs>0 && agg_e->args[0]->type==EXPR_STAR);
@@ -1560,10 +1579,19 @@ static void agg_accumulate(ExecState *st, GrpAcc *g, int s, Expr *agg_e, JoinCtx
     } else {
         Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
         if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,st->a)))) {
-            double n=v.num; if (!v.is_num) pnum(val_str(v,st->a),&n);
+            const char *sv=val_str(v,st->a);
+            double n=v.num; if (!v.is_num) pnum(sv,&n);
             g->sums[s]+=n; g->cnts[s]++;
-            if (!g->min_set[s]||n<g->mins[s]){g->mins[s]=n;g->min_set[s]=true;}
-            if (!g->max_set[s]||n>g->maxs[s]){g->maxs[s]=n;g->max_set[s]=true;}
+            if (!g->min_set[s]) {
+                g->mins[s]=n; g->maxs[s]=n;
+                g->min_str[s]=arena_strdup(st->a,sv); g->max_str[s]=arena_strdup(st->a,sv);
+                g->min_set[s]=g->max_set[s]=true;
+            } else {
+                if (n<g->mins[s]) g->mins[s]=n;
+                if (n>g->maxs[s]) g->maxs[s]=n;
+                if (agg_val_cmp(sv,g->min_str[s])<0) g->min_str[s]=arena_strdup(st->a,sv);
+                if (agg_val_cmp(sv,g->max_str[s])>0) g->max_str[s]=arena_strdup(st->a,sv);
+            }
         }
     }
 }
@@ -1615,8 +1643,8 @@ static void emit_groups(ExecState *st) {
                 if (!strcasecmp(fn,"COUNT")) cells[s]=arena_sprintf(st->a,"%d",g->cnts[s]);
                 else if (!strcasecmp(fn,"SUM")) cells[s]=dbl_fmt(st->a, g->sums[s]);
                 else if (!strcasecmp(fn,"AVG")) cells[s]=g->cnts[s]?dbl_fmt(st->a, g->sums[s]/g->cnts[s]):"";
-                else if (!strcasecmp(fn,"MIN")) cells[s]=g->min_set[s]?dbl_fmt(st->a, g->mins[s]):"";
-                else if (!strcasecmp(fn,"MAX")) cells[s]=g->max_set[s]?dbl_fmt(st->a, g->maxs[s]):"";
+                else if (!strcasecmp(fn,"MIN")) cells[s]=g->min_set[s]?g->min_str[s]:"";
+                else if (!strcasecmp(fn,"MAX")) cells[s]=g->max_set[s]?g->max_str[s]:"";
                 else cells[s]="";
             } else if (expr_has_agg(base)) {
                 /* expression wrapping aggregate (e.g. ROUND(AVG(x))) — eval with group ctx */
@@ -1955,8 +1983,12 @@ static ColType infer_expr_type(Expr *e, TblData *tables, int ntables) {
         }
         return COL_TEXT;
     }
-    if (e->type==EXPR_FUNC && e->func_name && is_agg_name(e->func_name))
-        return !strcasecmp(e->func_name,"COUNT") ? COL_INT64 : COL_DOUBLE;
+    if (e->type==EXPR_FUNC && e->func_name && is_agg_name(e->func_name)) {
+        if (!strcasecmp(e->func_name,"COUNT")) return COL_INT64;
+        if (!strcasecmp(e->func_name,"MIN")||!strcasecmp(e->func_name,"MAX"))
+            return e->nargs>0 ? infer_expr_type(e->args[0], tables, ntables) : COL_TEXT;
+        return COL_DOUBLE;  /* SUM/AVG */
+    }
     if (e->type==EXPR_LITERAL_INT)   return COL_INT64;
     if (e->type==EXPR_LITERAL_FLOAT) return COL_DOUBLE;
     if (e->type==EXPR_LITERAL_BOOL)  return COL_BOOL;
@@ -5163,9 +5195,13 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
         "    sys.exit(2)\n"
         "_csv_in = sys.stdin.read()\n"
         "df = pd.read_csv(io.StringIO(_csv_in)) if _csv_in.strip() else pd.DataFrame()\n"
+        "# Route user print()/stdout to stderr so diagnostics never mix into the\n"
+        "# result CSV (a single print() used to corrupt the target table silently).\n"
+        "_dfo_out = sys.stdout; sys.stdout = sys.stderr\n"
         "# ── user code ──\n"
         "%s\n"
         "# ── /user code ──\n"
+        "sys.stdout = _dfo_out\n"
         "df.to_csv(sys.stdout, index=False)\n",
         user_code);
 
