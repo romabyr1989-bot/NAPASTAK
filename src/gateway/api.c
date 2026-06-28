@@ -4790,13 +4790,19 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         return -1;
     }
 
-    /* 2. Build a TEXT schema from the result columns */
+    /* 2. Build the sink schema from the result columns. Values are always text
+     * (text-always model), but we carry the LOGICAL type so a typed sink (e.g.
+     * the PG sink) can create BIGINT/NUMERIC/BOOLEAN columns instead of all TEXT
+     * — typed write parity with the source. NULLs still flow via null_bitmap
+     * below (a real NULL param, never the sentinel text), so typed columns never
+     * see an uncastable value. */
     Schema *schema = arena_calloc(a, sizeof(Schema));
     schema->ncols = rs->ncols;
     schema->cols  = arena_alloc(a, (size_t)rs->ncols * sizeof(ColDef));
     for (int c = 0; c < rs->ncols; c++) {
+        ColType lt = rs->col_types ? rs->col_types[c] : COL_TEXT;
         schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
-        schema->cols[c].type     = COL_TEXT;
+        schema->cols[c].type     = (lt==COL_INT64||lt==COL_DOUBLE||lt==COL_BOOL) ? lt : COL_TEXT;
         schema->cols[c].nullable = true;
     }
 

@@ -553,7 +553,16 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
         off += (size_t)snprintf(ddl+off, cap-off, "CREATE TABLE IF NOT EXISTS %s (", eident);
         for (int c = 0; c < ncols; c++) {
             char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
-            off += (size_t)snprintf(ddl+off, cap-off, "%s%s TEXT", c?", ":"", col ? col : "\"col\"");
+            /* Logical type → PG column type (values arrive as text and are
+             * assignment-cast on INSERT; NUMERIC keeps money exact). */
+            const char *sqlty;
+            switch (schema->cols[c].type) {
+                case COL_INT64:  sqlty = "BIGINT";  break;
+                case COL_DOUBLE: sqlty = "NUMERIC"; break;
+                case COL_BOOL:   sqlty = "BOOLEAN"; break;
+                default:         sqlty = "TEXT";    break;
+            }
+            off += (size_t)snprintf(ddl+off, cap-off, "%s%s %s", c?", ":"", col ? col : "\"col\"", sqlty);
             if (col) PQfreemem(col);
         }
         if (npk > 0)
@@ -623,12 +632,13 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
                 const uint8_t *bm = batch->null_bitmap[c];
                 int isnull = (bm && ((bm[r/8] >> (r%8)) & 1u));
                 if (isnull) { PG_APP("%sNULL", c?", ":""); continue; }
-                char numbuf[64]; const char *v;
-                switch (schema->cols[c].type) {
-                    case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
-                    case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
-                    default:         v = ((char**)batch->values[c])[r]; if(!v) v=""; break;
-                }
+                /* Values are always text (text-always model); the schema type only
+                 * drives the column type in the DDL above. We send the text literal
+                 * and let PG assignment-cast it ('42'->BIGINT, '12.5'->NUMERIC,
+                 * 'true'->BOOLEAN). Reading a char* cell as a native int64/double
+                 * (the old typed switch) reinterpreted the pointer as the value and
+                 * wrote garbage into typed sink columns. */
+                const char *v = ((char**)batch->values[c])[r]; if(!v) v="";
                 /* NULL contract: a TEXT cell holding the sentinel is a real NULL,
                  * not the literal string — emit SQL NULL so the column stays NULL. */
                 if (v && strcmp(v, DFO_NULL_SENTINEL) == 0) { PG_APP("%sNULL", c?", ":""); continue; }
