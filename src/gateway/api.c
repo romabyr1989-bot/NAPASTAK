@@ -6131,6 +6131,12 @@ static bool error_is_nonretryable(const char *msg) {
         "no such", "not found", "does not exist", "unknown table", "unknown column",
         "no route to host", "name or service not known", "could not resolve",
         "connection refused", "unknown host",
+        /* DNS-resolution failures — librdkafka/macOS getaddrinfo phrasings. These
+         * never recover within a run's retry budget; retrying just pins a worker
+         * thread for the whole 30 s backoff (saw the gateway wedged by an
+         * unresolvable prod broker). */
+        "failed to resolve", "nodename nor servname", "nodename", "servname",
+        "all brokers down", "all broker connections", "broker transport failure",
         /* transport refusals + connect timeouts (libcurl/libpq phrasings) */
         "couldn't connect", "could not connect", "no connection",
         "timeout expired", "timed out", "timeout", "connection timed",

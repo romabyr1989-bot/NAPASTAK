@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -407,6 +409,7 @@ struct HttpServer {
     TlsCtx  *tls_ctx;
     int      redirect_fd;   /* HTTP→HTTPS plain listener (-1 if unused) */
     int      https_port;    /* actual HTTPS port (listenfd) */
+    _Atomic int active_conns; /* in-flight connection threads (bounds fan-out) */
 };
 
 /* Обрабатывает одно соединение целиком (блокирующе): опциональный TLS,
@@ -675,6 +678,54 @@ HttpServer *http_server_create(Router *r, int port, int backlog, TlsCtx *tls_ctx
 
 /* Открывает слушающие сокеты и крутит цикл accept на kqueue/epoll,
  * пока s->running. Блокирует вызывающий поток. */
+/* Upper bound on concurrent connection threads. Past this we serve inline
+ * (backpressure) rather than spawn unboundedly under a connection flood. */
+#define HTTP_MAX_CONN_THREADS 96
+
+typedef struct { HttpServer *srv; int fd; } ConnJob;
+
+static void *conn_thread(void *arg) {
+    ConnJob *j = (ConnJob *)arg;
+    handle_conn(j->srv, j->fd);
+    atomic_fetch_sub(&j->srv->active_conns, 1);
+    free(j);
+    return NULL;
+}
+
+/* Dispatch each connection to its own thread so that a slow handler — a heavy
+ * /tables/query, or one stalled on the catalog mutex a worker is holding during
+ * a big ingest/SCD2 — can NEVER starve /health (which the watchdog polls) on the
+ * single kqueue/epoll event loop. The HTTP handlers' shared state is already
+ * mutex-guarded (catalog CAT_GUARD, tables_mu, per-metric mutexes, scheduler mu)
+ * because the worker pool and scheduler already run concurrently with the event
+ * loop. Threads get the same 8 MiB stack as the worker pool (pipeline execution
+ * can run inline on a connection via /run preview paths). */
+static void dispatch_conn(HttpServer *s, int cfd) {
+    if (atomic_load(&s->active_conns) >= HTTP_MAX_CONN_THREADS) {
+        handle_conn(s, cfd);   /* backpressure: serve inline */
+        return;
+    }
+    ConnJob *j = (ConnJob *)malloc(sizeof(*j));
+    if (!j) { handle_conn(s, cfd); return; }
+    j->srv = s; j->fd = cfd;
+
+    pthread_attr_t attr; pthread_attr_t *ap = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        ap = &attr;
+    }
+    atomic_fetch_add(&s->active_conns, 1);
+    pthread_t th;
+    int rc = pthread_create(&th, ap, conn_thread, j);
+    if (ap) pthread_attr_destroy(&attr);
+    if (rc != 0) {                          /* spawn failed — fall back inline */
+        atomic_fetch_sub(&s->active_conns, 1);
+        free(j);
+        handle_conn(s, cfd);
+    }
+}
+
 void http_server_run(HttpServer *s) {
     signal(SIGPIPE, SIG_IGN);
     int yes = 1;
@@ -741,7 +792,7 @@ void http_server_run(HttpServer *s) {
                 int cfd = accept(lfd, (struct sockaddr*)&ca, &cl);
                 if (cfd < 0) continue;
                 fcntl(cfd, F_SETFD, FD_CLOEXEC);
-                handle_conn(s, cfd);
+                dispatch_conn(s, cfd);
             } else if (s->redirect_fd >= 0 && efd == s->redirect_fd) {
                 int cfd = accept(s->redirect_fd, (struct sockaddr*)&ca, &cl);
                 if (cfd < 0) continue;
@@ -770,7 +821,7 @@ void http_server_run(HttpServer *s) {
             if (events[i].data.fd == lfd) {
                 int cfd = accept4(lfd, (struct sockaddr*)&ca, &cl, SOCK_CLOEXEC);
                 if (cfd < 0) continue;
-                handle_conn(s, cfd);
+                dispatch_conn(s, cfd);
             } else if (s->redirect_fd >= 0 && events[i].data.fd == s->redirect_fd) {
                 int cfd = accept4(s->redirect_fd, (struct sockaddr*)&ca, &cl, SOCK_CLOEXEC);
                 if (cfd < 0) continue;
