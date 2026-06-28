@@ -245,21 +245,18 @@ static void csv_write_field(FILE *f, const char *v, char delim) {
     fputc('"', f);
 }
 
-/* Render one cell of a column-batch as text (sink input is always TEXT). */
+/* Render one cell of a column-batch as text. Sink values are ALWAYS char* text
+ * (text-always model); the schema's logical type is metadata only. Reading the
+ * cell as a native int64/double (the old typed switch) reinterpreted the char*
+ * pointer as the value and wrote the pointer ADDRESS into the CSV (R7). */
 static const char *csv_cell_text(const ColBatch *b, int c, int r, char *tmp, size_t tn) {
+    (void)tmp; (void)tn;
     if (bit_get(b->null_bitmap[c], r)) return "";
-    ColType t = b->schema ? b->schema->cols[c].type : COL_TEXT;
-    switch (t) {
-        case COL_INT64:  snprintf(tmp, tn, "%lld", (long long)((int64_t*)b->values[c])[r]); return tmp;
-        case COL_DOUBLE: snprintf(tmp, tn, "%.10g", ((double*)b->values[c])[r]); return tmp;
-        default: {
-            char *s = ((char**)b->values[c])[r];
-            /* NULL contract: a sentinel cell renders as an empty (unquoted) CSV
-             * field, i.e. a real absent value — never the raw sentinel bytes. */
-            if (s && strcmp(s, DFO_NULL_SENTINEL)==0) return "";
-            return s ? s : "";
-        }
-    }
+    char *s = ((char**)b->values[c])[r];
+    /* NULL contract: a sentinel cell renders as an empty (unquoted) CSV field,
+     * i.e. a real absent value — never the raw sentinel bytes. */
+    if (s && strcmp(s, DFO_NULL_SENTINEL)==0) return "";
+    return s ? s : "";
 }
 
 /* ── Sink: append/overwrite rows to a CSV file ──

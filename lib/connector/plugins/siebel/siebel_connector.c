@@ -108,11 +108,10 @@ static void sb_json_escape(CurlBuf *b, const char *s) {
 static int sb_cell_is_null(const ColBatch *b, int c, int r) {
     const uint8_t *bm = b->null_bitmap[c];
     if (bm && ((bm[r/8] >> (r%8)) & 1u)) return 1;
-    ColType t = b->schema ? b->schema->cols[c].type : COL_TEXT;
-    if (t != COL_INT64 && t != COL_DOUBLE) {
-        const char *s = ((char**)b->values[c])[r];
-        if (s && strcmp(s, DFO_NULL_SENTINEL)==0) return 1;
-    }
+    /* Sink values are always char* text (text-always model); check the sentinel
+     * for every column regardless of its logical type. */
+    const char *s = ((char**)b->values[c])[r];
+    if (s && strcmp(s, DFO_NULL_SENTINEL)==0) return 1;
     return 0;
 }
 
@@ -228,7 +227,6 @@ static int siebel_write_batch(void *vctx, Arena *a, const char *entity,
     sb_json_escape(&body, io);
     curl_write((void*)"\":[", 1, 3, &body);
 
-    char tmp[64];
     for (int r = 0; r < batch->nrows; r++) {
         if (r) curl_write((void*)",", 1, 1, &body);
         curl_write((void*)"{", 1, 1, &body);
@@ -241,12 +239,10 @@ static int siebel_write_batch(void *vctx, Arena *a, const char *entity,
                 curl_write((void*)"null", 1, 4, &body);
                 continue;
             }
-            const char *v;
-            switch (schema->cols[c].type) {
-                case COL_INT64:  snprintf(tmp,sizeof(tmp),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=tmp; break;
-                case COL_DOUBLE: snprintf(tmp,sizeof(tmp),"%.10g",((double*)batch->values[c])[r]); v=tmp; break;
-                default:         v = ((char**)batch->values[c])[r]; break;
-            }
+            /* Sink values are always char* text (text-always model); the schema
+             * type is metadata only. Reading the cell as a native int64/double
+             * reinterpreted the char* pointer as the value (R7). */
+            const char *v = ((char**)batch->values[c])[r];
             curl_write((void*)"\"", 1, 1, &body);
             sb_json_escape(&body, v ? v : "");
             curl_write((void*)"\"", 1, 1, &body);

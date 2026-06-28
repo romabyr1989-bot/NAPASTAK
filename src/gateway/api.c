@@ -5115,40 +5115,38 @@ static int script_step_ingest_output(App *app, Arena *a, PipelineStep *st,
     if (!step_output(st)[0] || out_len == 0) {
         return 0;
     }
-    /* Tokenize header line */
+    /* Header line. Parse with the RFC-4180 splitter (same as /api/ingest/csv):
+     * a naive strtok(",") split inside quoted fields ("Иванов, Иван", a JSON
+     * payload) and collapsed empty fields (,,), shifting every later column and
+     * silently scrambling identity/classification data at status=0 (J2). */
     char *nl = strchr(out_buf, '\n');
     if (!nl) {
         snprintf(errbuf, errsz, "%s: output CSV has no header", label);
         return -1;
     }
     *nl = '\0';
-    int header_ncols = 1;
-    for (char *p = out_buf; *p; p++) if (*p == ',') header_ncols++;
-
-    char **col_names = arena_alloc(a, (size_t)header_ncols * sizeof(char *));
-    int col_idx = 0;
-    char *tok = strtok(out_buf, ",");
-    while (tok && col_idx < header_ncols) {
-        col_names[col_idx++] = arena_strdup(a, tok);
-        tok = strtok(NULL, ",");
+    int header_ncols = 0, herr = 0;
+    char **col_names = split_line_rfc4180(a, out_buf, ',', &header_ncols, &herr);
+    if (!col_names || header_ncols <= 0) {
+        snprintf(errbuf, errsz, "%s: malformed output CSV header", label);
+        return -1;
     }
 
-    /* Build RS with the rest as text rows */
+    /* Build RS with the rest as text rows, aligned to the header by position. */
     RS *rs = rs_new(a, header_ncols, col_names, 0);
     char *cursor = nl + 1;
     while (cursor && *cursor) {
         char *line_end = strchr(cursor, '\n');
         if (line_end) *line_end = '\0';
         if (*cursor == '\0') { cursor = line_end ? line_end + 1 : NULL; continue; }
+        int nf = 0, perr = 0;
+        char **fields = split_line_rfc4180(a, cursor, ',', &nf, &perr);
         char **cells = arena_alloc(a, (size_t)header_ncols * sizeof(char *));
-        for (int i = 0; i < header_ncols; i++) cells[i] = (char *)"";
-        char *line_copy = arena_strdup(a, cursor);
-        int ci = 0;
-        char *cell = strtok(line_copy, ",");
-        while (cell && ci < header_ncols) {
-            cells[ci++] = arena_strdup(a, cell);
-            cell = strtok(NULL, ",");
-        }
+        for (int i = 0; i < header_ncols; i++)
+            /* Empty/absent field → SQL NULL, matching /api/ingest/csv so a pandas
+             * NaN/empty cell stays NULL instead of an empty string. */
+            cells[i] = (i < nf && fields && fields[i] && fields[i][0])
+                       ? fields[i] : (char *)DFO_NULL_SENTINEL;
         rs_add(rs, a, cells, NULL);
         cursor = line_end ? line_end + 1 : NULL;
     }

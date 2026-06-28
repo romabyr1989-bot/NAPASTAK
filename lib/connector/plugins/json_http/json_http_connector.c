@@ -417,7 +417,6 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
      * Собираем вручную через curl_write в растущий буфер; строки экранируем. */
     CurlBuf body = {NULL,0,0};
     curl_write((void*)"[", 1, 1, &body);
-    char tmp[64];
     for (int r = 0; r < batch->nrows; r++) {
         if (r) curl_write((void*)",", 1, 1, &body);
         curl_write((void*)"{", 1, 1, &body);
@@ -428,12 +427,10 @@ static int jh_write_batch(void *vctx, Arena *a, const char *entity,
             curl_write((void*)"\":", 1, 2, &body);
             int isnull = (bit_isnull(batch, c, r) != NULL);
             if (isnull) { curl_write((void*)"null", 1, 4, &body); continue; }
-            const char *v;
-            switch (schema->cols[c].type) {
-                case COL_INT64:  snprintf(tmp,sizeof(tmp),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=tmp; break;
-                case COL_DOUBLE: snprintf(tmp,sizeof(tmp),"%.10g",((double*)batch->values[c])[r]); v=tmp; break;
-                default:         v = ((char**)batch->values[c])[r]; break;
-            }
+            /* Sink values are always char* text (text-always model); the schema
+             * type is metadata only. Reading the cell as a native int64/double
+             * reinterpreted the char* pointer as the value (R7). */
+            const char *v = ((char**)batch->values[c])[r];
             curl_write((void*)"\"", 1, 1, &body);
             jh_json_escape(&body, v ? v : "");
             curl_write((void*)"\"", 1, 1, &body);
