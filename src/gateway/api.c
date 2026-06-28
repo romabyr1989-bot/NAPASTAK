@@ -4551,18 +4551,29 @@ static char *resolve_step_sql(App *app, Arena *a, Pipeline *p, PipelineStep *st,
  * scheduler.h PipelineStep struct can't be extended here, so the watermark is
  * persisted as a tiny file under data_dir, keyed by the step's output table.
  * Path: <data_dir>/.cursors/<output>.cur  (output is a validated table name). */
-static void cursor_state_path(App *app, const char *output, char *out, size_t outsz) {
+static void cursor_state_path(App *app, const char *pipeline_id, const char *step_id,
+                              const char *output, char *out, size_t outsz) {
     out[0] = '\0';
     if (!output || !output[0]) return;
-    /* keep it filesystem-safe: only table-name chars are expected here */
-    snprintf(out, outsz, "%s/.cursors/%s.cur", app->data_dir, output);
+    /* Key by pipeline + step + output, not output alone: two pipelines that write
+     * the same target table from different sources must NOT share one watermark
+     * (sharing would make each skip the other's unread rows). ids and table names
+     * are validated elsewhere; sanitize defensively to stay filesystem-safe. */
+    char key[768];
+    snprintf(key, sizeof(key), "%s__%s__%s",
+             pipeline_id && pipeline_id[0] ? pipeline_id : "_",
+             step_id && step_id[0] ? step_id : "_", output);
+    for (char *c = key; *c; c++)
+        if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||(*c>='0'&&*c<='9')||*c=='_'||*c=='-')) *c='_';
+    snprintf(out, outsz, "%s/.cursors/%s.cur", app->data_dir, key);
 }
 
 /* Load a previously saved watermark into buf (empty string if none). */
-static void cursor_state_load(App *app, const char *output, char *buf, size_t bufsz) {
+static void cursor_state_load(App *app, const char *pipeline_id, const char *step_id,
+                              const char *output, char *buf, size_t bufsz) {
     buf[0] = '\0';
     char path[1024];
-    cursor_state_path(app, output, path, sizeof(path));
+    cursor_state_path(app, pipeline_id, step_id, output, path, sizeof(path));
     if (!path[0]) return;
     FILE *f = fopen(path, "r");
     if (!f) return;
@@ -4575,9 +4586,10 @@ static void cursor_state_load(App *app, const char *output, char *buf, size_t bu
 
 /* Persist the watermark for the next run. Best-effort: a write failure only
  * costs a re-read next time, never correctness within this run. */
-static void cursor_state_save(App *app, const char *output, const char *val) {
+static void cursor_state_save(App *app, const char *pipeline_id, const char *step_id,
+                              const char *output, const char *val) {
     char path[1024];
-    cursor_state_path(app, output, path, sizeof(path));
+    cursor_state_path(app, pipeline_id, step_id, output, path, sizeof(path));
     if (!path[0] || !val) return;
     /* ensure <data_dir>/.cursors exists */
     char dir[1024];
@@ -4590,7 +4602,8 @@ static void cursor_state_save(App *app, const char *output, const char *val) {
 }
 
 /* ── Run one connector step: pull all batches into target_table ── */
-static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
+static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *pipeline_id,
+                              char *errbuf, size_t errsz) {
     char so_path[1024];
     const char *conn = connector_so_name(st->connector_type);
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
@@ -4652,7 +4665,7 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
      * hold timestamps / bigints / arbitrary key values. */
     char cursor_buf[256] = "0";
     if (incremental)
-        cursor_state_load(app, step_output(st), cursor_buf, sizeof(cursor_buf));
+        cursor_state_load(app, pipeline_id, st->id, step_output(st), cursor_buf, sizeof(cursor_buf));
 
     for (;;) {
         DfoReadReq req = { .cursor = cursor_buf, .limit = BATCH_SIZE, .filter = filter };
@@ -4730,7 +4743,7 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
      * incremental mode; we save even on a 0-row run so an empty re-poll keeps
      * the existing watermark file in place (cursor_buf still holds it). */
     if (incremental)
-        cursor_state_save(app, step_output(st), cursor_buf);
+        cursor_state_save(app, pipeline_id, st->id, step_output(st), cursor_buf);
 
     if (table_created)
         catalog_update_table_meta(app->catalog, step_output(st), st->connector_type, (int64_t)total_rows);
@@ -6250,7 +6263,7 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     st->status = STEP_SUCCESS;
                 }
             } else if (st->connector_type[0]) {
-                int n = run_connector_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                int n = run_connector_step(app, a, st, p->id, p->error_msg, sizeof(p->error_msg));
                 if (n < 0) {
                     st->status = STEP_FAILED;
                 } else {

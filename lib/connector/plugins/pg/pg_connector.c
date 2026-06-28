@@ -338,14 +338,32 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         if (req && req->cursor && req->cursor[0])
             offset = (int64_t)strtoll(req->cursor, NULL, 10);
         if (strncasecmp(src, "SELECT", 6) == 0)
+            /* Subquery: LIMIT/OFFSET across batches is only stable if the user's
+             * SELECT carries its own ORDER BY (or use cursor_column mode). We can't
+             * inject a key we don't know, so we leave their ordering as-is. */
             snprintf(sql, sizeof(sql),
                 "SELECT * FROM (%s) _dfo_q LIMIT %lld OFFSET %lld",
                 src, (long long)limit, (long long)offset);
         else
+            /* Plain table: without ORDER BY, PostgreSQL does not guarantee a stable
+             * row order, so OFFSET paging across batches could skip or duplicate
+             * rows. ctid (physical row id) gives a cheap, deterministic scan order
+             * for a static table. */
+            snprintf(sql, sizeof(sql),
+                "SELECT * FROM \"%s\" ORDER BY ctid LIMIT %lld OFFSET %lld",
+                src, (long long)limit, (long long)offset);
+        res = PQexec(ctx->conn, sql);
+        /* Views and foreign tables have no ctid column — fall back to unordered
+         * paging (the user should add ORDER BY / use cursor_column for those). */
+        if (strncasecmp(src, "SELECT", 6) != 0 &&
+            PQresultStatus(res) != PGRES_TUPLES_OK &&
+            strstr(PQerrorMessage(ctx->conn), "ctid")) {
+            PQclear(res);
             snprintf(sql, sizeof(sql),
                 "SELECT * FROM \"%s\" LIMIT %lld OFFSET %lld",
                 src, (long long)limit, (long long)offset);
-        res = PQexec(ctx->conn, sql);
+            res = PQexec(ctx->conn, sql);
+        }
     }
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
