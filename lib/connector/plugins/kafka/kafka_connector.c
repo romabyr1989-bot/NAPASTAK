@@ -217,6 +217,42 @@ static ColBatch *batch_from_raw(Arena *a, const char *payload, size_t payload_le
     return batch;
 }
 
+/* Serialize a JVal sub-document back to JSON text. A nested array/object value
+ * must be re-serialized — JVal is a union where {s,len} aliases {items,nitems},
+ * so copying v->s/v->len for a container yields garbage bytes (J2). */
+static void kafka_jval_write(JBuf *jb, JVal *v) {
+    if (!v) { jb_null(jb); return; }
+    switch (v->type) {
+        case JV_BOOL:   jb_bool(jb, v->b); break;
+        case JV_NUMBER: jb_double(jb, v->n); break;
+        case JV_STRING: jb_strn(jb, v->s, v->len); break;
+        case JV_ARRAY:
+            jb_arr_begin(jb);
+            for (size_t i = 0; i < v->nitems; i++) kafka_jval_write(jb, v->items[i]);
+            jb_arr_end(jb);
+            break;
+        case JV_OBJECT:
+            jb_obj_begin(jb);
+            for (size_t i = 0; i < v->nkeys; i++) { jb_key(jb, v->keys[i]); kafka_jval_write(jb, v->vals[i]); }
+            jb_obj_end(jb);
+            break;
+        default: jb_null(jb); break;   /* JV_NULL / JV_ERROR */
+    }
+}
+
+/* True for a string that is a valid bare JSON number literal — used to decide
+ * whether a text value may be emitted UNQUOTED for a typed numeric column. */
+static bool kafka_is_json_num(const char *s) {
+    if (!s || !*s) return false;
+    const char *p = s; if (*p == '-') p++;
+    bool dig = false;
+    while (*p >= '0' && *p <= '9') { p++; dig = true; }
+    if (*p == '.') { p++; while (*p >= '0' && *p <= '9') { p++; dig = true; } }
+    if (*p == 'e' || *p == 'E') { p++; if (*p=='+'||*p=='-') p++; bool e=false;
+        while (*p>='0'&&*p<='9'){p++;e=true;} if(!e) return false; }
+    return dig && *p == '\0';
+}
+
 /* Build ColBatch from JSON message: {"key1": val1, "key2": val2, ...} */
 static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_len,
                                   int64_t offset_val)
@@ -301,7 +337,18 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
             batch->values[i + 1] = iv;
         } else {
             char **sv = arena_alloc(a, sizeof(char *));
-            sv[0] = arena_strndup(a, v->s, v->len);
+            if (v->type == JV_STRING) {
+                sv[0] = arena_strndup(a, v->s, v->len);
+            } else if (v->type == JV_ARRAY || v->type == JV_OBJECT) {
+                /* Re-serialize the sub-document to JSON text. arena_strndup(v->s,
+                 * v->len) read the union's items/nitems as a string -> N garbage
+                 * non-UTF-8 bytes (J2), corrupting e.g. the ows.CLIENT array. */
+                JBuf jb; jb_init(&jb, a, 128);
+                kafka_jval_write(&jb, v);
+                sv[0] = (char *)jb_done(&jb);
+            } else {
+                sv[0] = arena_strdup(a, "");   /* JV_NULL / unexpected */
+            }
             batch->values[i + 1] = sv;
         }
     }
@@ -1081,15 +1128,28 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
             if (bm && ((bm[r/8]>>(r%8))&1u)) {
                 if (len+4>cap){cap*=2;msg=realloc(msg,cap);} memcpy(msg+len,"null",4); len+=4; continue;
             }
-            const char *v;
-            switch (schema->cols[c].type) {
-                case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
-                case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
-                default:         v=((char**)batch->values[c])[r]; break;
+            /* Values are always char* text (text-always model); the schema type
+             * is metadata only. Reading the cell as a native int64/double (the old
+             * switch) reinterpreted the char* POINTER as the value and shipped a
+             * heap address / garbage double; numbers were also wrapped in quotes,
+             * emitting a JSON string instead of a number (K6). Now: typed numeric/
+             * bool columns emit the text UNQUOTED as a real JSON number/bool;
+             * everything else is a quoted, escaped JSON string. */
+            const char *v = ((char**)batch->values[c])[r];
+            if (!v || strcmp(v, DFO_NULL_SENTINEL)==0) {
+                if (len+4>cap){cap*=2;msg=realloc(msg,cap);} memcpy(msg+len,"null",4); len+=4; continue;
             }
-            if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"';
-            kafka_json_escape(&msg,&len,&cap,v);
-            if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"';
+            ColType _ct = schema->cols[c].type;
+            bool bare = ((_ct==COL_INT64||_ct==COL_DOUBLE) && kafka_is_json_num(v)) ||
+                        (_ct==COL_BOOL && (!strcmp(v,"true")||!strcmp(v,"false")));
+            if (bare) {
+                size_t vl=strlen(v); if(len+vl>cap){while(len+vl>cap)cap*=2;msg=realloc(msg,cap);}
+                memcpy(msg+len,v,vl); len+=vl;
+            } else {
+                if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"';
+                kafka_json_escape(&msg,&len,&cap,v);
+                if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='"';
+            }
         }
         if (len+1>cap){cap*=2;msg=realloc(msg,cap);} msg[len++]='}';
         int rc = rd_kafka_produce(rkt, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY,

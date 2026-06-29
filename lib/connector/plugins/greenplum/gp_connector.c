@@ -528,12 +528,13 @@ static int gp_write_batch(void *vctx, Arena *a, const char *entity,
                 const uint8_t *bm = batch->null_bitmap[c];
                 int isnull = (bm && ((bm[r/8] >> (r%8)) & 1u));
                 if (isnull) { GP_APP("%sNULL", c?", ":""); continue; }
-                char numbuf[64]; const char *v;
-                switch (schema->cols[c].type) {
-                    case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numbuf; break;
-                    case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]); v=numbuf; break;
-                    default:         v = ((char**)batch->values[c])[r]; if(!v) v=""; break;
-                }
+                /* Values are always char* text (text-always model); the schema
+                 * type only drives the DDL column type. Reading the cell as a
+                 * native int64/double reinterpreted the char* pointer as the value
+                 * and wrote garbage; send the text and let PG assignment-cast it
+                 * to the typed column (same fix as the PG sink, K6). */
+                const char *v = ((char**)batch->values[c])[r]; if(!v) v="";
+                if (strcmp(v, DFO_NULL_SENTINEL)==0) { GP_APP("%sNULL", c?", ":""); continue; }
                 char *lit = PQescapeLiteral(ctx->conn, v, strlen(v));
                 GP_APP("%s%s", c?", ":"", lit ? lit : "''");
                 if (lit) PQfreemem(lit);
