@@ -752,7 +752,11 @@ body {
   width: 26px;
   height: 26px;
   border-radius: 8px;
-  background: linear-gradient(145deg, #0077ed, #005ec4);
+  /* Флаг Армении: красный / синий / абрикосовый — фон под зайчиком 🐇 */
+  background: linear-gradient(180deg,
+    #D90012 0 33.33%,
+    #0033A0 33.33% 66.66%,
+    #F2A800 66.66% 100%);
   color: #fff;
   display: inline-flex;
   align-items: center;
