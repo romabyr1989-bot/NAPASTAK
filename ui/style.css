@@ -736,11 +736,26 @@ body {
   background: rgba(250, 250, 252, 0.8);
   backdrop-filter: saturate(180%) blur(24px);
   -webkit-backdrop-filter: saturate(180%) blur(24px);
-  border-right: 1px solid rgba(0, 0, 0, 0.08);
+  border-right: 1px solid var(--border);   /* разделитель меню | контент */
 }
 
 #main {
   padding: 2.4rem 2.8rem 3rem;
+}
+
+/* Одна общая рамка вокруг всего окна — фикс-оверлей поверх всего (верх/право/низ;
+ * лево — край окна). Оверлей рисует линию ВНУТРИ вьюпорта (край не срезает), а
+ * заметный серый даёт контраст на светлом фоне (тон панели #d2d2d7 у края сливался). */
+#window-frame {
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;   /* явно, не inset (совместимость) */
+  pointer-events: none;                    /* не мешает кликам */
+  z-index: 99999;                          /* поверх всего */
+  /* 4px, читаемый серый тона панели. Ровно #d2d2d7 у края окна сливается с
+   * фоном (оттого «не видно»), поэтому тон семейства панели, но чуть темнее. */
+  border-top:    4px solid #9aa0a8;
+  border-right:  4px solid #9aa0a8;
+  border-bottom: 4px solid #9aa0a8;
 }
 
 .logo {
