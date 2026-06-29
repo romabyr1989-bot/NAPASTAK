@@ -1553,7 +1553,7 @@ const SINK_TYPES = ['csv','json_http','postgresql','kafka','greenplum','oracle',
 const SINK_OPTIONS = [
   ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
   ['kafka','Kafka'], ['json_http','HTTP / Webhook'],
-  ['csv','CSV'], ['parquet','Parquet'],
+  ['csv','CSV'], ['parquet','Parquet'], ['siebel','Siebel / EIM'],
 ];
 
 function stepType(step) {
@@ -2270,6 +2270,38 @@ function makeConnectorConfigHTML(step, idx) {
       <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
     </div>`;
   }
+
+  if (type === 'siebel') return `
+    <div class="conn-group">
+      <div class="conn-group-title">Подключение к Siebel / EIM (REST/EAI)</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">
+        <div class="form-group" style="margin:0;grid-column:1/-1">
+          <label>URL REST/EAI-эндпоинта</label>
+          <input type="text" value="${escAttr(cfg.url || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'url',this.value)"
+                 placeholder="http://siebel.internal:8444/eai/CX_EIM_CONTACT">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Integration Object (io_name)</label>
+          <input type="text" value="${escAttr(cfg.io_name || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'io_name',this.value)" placeholder="CX_EIM_CONTACT">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пользователь</label>
+          <input type="text" value="${escAttr(cfg.user || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="SADMIN">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пароль</label>
+          <input type="password" value="${escAttr(cfg.password || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="••••••">
+        </div>
+      </div>
+      <div style="font-size:.8rem;color:var(--muted);margin-top:.5rem">
+        Приёмник CDI→Siebel/EIM: каждый батч уходит POST-запросом как Siebel IO-конверт
+        <code>{"&lt;io_name&gt;":[…]}</code> с Basic-авторизацией.
+      </div>
+    </div>`;
 
   if (type === 'postgresql') return `
     <div class="conn-group">
