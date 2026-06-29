@@ -5051,24 +5051,50 @@ static int run_csv_subprocess(Arena *a, char *const argv[],
         snprintf(errbuf, errsz, "%s: pipe() failed", label);
         return -1;
     }
+    /* Build the child's full environment AND resolve the binary to an absolute
+     * path HERE, in the parent (before fork). After fork() in a multithreaded
+     * process (the HTTP server now runs per-connection threads) the child may
+     * call only async-signal-safe functions before exec — putenv() and execvp()
+     * can take the allocator lock and would DEADLOCK the child if another thread
+     * held it at the fork instant. execve() with a pre-built envp + absolute path
+     * is async-signal-safe, so the child does no allocation. */
+    extern char **environ;
+    int n_env = 0; while (environ && environ[n_env]) n_env++;
+    int n_extra = 0; while (envextra && envextra[n_extra]) n_extra++;
+    char **child_envp = arena_alloc(a, (size_t)(n_env + n_extra + 1) * sizeof(char *));
+    { int ei = 0;
+      for (int i = 0; i < n_env;   i++) child_envp[ei++] = environ[i];
+      for (int i = 0; i < n_extra; i++) child_envp[ei++] = envextra[i];
+      child_envp[ei] = NULL; }
+    char child_path[1024];
+    if (strchr(argv[0], '/')) {
+        snprintf(child_path, sizeof(child_path), "%s", argv[0]);
+    } else {                                 /* PATH search in the parent (malloc-safe) */
+        child_path[0] = '\0';
+        const char *path = getenv("PATH"); if (!path || !*path) path = "/usr/bin:/bin:/usr/local/bin";
+        char pbuf[4096]; snprintf(pbuf, sizeof(pbuf), "%s", path);
+        char *save = NULL;
+        for (char *dir = strtok_r(pbuf, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+            char cand[1024]; snprintf(cand, sizeof(cand), "%s/%s", dir, argv[0]);
+            if (access(cand, X_OK) == 0) { snprintf(child_path, sizeof(child_path), "%s", cand); break; }
+        }
+        if (!child_path[0]) snprintf(child_path, sizeof(child_path), "%s", argv[0]);  /* execve fails cleanly */
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         snprintf(errbuf, errsz, "%s: fork() failed", label);
         return -1;
     }
     if (pid == 0) {
-        /* CHILD */
+        /* CHILD — async-signal-safe only: dup2/close/execve, no malloc. */
         dup2(in_pipe[0],  STDIN_FILENO);
         dup2(out_pipe[1], STDOUT_FILENO);
         dup2(err_pipe[1], STDERR_FILENO);
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
-        /* Extra env vars ("KEY=VALUE", NULL-terminated) — added to the inherited
-         * environment before exec. Strings are arena-allocated and live until the
-         * exec replaces the image, which is when putenv's pointers are read. */
-        for (int i = 0; envextra && envextra[i]; i++) putenv(envextra[i]);
-        execvp(argv[0], argv);
+        execve(child_path, argv, child_envp);
         _exit(127);
     }
     /* PARENT */
