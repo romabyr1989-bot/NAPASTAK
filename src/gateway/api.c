@@ -1998,6 +1998,20 @@ static ColType infer_expr_type(Expr *e, TblData *tables, int ntables) {
     if (e->type==EXPR_LITERAL_INT)   return COL_INT64;
     if (e->type==EXPR_LITERAL_FLOAT) return COL_DOUBLE;
     if (e->type==EXPR_LITERAL_BOOL)  return COL_BOOL;
+    /* CAST(x AS <type>) — propagate the declared target type so a typed sink
+     * (PG/Parquet) creates a typed column for it instead of TEXT (K2). The type
+     * name is args[1] (a string literal). */
+    if (e->type==EXPR_FUNC && e->func_name && !strcasecmp(e->func_name,"cast")
+        && e->nargs==2 && e->args[1]) {
+        const char *tn = e->args[1]->sval ? e->args[1]->sval : e->args[1]->name;
+        if (tn) {
+            if (!strncasecmp(tn,"int",3)||!strncasecmp(tn,"big",3)||!strncasecmp(tn,"sma",3)) return COL_INT64;
+            if (!strncasecmp(tn,"float",5)||!strncasecmp(tn,"double",6)||!strncasecmp(tn,"num",3)
+                ||!strncasecmp(tn,"dec",3)||!strncasecmp(tn,"real",4)) return COL_DOUBLE;
+            if (!strncasecmp(tn,"bool",4)) return COL_BOOL;
+        }
+        return COL_TEXT;
+    }
     return COL_TEXT;
 }
 
@@ -4623,7 +4637,26 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
              app->plugins_dir, conn);
 
-    ConnectorInst *inst = connector_load(so_path, st->connector_config, a);
+    /* Kafka: when no explicit group_id is set, inject one unique to this
+     * pipeline-step so two pipelines reading the SAME topic each consume it
+     * independently. A single shared default consumer group let the first reader
+     * commit the topic's offsets and the next read 0 already-consumed messages
+     * with a silent green success (S18). An explicit group_id still wins. */
+    const char *load_cfg = st->connector_config;
+    if (!strcmp(conn, "kafka") && st->connector_config[0]
+        && !strstr(st->connector_config, "group_id")) {
+        const char *cc = st->connector_config;
+        const char *close = strrchr(cc, '}');
+        if (close) {
+            size_t n = strlen(cc) + 160;
+            char *cfg_mod = arena_alloc(a, n);
+            snprintf(cfg_mod, n, "%.*s,\"group_id\":\"dfo-%s-%s\"}",
+                     (int)(close - cc), cc, pipeline_id ? pipeline_id : "p", st->id);
+            load_cfg = cfg_mod;
+        }
+    }
+
+    ConnectorInst *inst = connector_load(so_path, load_cfg, a);
     if (!inst) {
         snprintf(errbuf, errsz, "connector_load(%s) failed", so_path);
         return -1;
@@ -4695,8 +4728,17 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
             connector_unload(inst);
             return -1;
         }
-        if (!batch || batch->nrows == 0)
+        if (!batch || batch->nrows == 0) {
+            /* A 0-row read must still make the target reflect THIS run: recreate
+             * it EMPTY so a stale prior-run stage isn't re-consumed (and doubled)
+             * by a downstream append sink (S11). Also makes an empty read a
+             * visible empty table rather than silently leaving none. */
+            if (!table_created) {
+                Schema *sc = (batch && batch->schema) ? batch->schema : schema;
+                if (sc) { recreate_table(app, a, step_output(st), sc); table_created = true; }
+            }
             break;
+        }
 
         /* Create the table on first non-empty batch */
         if (!table_created) {

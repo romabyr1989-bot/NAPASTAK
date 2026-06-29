@@ -569,6 +569,18 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
     }
 
+    /* Per-topic default consumer group. A single global default ("dfo-consumer")
+     * was shared by EVERY Kafka pipeline, so once one pipeline committed the
+     * topic's offsets a second pipeline (or a re-run) on the same broker read 0
+     * already-consumed messages and reported a silent green success (S18). Keying
+     * the default by topic stops distinct topics from sharing an offset; an
+     * explicit group_id in connector_config still wins. */
+    if (strcmp(ctx->group_id, "dfo-consumer") == 0 && ctx->topic_name[0]) {
+        char g[128];
+        snprintf(g, sizeof(g), "dfo-%s", ctx->topic_name);
+        snprintf(ctx->group_id, sizeof(ctx->group_id), "%s", g);
+    }
+
     if (strcasecmp(ctx->data_format, "avro") == 0 && !ctx->schema_registry_url[0])
         LOG_ERROR("kafka: data_format=avro requires schema_registry_url "
                   "(messages will fall back to raw)");
