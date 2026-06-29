@@ -1177,6 +1177,12 @@ static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
         case OP_DIV: return num_ok ? (rv!=0?vnum(lv/rv):vnull()) : vnull();
         case OP_MOD: return num_ok ? (rv!=0?vnum(fmod(lv,rv)):vnull()) : vnull();
         case OP_CONCAT: {
+            /* ANSI/PostgreSQL: NULL || x = NULL. val_str() flattens NULL to "",
+             * so without this guard `||` silently returned a non-NULL result on
+             * NULL operands (T5) — inconsistent with concat(), which ignores NULL.
+             * concat() keeps its skip-NULL semantics; only the || operator is
+             * NULL-propagating per the standard. */
+            if (L.is_null || R.is_null) return vnull();
             const char *sl=val_str(L,a), *sr=val_str(R,a);
             size_t tl=strlen(sl)+strlen(sr)+1;
             char *out=arena_alloc(a,tl); strcpy(out,sl); strcat(out,sr);
@@ -3715,7 +3721,15 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
             if (!vne) vne = body + req->body_len;
             size_t vrlen = (size_t)(vne - vp);
             if (vrlen == 0 || (vrlen == 1 && vp[0] == '\r')) { vp = vne + 1; continue; }
-            if (vrlen >= 65536) vrlen = 65535;
+            /* Reject an over-long row LOUDLY instead of silently truncating it to
+             * 65535 bytes (T19): truncation reported success while irreversibly
+             * dropping data. Rejecting here, in the pre-pass, keeps the ingest
+             * atomic (0 rows committed). */
+            if (vrlen >= 65536) {
+                arena_destroy(va); arena_destroy(a);
+                http_resp_error(resp, 400, "CSV row exceeds the 65535-byte maximum row size");
+                return;
+            }
             memcpy(vrow, vp, vrlen);
             if (vrlen > 0 && vrow[vrlen-1] == '\r') vrlen--;
             vrow[vrlen] = '\0';
