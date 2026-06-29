@@ -701,12 +701,19 @@ static void *conn_thread(void *arg) {
  * loop. Threads get the same 8 MiB stack as the worker pool (pipeline execution
  * can run inline on a connection via /run preview paths). */
 static void dispatch_conn(HttpServer *s, int cfd) {
+    /* CRITICAL: never run handle_conn() on the event-loop thread. The old
+     * over-cap / spawn-failure fallback handled the connection INLINE here, which
+     * blocked the accept loop for the whole request — so one slow handler under a
+     * connection burst stalled accepting EVERY other connection, including the
+     * /health the watchdog polls (intermittent "hangs" -> restarts). Over the cap
+     * (or on spawn failure) we now DROP the connection instead of blocking; the
+     * client retries, and the event loop keeps accepting (so /health stays live). */
     if (atomic_load(&s->active_conns) >= HTTP_MAX_CONN_THREADS) {
-        handle_conn(s, cfd);   /* backpressure: serve inline */
+        close(cfd);
         return;
     }
     ConnJob *j = (ConnJob *)malloc(sizeof(*j));
-    if (!j) { handle_conn(s, cfd); return; }
+    if (!j) { close(cfd); return; }
     j->srv = s; j->fd = cfd;
 
     pthread_attr_t attr; pthread_attr_t *ap = NULL;
@@ -719,10 +726,10 @@ static void dispatch_conn(HttpServer *s, int cfd) {
     pthread_t th;
     int rc = pthread_create(&th, ap, conn_thread, j);
     if (ap) pthread_attr_destroy(&attr);
-    if (rc != 0) {                          /* spawn failed — fall back inline */
+    if (rc != 0) {                          /* spawn failed — drop, never block the loop */
         atomic_fetch_sub(&s->active_conns, 1);
         free(j);
-        handle_conn(s, cfd);
+        close(cfd);
     }
 }
 
