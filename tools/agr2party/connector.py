@@ -79,8 +79,13 @@ def build_mapping(delta_df: pd.DataFrame) -> pd.DataFrame:
 
     # Master lookup via the external CDI proxy (owner attrs already in df via JOIN).
     if "party_id" in merged.columns:
+        # Cast the merge key to str on both sides: pandas reads an all-numeric
+        # party_id column as int64, but find_masters_via_cdi keys by str, and
+        # merging int64 against object raises "You are trying to merge on ...".
+        merged["party_id"] = merged["party_id"].astype(str).str.replace(r"\.0$", "", regex=True)
         masters = find_masters_via_cdi(merged["party_id"].dropna().unique().tolist())
         if not masters.empty:
+            masters["party_id"] = masters["party_id"].astype(str)
             merged = merged.merge(masters, on="party_id", how="left")
     log(f"agreements={len(merged)} recheckable={RECHECKABLE}")
 

@@ -1,0 +1,113 @@
+# mdc_test — local end-to-end proof of the MDC MDM pipeline (J3 core).
+# Same logic as mdc_pipeline.yaml, but python_file points at the repo tools/
+# (the /opt/tsmdm deploy dir is not writable on this stand) and it is manual
+# (no cron). Sources are local engine tables seeded with cross-system dupes.
+
+name: mdc_test
+enabled: false
+
+steps:
+
+  - id: load_clean_person
+    transform_sql: |
+      SELECT source_id, system_name, last_upd,
+             src_last_name, src_first_name, src_middle_name, src_fullname,
+             src_inn, birth_date
+      FROM cdi_physical_party
+      WHERE source_id IS NOT NULL AND source_id != ''
+    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/clean_person.py"
+    python_context_dir: "/tmp/dfo_mdc_test"
+    python_timeout_sec: 600
+    target_table: "mdc_person_clean"
+
+  - id: load_clean_id_doc
+    transform_sql: |
+      SELECT source_id, person_source_id, category, src_number
+      FROM cdi_id_doc WHERE source_id IS NOT NULL AND source_id != ''
+    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/clean_id_doc.py"
+    python_context_dir: "/tmp/dfo_mdc_test"
+    python_timeout_sec: 300
+    target_table: "mdc_id_doc_clean"
+    deps: [0]
+
+  - id: aggregate_dul_to_person
+    transform_sql: |
+      SELECT p.source_id, p.system_name, p.last_upd, p.master_id,
+             p.cio_last_name, p.cio_first_name, p.cio_middle_name,
+             p.cio_inn, p.birth_date, d.cio_number
+      FROM mdc_person_clean p
+      LEFT JOIN mdc_id_doc_clean d ON d.person_source_id = p.source_id
+    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/aggregate_docs.py"
+    python_context_dir: "/tmp/dfo_mdc_test"
+    python_timeout_sec: 300
+    target_table: "mdc_person_with_docs"
+    deps: [1]
+
+  - id: generate_match_keys
+    transform_sql: "SELECT * FROM mdc_person_with_docs"
+    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/generate_keys.py"
+    python_context_dir: "/tmp/dfo_mdc_test"
+    python_timeout_sec: 300
+    target_table: "mdc_match_keys"
+    deps: [2]
+
+  - id: match_person
+    transform_sql: "SELECT * FROM mdc_person_with_docs"
+    target_table: "mdc_person_matches"
+    deps: [3]
+    match_rules: |
+      [
+        {"rule_name": "1.1 DUL->FIO+BD", "id_column": "source_id",
+         "scan_columns": ["mat_id_doc_set"],
+         "test_columns": ["cio_last_name", "cio_first_name", "birth_date"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 0.80, "normalize": "name"},
+        {"rule_name": "1.2 INN->FIO+BD", "id_column": "source_id",
+         "scan_columns": ["cio_inn"],
+         "test_columns": ["cio_last_name", "cio_first_name", "birth_date"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 0.80, "normalize": "name"},
+        {"rule_name": "2.2 FIO+BD->INN", "id_column": "source_id",
+         "scan_columns": ["cio_last_name", "birth_date"],
+         "test_columns": ["cio_inn"],
+         "metric_function": "word_similarity", "operator": ">=", "threshold": 0.50, "normalize": "inn"}
+      ]
+
+  - id: accept_matches
+    transform_sql: "SELECT * FROM mdc_person_matches"
+    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/accept_matches.py"
+    python_context_dir: "/tmp/dfo_mdc_test"
+    python_timeout_sec: 300
+    target_table: "mdc_master_map"
+    deps: [4]
+
+  - id: apply_master
+    transform_sql: |
+      SELECT pc.source_id, pc.system_name, pc.last_upd, m.master_id,
+             pc.cio_inn, pc.cio_last_name, pc.cio_first_name,
+             pc.cio_middle_name, pc.birth_date
+      FROM mdc_person_clean pc
+      JOIN mdc_master_map m ON m.source_id = pc.source_id
+    target_table: "mdc_person_mastered"
+    deps: [5]
+
+  - id: merge_master_person
+    transform_sql: |
+      SELECT
+        pm.master_id,
+        pm.cio_inn AS inn,
+        pm.cio_last_name AS last_name,
+        pm.cio_first_name AS first_name,
+        pm.cio_middle_name AS middle_name,
+        pm.birth_date
+      FROM mdc_person_mastered pm
+      WHERE pm.master_id IS NOT NULL AND pm.master_id != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM mdc_person_mastered p2
+          WHERE p2.master_id = pm.master_id AND p2.last_upd > pm.last_upd
+        )
+    target_table: master_person
+    scd2_business_key: master_id
+    scd2_effective_from_col: valid_from
+    scd2_effective_to_col:   valid_to
+    scd2_hash_col: _master_hash
+    scd2_compare_columns: inn,last_name,first_name,middle_name,birth_date
+    deps: [6]
