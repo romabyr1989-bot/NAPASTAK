@@ -1,7 +1,7 @@
 # DataFlow OS — build system
 CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic \
-           -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE \
+           -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fPIC \
            -Ilib -Ilib/core -Ilib/net -Ilib/storage \
            -Ilib/sql_parser -Ilib/qengine -Ilib/scheduler \
            -Ilib/observ -Ilib/connector -Ilib/index
@@ -112,8 +112,12 @@ else
   HAS_ODPI      := $(if $(ORACLELDFLAGS),yes,no)
 endif
 
-.PHONY: all clean run test dirs release debug \
+.PHONY: all clean run test dirs release debug dist \
         test-integration test-sql test-all bench flight gp oracle
+
+# `make` без цели собирает всё (иначе default goal стал бы первый файловый
+# таргет — конвенция-таргет gp, что собирало только один плагин).
+.DEFAULT_GOAL := all
 
 # Base targets always built
 _ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(SIEBEL_PLUGIN) $(XML_PLUGIN) $(SOAP_PLUGIN)
@@ -140,6 +144,24 @@ release:
 
 debug:
 	$(MAKE) BUILD=debug all
+
+# ── Дистрибутив для сервера (RedOS 8 / Linux): tar.gz с бинарём, плагинами,
+# UI, конвейерами, конфигом, systemd-юнитом и install.sh. См. packaging/redos/.
+VERSION   ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+DIST_NAME := dataflow-os-$(VERSION)-linux-$(shell uname -m)
+DIST_DIR  := $(OUTDIR)/dist/$(DIST_NAME)
+dist: all
+	@echo "  DIST $(DIST_NAME).tar.gz"
+	@rm -rf $(DIST_DIR)
+	@mkdir -p $(DIST_DIR)/bin $(DIST_DIR)/lib $(DIST_DIR)/ui $(DIST_DIR)/pipelines
+	@cp $(GATEWAY) $(DIST_DIR)/bin/
+	@cp $(LIBDIR)/*.so $(DIST_DIR)/lib/
+	@cp -a ui/. $(DIST_DIR)/ui/
+	@cp -a pipelines/. $(DIST_DIR)/pipelines/ 2>/dev/null || true
+	@cp packaging/redos/config.json packaging/redos/dataflow-os.service packaging/redos/install.sh $(DIST_DIR)/
+	@chmod +x $(DIST_DIR)/install.sh
+	@tar -C $(OUTDIR)/dist -czf $(OUTDIR)/dist/$(DIST_NAME).tar.gz $(DIST_NAME)
+	@echo "  → $(OUTDIR)/dist/$(DIST_NAME).tar.gz"
 
 dirs:
 	@mkdir -p $(BINDIR) $(LIBDIR)

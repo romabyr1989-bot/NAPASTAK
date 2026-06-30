@@ -1,0 +1,26 @@
+[Unit]
+Description=DataFlow OS gateway (MDM/CDI)
+Documentation=https://github.com/romabyr1989-bot/DataFlow-OS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dataflow
+Group=dataflow
+# UI и плагины ищутся относительно рабочего каталога (ui/index.html, lib/*.so)
+WorkingDirectory=/opt/dataflow-os
+ExecStart=/opt/dataflow-os/bin/dfo_gateway -c /opt/dataflow-os/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+# Защита (данные пишутся только в /var/lib/dataflow-os)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/dataflow-os
+
+[Install]
+WantedBy=multi-user.target

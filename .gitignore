@@ -12,3 +12,6 @@ data/*
 # Python test cache
 __pycache__/
 *.pyc
+
+# RedOS/Linux deploy bundles (make dist)
+/dist/
