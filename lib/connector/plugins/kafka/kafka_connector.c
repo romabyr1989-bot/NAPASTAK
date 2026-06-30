@@ -288,7 +288,10 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
              * while the catalog type renders it as a JSON number on output. */
             schema->cols[i + 1].type = COL_DOUBLE;
         else if (v->type == JV_BOOL)
-            schema->cols[i + 1].type = COL_BOOL;
+            /* TEXT-always: bool хранится текстом "true"/"false" (значение — char*).
+             * Раньше схема была COL_BOOL, а значение native int64 → ядро читало
+             * его как указатель (0/1) → сегфолт (как в json_http). */
+            schema->cols[i + 1].type = COL_TEXT;
         else
             schema->cols[i + 1].type = COL_TEXT;
     }
@@ -308,7 +311,6 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
     /* data columns */
     for (size_t i = 0; i < root->nkeys; i++) {
         JVal *v = root->vals[i];
-        ColType ct = schema->cols[i + 1].type;
 
         batch->null_bitmap[i + 1] = arena_calloc(a, 1);
 
@@ -331,10 +333,11 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
             char **sv = arena_alloc(a, sizeof(char *));
             sv[0] = arena_strdup(a, numbuf);
             batch->values[i + 1] = sv;
-        } else if (ct == COL_BOOL) {
-            int64_t *iv = arena_alloc(a, sizeof(int64_t));
-            iv[0] = v->b ? 1 : 0;
-            batch->values[i + 1] = iv;
+        } else if (v->type == JV_BOOL) {
+            /* TEXT-always: значение — char* "true"/"false" (не native int64). */
+            char **sv = arena_alloc(a, sizeof(char *));
+            sv[0] = arena_strdup(a, v->b ? "true" : "false");
+            batch->values[i + 1] = sv;
         } else {
             char **sv = arena_alloc(a, sizeof(char *));
             if (v->type == JV_STRING) {

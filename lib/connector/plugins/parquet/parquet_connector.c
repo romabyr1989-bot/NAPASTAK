@@ -830,7 +830,9 @@ static int pq_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     sc->cols=arena_alloc(a,(size_t)f->ncols*sizeof(ColDef));
     for (int c=0;c<f->ncols;c++) {
         sc->cols[c].name=arena_strdup(a,f->cols[c].name);
-        sc->cols[c].type=pq_to_col_type(f->cols[c].pq_type);
+        /* TEXT-always источник: ядро хранит данные источника текстом (см.
+         * pq_read_batch). Каталог — тоже TEXT, чтобы SELECT читал char*. */
+        sc->cols[c].type=COL_TEXT;
         sc->cols[c].nullable=f->cols[c].optional;
     }
     *out=sc; return 0;
@@ -898,6 +900,25 @@ static int pq_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     }
 
     batch->nrows=batch_row;
+    /* TEXT-always: ядро форсит COL_TEXT и читает char* перед table_append.
+     * Числовые колонки (декодированные как int64/double) конвертируем в строки —
+     * иначе число читалось бы как указатель → сегфолт (как было в json_http). */
+    for (int c=0;c<ncols;c++) {
+        if (sc->cols[c].type!=COL_INT64 && sc->cols[c].type!=COL_DOUBLE) continue;
+        char **txt=arena_alloc(a,(size_t)BATCH_SIZE*sizeof(char*));
+        for (int r=0;r<batch->nrows;r++) {
+            if (batch->null_bitmap[c][r/8] & (uint8_t)(1u<<(r%8))) { txt[r]=NULL; continue; }
+            char b[40];
+            if (sc->cols[c].type==COL_INT64)
+                snprintf(b,sizeof(b),"%lld",(long long)((int64_t*)batch->values[c])[r]);
+            else { double d=((double*)batch->values[c])[r]; int64_t iv=(int64_t)d;
+                   if (d==(double)iv) snprintf(b,sizeof(b),"%lld",(long long)iv);
+                   else               snprintf(b,sizeof(b),"%g",d); }
+            txt[r]=arena_strdup(a,b);
+        }
+        batch->values[c]=txt;
+        sc->cols[c].type=COL_TEXT;
+    }
     *out_batch=batch;
     return (batch_row>0)?0:1;
 }

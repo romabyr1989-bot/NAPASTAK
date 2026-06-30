@@ -781,18 +781,17 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
             for (int c = 0; c < ncols; c++) {
                 const uint8_t *bm = batch->null_bitmap[c];
                 if (bm && ((bm[r/8] >> (r%8)) & 1u)) { ORA_APP("%sNULL", c?", ":""); continue; }
-                char numbuf[64];
-                switch (schema->cols[c].type) {
-                    case COL_INT64:  snprintf(numbuf,sizeof(numbuf),"%lld",(long long)((int64_t*)batch->values[c])[r]);
-                                     ORA_APP("%s%s", c?", ":"", numbuf); continue;
-                    case COL_DOUBLE: snprintf(numbuf,sizeof(numbuf),"%.10g",((double*)batch->values[c])[r]);
-                                     ORA_APP("%s%s", c?", ":"", numbuf); continue;
-                    default: break;
-                }
+                /* TEXT-always sink: значения приходят как char* (текст). Числовые
+                 * колонки пишем литералом БЕЗ кавычек. Раньше COL_INT64/COL_DOUBLE
+                 * читались как native int64/double прямо из char*-массива → читался
+                 * указатель как число → мусор в INSERT (R7-класс). */
                 const char *v = ((char**)batch->values[c])[r]; if (!v) v = "";
-                /* Подстраховка: ячейка-сентинел NULL (если sink-путь в api.c не
-                 * выставил null_bitmap) — пишем настоящий NULL, а не литерал. */
-                if (strcmp(v, DFO_NULL_SENTINEL) == 0) { ORA_APP("%sNULL", c?", ":""); continue; }
+                int is_num = (schema->cols[c].type==COL_INT64 || schema->cols[c].type==COL_DOUBLE);
+                /* сентинел NULL или пустое число → настоящий NULL */
+                if (strcmp(v, DFO_NULL_SENTINEL) == 0 || (is_num && !v[0])) {
+                    ORA_APP("%sNULL", c?", ":""); continue;
+                }
+                if (is_num) { ORA_APP("%s%s", c?", ":"", v); continue; }
                 ORA_APP("%s'", c?", ":"");
                 for (const char *p=v; *p; p++) { if (*p=='\'') ORA_APP("''"); else ORA_APP("%c", *p); }
                 ORA_APP("'");
