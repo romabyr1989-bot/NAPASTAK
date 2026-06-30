@@ -174,9 +174,14 @@ static Schema *jh_infer_schema(JVal *arr, Arena *a) {
     sc->cols=arena_alloc(a,(size_t)sc->ncols*sizeof(ColDef));
     for (int c=0;c<sc->ncols;c++) {
         sc->cols[c].name=arena_strdup(a,first->keys[c]);
-        sc->cols[c].type=infer_col_type(arr,c);
+        /* TEXT-always: ядро хранит источники как текст (форсит COL_TEXT перед
+         * table_append и читает char*). Отдавать native int64/double нельзя —
+         * число читалось как указатель → сегфолт. infer_col_type сохранён для
+         * справки, но в выдаваемой схеме все колонки TEXT. */
+        sc->cols[c].type=COL_TEXT;
         sc->cols[c].nullable=true;
     }
+    (void)infer_col_type;
     return sc;
 }
 
@@ -196,19 +201,18 @@ static int jh_fill_batch(JVal *arr, Schema *sc, ColBatch *batch,
             if (!v||v->type==JV_NULL) {
                 batch->null_bitmap[c][n/8]|=(uint8_t)(1u<<(n%8)); continue;
             }
-            switch(sc->cols[c].type) {
-                case COL_INT64:
-                    ((int64_t*)batch->values[c])[n]=(v->type==JV_BOOL)?(int64_t)v->b:(int64_t)v->n;
-                    break;
-                case COL_DOUBLE:
-                    ((double*)batch->values[c])[n]=v->n;
-                    break;
-                default:
-                    if (v->type==JV_STRING)
-                        ((const char**)batch->values[c])[n]=arena_strndup(a,v->s,v->len);
-                    else
-                        ((const char**)batch->values[c])[n]=arena_strdup(a,"");
-                    break;
+            /* TEXT-always: всегда char*; число/булево строкуем (схема — COL_TEXT). */
+            if (v->type==JV_STRING) {
+                ((const char**)batch->values[c])[n]=arena_strndup(a,v->s,v->len);
+            } else if (v->type==JV_NUMBER) {
+                char nb[32]; double d=v->n; int64_t iv=(int64_t)d;
+                if (d==(double)iv) snprintf(nb,sizeof(nb),"%lld",(long long)iv);
+                else               snprintf(nb,sizeof(nb),"%g",d);
+                ((const char**)batch->values[c])[n]=arena_strdup(a,nb);
+            } else if (v->type==JV_BOOL) {
+                ((const char**)batch->values[c])[n]=arena_strdup(a,v->b?"true":"false");
+            } else {
+                ((const char**)batch->values[c])[n]=arena_strdup(a,"");
             }
         }
     }
