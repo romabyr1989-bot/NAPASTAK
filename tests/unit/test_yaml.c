@@ -164,6 +164,20 @@ int main(void) {
     check("blank lines inside block scalar",
           j && contains(j, "\"msg\":\"line1\\n\\nline2\""), j);
 
+    /* Regression: a dedented comment after a `|` block scalar must END the block
+     * (not be slurped). Previously it leaked into the value AND a child_indent
+     * strip cut the multibyte `═` mid-character → invalid UTF-8 in the JSON. */
+    j = yconvert(
+        "steps:\n"
+        "  - id: a\n"
+        "    rules: |\n"
+        "      [1,2]\n"
+        "\n"
+        "  # ═══ note ═══\n"
+        "  - id: b\n", a);
+    check("block scalar stops at dedented comment (no UTF-8 corruption)",
+          j && contains(j, "\"rules\":\"[1,2]") && !contains(j, "note") && contains(j, "\"id\":\"b\""), j);
+
     printf("\nYAML loader: %d passed, %d failed\n", pass, fail);
     arena_destroy(a);
     return fail == 0 ? 0 : 1;

@@ -1,23 +1,26 @@
-/* siebel_connector.c — Siebel/EIM sink-коннектор DataFlow OS (CDI → Siebel).
+/* siebel_connector.c — Siebel/EIM коннектор DataFlow OS (CDI ↔ Siebel).
  *
- * Джокер пишет мастер-данные обратно в Siebel. Siebel принимает данные двумя
- * способами: (1) EIM batch (INSERT в EIM_*-таблицы Oracle + EIM-джоб) или
- * (2) Siebel EAI через HTTP/REST (POST в Inbound Web Service). Реализован
- * REST-вариант — проще, без Oracle-зависимости: write_batch на каждый батч
- * формирует Siebel-совместимый JSON-конверт вокруг Integration Object и POST-ит
- * на configurable siebel_url с опциональным Basic-auth.
+ * Двунаправленный коннектор поверх Siebel EAI / REST Inbound Web Service:
  *
- * По сути это специализация HTTP-приёмника (см. json_http_connector.c) с
- * маппингом полей строки под Siebel IO (Integration Object): каждая строка
- * становится одним IO-инстансом
- *     { "<io_name>": { "field": "value", ... } }
- * а весь батч заворачивается в массив объектов под ключом io_name, что
- * соответствует Siebel EAI «list of integration object instances».
+ *   • SINK (CDI → Siebel). Джокер пишет мастер-данные обратно в Siebel. write_batch
+ *     на каждый батч формирует Siebel-совместимый JSON-конверт вокруг Integration
+ *     Object и POST-ит на configurable siebel_url с опциональным Basic-auth:
+ *         { "<io_name>": [ { "field": "value", ... }, ... ] }
+ *     что соответствует Siebel EAI «list of integration object instances».
  *
- * Только sink (read_batch/describe возвращают «read-only»). ABI как у json_http:
- *   .name="siebel" .write_batch .last_error и т.д. */
+ *   • SOURCE (Siebel → DFO). read_batch вытягивает записи IO из Siebel REST/EAI
+ *     (как исходный TSMDM-поток «collector»: Siebel S_CONTACT → …). GET на
+ *     read_url (или siebel_url) с offset-пагинацией ?StartRowNum=&PageSize=,
+ *     навигация к массиву записей по data_path (по умолчанию — ключ io_name,
+ *     с фолбэком на голый массив или "items"), вывод схемы из первого элемента.
+ *     Чтобы перешагнуть лимит ядра (батч = BATCH_SIZE строк, короткий батч =
+ *     конец данных), read_batch склеивает несколько Siebel-страниц в один батч.
+ *
+ * Специализация HTTP-коннектора (см. json_http_connector.c) под маппинг Siebel IO.
+ * ABI как у json_http: .name="siebel" .read_batch/.describe/.write_batch/.last_error. */
 #include "../../connector.h"
 #include "../../../core/log.h"
+#include "../../../core/json.h"
 #include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,10 +30,18 @@
 
 /* ── Конфиг коннектора ── */
 typedef struct {
-    char url[1024];          /* siebel_url — Inbound Web Service endpoint */
+    char url[1024];          /* siebel_url — Inbound Web Service endpoint (sink) */
     char io_name[256];       /* io_name / eim_object — Siebel Integration Object */
     char user[256];          /* siebel_user — для Basic-auth */
     char password[256];      /* siebel_password — для Basic-auth */
+    /* ── source (чтение) ── */
+    char read_url[1024];     /* read_url — эндпоинт запроса записей (default: url) */
+    char data_path[256];     /* dot-path к массиву записей (default: io_name) */
+    char page_param[64];     /* GET-параметр оффсета строки (default StartRowNum) */
+    char size_param[64];     /* GET-параметр размера страницы (default PageSize) */
+    char read_method[8];     /* GET | POST (default GET) */
+    char read_body[2048];    /* тело POST-запроса (EAI Query SiebelMessage) */
+    int  page_size;          /* записей за один Siebel-fetch (default 1000) */
     char last_err[512];      /* human-readable причина последнего сбоя */
     Arena *arena;
 } SiebelCtx;
@@ -71,10 +82,13 @@ static void cfg_get(const char *json, const char *key,
     while(*p==' '||*p=='\t'||*p=='\n') p++;
     if(*p!=':') return; p++;
     while(*p==' '||*p=='\t'||*p=='\n') p++;
-    if(*p=='"') {
-        p++; const char *e=strchr(p,'"'); if(!e) return;
-        size_t n=(size_t)(e-p); if(n>=outsz)n=outsz-1;
-        memcpy(out,p,n); out[n]='\0';
+    if(*p=='"') {            /* строка: декодируем JSON-экранирование, стоп на НЕэкранированной " */
+        p++; size_t o=0;
+        while(*p && *p!='"' && o<outsz-1) {
+            if(*p=='\\' && p[1]) { p++; char c=*p; if(c=='n')c='\n'; else if(c=='t')c='\t'; else if(c=='r')c='\r'; out[o++]=c; p++; }
+            else out[o++]=*p++;
+        }
+        out[o]='\0';
     } else {
         const char *e=p;
         while(*e&&*e!=','&&*e!='}'&&*e!=' '&&*e!='\n') e++;
@@ -130,7 +144,18 @@ static void *siebel_create(const char *cfg, Arena *a) {
     if (!ctx->io_name[0]) cfg_get(cfg,"eim_object", ctx->io_name, sizeof(ctx->io_name), "");
     if (!ctx->io_name[0]) { strncpy(ctx->io_name,"Integration Object",sizeof(ctx->io_name)-1); }
     cfg_get(cfg,"siebel_user",    ctx->user,     sizeof(ctx->user),     "");
+    if (!ctx->user[0]) cfg_get(cfg,"user", ctx->user, sizeof(ctx->user), "");
     cfg_get(cfg,"siebel_password",ctx->password, sizeof(ctx->password), "");
+    if (!ctx->password[0]) cfg_get(cfg,"password", ctx->password, sizeof(ctx->password), "");
+    /* ── source (чтение) ── */
+    cfg_get(cfg,"read_url",       ctx->read_url, sizeof(ctx->read_url), "");
+    cfg_get(cfg,"data_path",      ctx->data_path,sizeof(ctx->data_path),"");
+    cfg_get(cfg,"page_param",     ctx->page_param,sizeof(ctx->page_param),"StartRowNum");
+    cfg_get(cfg,"size_param",     ctx->size_param,sizeof(ctx->size_param),"PageSize");
+    cfg_get(cfg,"read_method",    ctx->read_method,sizeof(ctx->read_method),"GET");
+    cfg_get(cfg,"read_body",      ctx->read_body, sizeof(ctx->read_body), "");
+    char pgsz[16]; cfg_get(cfg,"page_size",pgsz,sizeof(pgsz),"1000");
+    ctx->page_size=atoi(pgsz); if(ctx->page_size<=0) ctx->page_size=1000;
     return ctx;
 }
 
@@ -194,6 +219,268 @@ static int siebel_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     out->items[0].type="table";
     out->count=1;
     return 0;
+}
+
+/* ════════════════════════════ SOURCE (чтение) ════════════════════════════ */
+
+/* sb_fetch: один GET/POST запрос записей из Siebel, тело ответа → арена a.
+ * GET (по умолчанию): read_url|url + ?<page_param>=<offset>&<size_param>=<page_size>.
+ * POST: тело read_body (EAI Query SiebelMessage), без пагинации в URL.
+ * NULL при ошибке транспорта или коде вне 2xx (причина → ctx->last_err). */
+static char *sb_fetch(SiebelCtx *ctx, int64_t offset, Arena *a) {
+    CURL *curl=curl_easy_init();
+    if (!curl) return NULL;
+    const char *base = ctx->read_url[0] ? ctx->read_url : ctx->url;
+    int is_get = strcasecmp(ctx->read_method,"POST")!=0;
+    char url[2400];
+    if (is_get && ctx->page_param[0]) {
+        const char *sep = strchr(base,'?') ? "&" : "?";
+        if (ctx->size_param[0])
+            snprintf(url,sizeof(url),"%s%s%s=%lld&%s=%d",
+                     base,sep,ctx->page_param,(long long)offset,ctx->size_param,ctx->page_size);
+        else
+            snprintf(url,sizeof(url),"%s%s%s=%lld",base,sep,ctx->page_param,(long long)offset);
+    } else {
+        strncpy(url,base,sizeof(url)-1); url[sizeof(url)-1]='\0';
+    }
+
+    CurlBuf buf={NULL,0,0};
+    struct curl_slist *hdrs=NULL;
+    hdrs=curl_slist_append(hdrs,"Accept: application/json");
+    curl_easy_setopt(curl,CURLOPT_URL,url);
+    curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,curl_write);
+    curl_easy_setopt(curl,CURLOPT_WRITEDATA,&buf);
+    curl_easy_setopt(curl,CURLOPT_FOLLOWLOCATION,1L);
+    curl_easy_setopt(curl,CURLOPT_TIMEOUT,60L);
+    curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);
+    if (!is_get) {
+        curl_easy_setopt(curl,CURLOPT_POST,1L);
+        curl_easy_setopt(curl,CURLOPT_POSTFIELDS,ctx->read_body[0]?ctx->read_body:"{}");
+        hdrs=curl_slist_append(hdrs,"Content-Type: application/json");
+    }
+    curl_easy_setopt(curl,CURLOPT_HTTPHEADER,hdrs);
+    siebel_apply_auth(curl,ctx);
+
+    CURLcode res=curl_easy_perform(curl);
+    long code=0;
+    curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    if (res!=CURLE_OK || code<200 || code>=300) {
+        if (res!=CURLE_OK)
+            snprintf(ctx->last_err,sizeof(ctx->last_err),
+                     "Ошибка соединения с %s: %s", url, curl_easy_strerror(res));
+        else
+            snprintf(ctx->last_err,sizeof(ctx->last_err),"HTTP %ld от %s", code, url);
+        LOG_ERROR("siebel source: fetch %s → curl=%d http=%ld", url, (int)res, code);
+        free(buf.data); return NULL;
+    }
+    if (!buf.data) return NULL;
+    char *result=arena_strdup(a,buf.data);
+    free(buf.data);
+    return result;
+}
+
+/* sb_navigate: data_path = "key1.key2" → последовательный json_get по ключам.
+ * Имя IO с пробелами (без точек) трактуется как один ключ — это норма для Siebel. */
+static JVal *sb_navigate(JVal *root, const char *path) {
+    if (!path||!path[0]) return root;
+    char buf[256]; strncpy(buf,path,sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+    JVal *cur=root;
+    char *tok=strtok(buf,".");
+    while (tok&&cur) {
+        if (cur->type!=JV_OBJECT) return NULL;
+        cur=json_get(cur,tok);
+        tok=strtok(NULL,".");
+    }
+    return cur;
+}
+
+/* sb_locate_array: найти массив записей в ответе — по data_path, иначе голый
+ * массив-корень, иначе ключ "items" (Siebel REST). NULL если массива нет. */
+static JVal *sb_locate_array(JVal *root, const char *dp) {
+    JVal *arr=sb_navigate(root,dp);
+    if (arr&&arr->type==JV_ARRAY) return arr;
+    if (root&&root->type==JV_ARRAY) return root;
+    JVal *it=json_get(root,"items");
+    if (it&&it->type==JV_ARRAY) return it;
+    return NULL;
+}
+
+/* sb_infer_col_type: тип колонки key по выборке до 10 строк; конфликт → TEXT. */
+static ColType sb_infer_col_type(JVal **rows, int nrows, const char *key) {
+    ColType t=COL_NULL;
+    int samples=nrows<10?nrows:10;
+    for (int i=0;i<samples;i++) {
+        JVal *row=rows[i];
+        if (!row||row->type!=JV_OBJECT) continue;
+        JVal *v=json_get(row,key);
+        if (!v||v->type==JV_NULL) continue;
+        ColType ct;
+        switch(v->type) {
+            case JV_NUMBER: { double d=v->n; int64_t iv=(int64_t)d; ct=(d==(double)iv)?COL_INT64:COL_DOUBLE; break; }
+            case JV_BOOL:   ct=COL_INT64; break;
+            default:        ct=COL_TEXT;  break;
+        }
+        if (t==COL_NULL) t=ct;
+        else if (t!=ct) { t=COL_TEXT; break; }
+    }
+    return (t==COL_NULL)?COL_TEXT:t;
+}
+
+/* sb_infer_schema: схема из ключей первого объекта-строки, типы — по выборке. */
+static Schema *sb_infer_schema(JVal **rows, int nrows, Arena *a) {
+    if (nrows<=0) return NULL;
+    JVal *first=rows[0];
+    if (!first||first->type!=JV_OBJECT||first->nkeys==0) return NULL;
+    int ncols=(int)first->nkeys;
+    if (ncols>MAX_COLS) ncols=MAX_COLS;
+    Schema *sc=arena_calloc(a,sizeof(Schema));
+    sc->ncols=ncols;
+    sc->cols=arena_alloc(a,(size_t)ncols*sizeof(ColDef));
+    for (int c=0;c<ncols;c++) {
+        sc->cols[c].name=arena_strdup(a,first->keys[c]);
+        sc->cols[c].type=sb_infer_col_type(rows,nrows,first->keys[c]);
+        sc->cols[c].nullable=true;
+    }
+    return sc;
+}
+
+/* sb_fill_batch: переносит nrows строк-объектов в колоночные массивы согласно
+ * типам схемы; отсутствующие/NULL-поля → null_bitmap. Для TEXT-колонок числа и
+ * bool строкуются (не теряем значение при смешанном типе). */
+static int sb_fill_batch(JVal **rows, int nrows, Schema *sc, ColBatch *batch, Arena *a) {
+    for (int n=0;n<nrows;n++) {
+        JVal *row=rows[n];
+        for (int c=0;c<sc->ncols;c++) {
+            JVal *v=(row&&row->type==JV_OBJECT)?json_get(row,sc->cols[c].name):NULL;
+            if (!v||v->type==JV_NULL) {
+                batch->null_bitmap[c][n/8]|=(uint8_t)(1u<<(n%8)); continue;
+            }
+            switch(sc->cols[c].type) {
+                case COL_INT64:
+                    ((int64_t*)batch->values[c])[n]=(v->type==JV_BOOL)?(int64_t)v->b:(int64_t)v->n;
+                    break;
+                case COL_DOUBLE:
+                    ((double*)batch->values[c])[n]=v->n;
+                    break;
+                default:
+                    if (v->type==JV_STRING)
+                        ((const char**)batch->values[c])[n]=arena_strndup(a,v->s,v->len);
+                    else if (v->type==JV_NUMBER) {
+                        char nb[32]; double d=v->n; int64_t iv=(int64_t)d;
+                        if (d==(double)iv) snprintf(nb,sizeof(nb),"%lld",(long long)iv);
+                        else               snprintf(nb,sizeof(nb),"%g",d);
+                        ((const char**)batch->values[c])[n]=arena_strdup(a,nb);
+                    } else if (v->type==JV_BOOL) {
+                        ((const char**)batch->values[c])[n]=arena_strdup(a,v->b?"true":"false");
+                    } else {
+                        ((const char**)batch->values[c])[n]=arena_strdup(a,"");
+                    }
+                    break;
+            }
+        }
+    }
+    return nrows;
+}
+
+/* describe(): тянет первую страницу, выводит схему из первого элемента массива. */
+static int siebel_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
+    SiebelCtx *ctx=vctx;
+    const char *base = ctx->read_url[0] ? ctx->read_url : ctx->url;
+    if (!base||!base[0]) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),
+                 "siebel source: ни read_url, ни siebel_url не заданы");
+        return -1;
+    }
+    char *body=sb_fetch(ctx,0,a);
+    if (!body) return -1;
+    JVal *root=json_parse(a,body,strlen(body));
+    if (!root||root->type==JV_ERROR) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),"siebel source: некорректный JSON-ответ");
+        return -1;
+    }
+    const char *io=(entity&&entity[0])?entity:ctx->io_name;
+    const char *dp=ctx->data_path[0]?ctx->data_path:io;
+    JVal *arr=sb_locate_array(root,dp);
+    if (!arr||arr->nitems==0) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),
+                 "siebel source: массив записей не найден (data_path='%s')", dp);
+        return -1;
+    }
+    int n=(int)arr->nitems; if(n>10)n=10;
+    JVal **rows=arena_alloc(a,(size_t)n*sizeof(JVal*));
+    for (int i=0;i<n;i++) rows[i]=arr->items[i];
+    Schema *sc=sb_infer_schema(rows,n,a);
+    if (!sc) return -1;
+    *out=sc; return 0;
+}
+
+/* read_batch: один батч = строки начиная с req->cursor (целочисленный оффсет,
+ * cumulative — ядро двигает его на число прочитанных строк). Чтобы перешагнуть
+ * правило ядра «короткий батч = конец», склеиваем несколько Siebel-страниц в
+ * один батч до BATCH_SIZE строк (или до короткой страницы Siebel = конец данных).
+ *   rc <0 ошибка; 0 = есть ещё (полный батч); 1 = последняя/единственная порция. */
+static int siebel_read_batch(void *vctx, Arena *a, DfoReadReq *req,
+                             const char *entity, ColBatch **out_batch) {
+    SiebelCtx *ctx=vctx;
+    const char *base = ctx->read_url[0] ? ctx->read_url : ctx->url;
+    if (!base||!base[0]) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),
+                 "siebel source: ни read_url, ни siebel_url не заданы");
+        return -1;
+    }
+    int64_t offset=0;
+    if (req&&req->cursor&&req->cursor[0]) offset=strtoll(req->cursor,NULL,10);
+
+    const char *io=(entity&&entity[0])?entity:ctx->io_name;
+    const char *dp=ctx->data_path[0]?ctx->data_path:io;
+
+    /* Склейка Siebel-страниц в один батч (до BATCH_SIZE строк). */
+    JVal **rows=arena_alloc(a,(size_t)BATCH_SIZE*sizeof(JVal*));
+    int nrows=0, done=0;
+    while (nrows<BATCH_SIZE && !done) {
+        char *body=sb_fetch(ctx,offset+nrows,a);   /* абсолютный StartRowNum */
+        if (!body) return -1;                       /* транспорт/HTTP — наверх */
+        JVal *root=json_parse(a,body,strlen(body));
+        if (!root||root->type==JV_ERROR) {
+            snprintf(ctx->last_err,sizeof(ctx->last_err),"siebel source: некорректный JSON-ответ");
+            return -1;
+        }
+        JVal *arr=sb_locate_array(root,dp);
+        if (!arr||arr->nitems==0) { done=1; break; }   /* данные кончились */
+        int got=(int)arr->nitems;
+        int take=got<(BATCH_SIZE-nrows)?got:(BATCH_SIZE-nrows);
+        for (int i=0;i<take;i++) rows[nrows++]=arr->items[i];
+        if (got<ctx->page_size) done=1;     /* короткая страница Siebel → конец */
+        if (!ctx->page_param[0])   done=1;  /* пагинация выключена → один fetch */
+        if (take<got) break;                /* батч заполнен посреди страницы */
+    }
+    if (nrows==0) return 1;                  /* на этом оффсете пусто → конец */
+
+    Schema *sc=sb_infer_schema(rows,nrows,a);
+    if (!sc) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),
+                 "siebel source: не удалось вывести схему из записей");
+        return -1;
+    }
+    int ncols=sc->ncols;
+    ColBatch *batch=arena_calloc(a,sizeof(ColBatch));
+    batch->schema=sc; batch->ncols=ncols;
+    for (int c=0;c<ncols;c++) {
+        batch->null_bitmap[c]=arena_calloc(a,((size_t)nrows+7)/8);
+        switch(sc->cols[c].type) {
+            case COL_INT64:  batch->values[c]=arena_alloc(a,(size_t)nrows*sizeof(int64_t)); break;
+            case COL_DOUBLE: batch->values[c]=arena_alloc(a,(size_t)nrows*sizeof(double));  break;
+            default:         batch->values[c]=arena_alloc(a,(size_t)nrows*sizeof(char*));   break;
+        }
+    }
+    batch->nrows=sb_fill_batch(rows,nrows,sc,batch,a);
+    *out_batch=batch;
+    LOG_INFO("siebel source: %d rows ← IO '%s' @ %s (offset %lld%s)",
+             batch->nrows, io, base, (long long)offset, done?", end":"");
+    return done?1:0;
 }
 
 /* ── Sink: POST батча в Siebel Inbound Web Service ──
@@ -313,18 +600,18 @@ static int siebel_write_batch(void *vctx, Arena *a, const char *entity,
 }
 
 /* Таблица экспорта плагина: точка входа, по которой загрузчик находит коннектор.
- * ABI как у json_http: read-only поля (describe/read_batch/cdc) = NULL — это
- * чистый sink. */
+ * Двунаправленный (ABI как у json_http): describe/read_batch — source,
+ * write_batch — sink; cdc не поддерживается. */
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "siebel",
-    .version      = "0.1.0",
-    .description  = "Siebel/EIM sink connector (EAI REST Inbound Web Service)",
+    .version      = "0.2.0",
+    .description  = "Siebel/EIM connector (EAI REST Inbound Web Service, source+sink)",
     .create       = siebel_create,
     .destroy      = siebel_destroy,
     .list_entities= siebel_list_entities,
-    .describe     = NULL,
-    .read_batch   = NULL,
+    .describe     = siebel_describe,
+    .read_batch   = siebel_read_batch,
     .cdc_start    = NULL,
     .cdc_stop     = NULL,
     .ping         = siebel_ping,

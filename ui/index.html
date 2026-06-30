@@ -7,8 +7,6 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<!-- Рамка окна: фикс-оверлей поверх всего (верх/право/низ) -->
-<div id="window-frame"></div>
 <div id="app">
 
   <!-- ── Login Screen ── -->
@@ -62,9 +60,9 @@
 
     <!-- ═══ Pipelines list + tables ═══ -->
     <section id="view-pipelines" class="view">
-      <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
+      <h1 style="display:flex;justify-content:flex-end;gap:.4rem">
         <button class="btn btn-primary btn-sm" onclick="openPipelineBuilder(null)" title="Создать новый конвейер в визуальном редакторе">+ Конвейер</button>
-        <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="openYamlImport()" title="Импортировать YAML-описание конвейера">📄 Импорт YAML</button>
+        <button class="btn btn-sm" onclick="openYamlImport()" title="Импортировать YAML-описание конвейера">📄 Импорт YAML</button>
       </h1>
       <div id="pipelines-list"></div>
     </section>
@@ -72,7 +70,7 @@
     <!-- ═══ Pipeline Builder ═══ -->
     <section id="view-builder" class="view">
       <div class="builder-topbar">
-        <button class="btn btn-sm" style="background:transparent;border:none;box-shadow:none" onclick="clearBuilderDraft();switchView('pipelines')">← Конвейеры</button>
+        <button class="btn btn-sm" onclick="clearBuilderDraft();switchView('pipelines')">← Конвейеры</button>
         <button class="btn btn-primary btn-sm" style="margin-left:auto;min-width:104px;justify-content:center" onclick="savePipeline()">Сохранить</button>
         <button class="btn btn-sm" style="min-width:104px;justify-content:center" onclick="clearBuilderDraft();switchView('pipelines')">Отмена</button>
       </div>

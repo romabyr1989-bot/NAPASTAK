@@ -736,7 +736,27 @@ async function applyYaml() {
 /* ═══════════════════════════════════════════════════
    PIPELINE LIST
 ═══════════════════════════════════════════════════ */
-let _pipelinesPerPage = 10;   /* page size (Infinity = «Все») */
+let _pipelinesPerPage = 10;   /* 10 блоков на странице по умолчанию (Infinity = «Все») */
+
+/* Фиксируем высоту блока так, чтобы РОВНО 10 блоков заполняли область панели.
+ * Размер блока не зависит от их числа: 10 → заполняют без скролла, больше → скролл. */
+function pipelinesSizeRows() {
+  const main = document.getElementById('main');
+  const list = document.getElementById('pipelines-list');
+  const view = document.getElementById('view-pipelines');
+  if (!main || !list || !view || !view.classList.contains('active')) return;
+  const rows = list.querySelectorAll('.pipeline-item');
+  if (!rows.length) return;
+  const cs    = getComputedStyle(main);
+  const usable = main.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  const h1    = view.querySelector('h1');
+  const toolbarH = h1 ? h1.offsetHeight + parseFloat(getComputedStyle(h1).marginBottom || 0) : 0;
+  const pager = list.querySelector('.pager');
+  const pagerH = pager ? pager.offsetHeight + 12 : 0;
+  const rowMargin = parseFloat(getComputedStyle(rows[0]).marginBottom || 0) || 0;
+  const rowH = Math.max(44, Math.floor((usable - toolbarH - pagerH) / 10) - rowMargin);
+  list.style.setProperty('--pipe-row-h', rowH + 'px');
+}
 let _pipelinesAll = [];
 let _pipelinesPage = 0;
 
@@ -792,7 +812,7 @@ function renderPipelinesPage() {
       <span class="pager-info">${start + 1}–${end} из ${total} · стр. ${_pipelinesPage + 1}/${pages}</span>
       <button class="btn btn-sm" ${_pipelinesPage >= pages - 1 ? 'disabled' : ''} onclick="pipelinesGoPage(${_pipelinesPage + 1})">Вперёд →</button>`
       : `<span class="pager-info">всего: ${total}</span>`;
-    const opts = [10, 25, 50].map(n => `<option value="${n}" ${perPage === n ? 'selected' : ''}>${n}</option>`).join('')
+    const opts = [10, 25, 50].map(n => `<option value="${n}" ${_pipelinesPerPage === n ? 'selected' : ''}>${n}</option>`).join('')
                + `<option value="all" ${all ? 'selected' : ''}>Все</option>`;
     nav.innerHTML = navBtns +
       `<label class="pager-size">На странице:
@@ -801,6 +821,8 @@ function renderPipelinesPage() {
     frag.appendChild(nav);
   }
   list.replaceChildren(frag);
+  /* Зафиксировать высоту блока так, чтобы 10 блоков заполняли область. */
+  pipelinesSizeRows();
 }
 
 function pipelinesGoPage(p) {
@@ -814,6 +836,13 @@ function pipelinesSetPerPage(v) {
   _pipelinesPage = 0;
   renderPipelinesPage();
 }
+
+/* Пересчитываем высоту блока (чтобы 10 заполняли область) при ресайзе окна. */
+let _pipResizeT;
+window.addEventListener('resize', () => {
+  clearTimeout(_pipResizeT);
+  _pipResizeT = setTimeout(pipelinesSizeRows, 120);
+});
 
 const STATUS_LABELS = ['ожидание','выполняется','успех','ошибка','отменён'];
 const STATUS_BADGE  = ['badge-warn','badge-run','badge-ok','badge-err','badge-warn'];
@@ -1207,8 +1236,8 @@ function pbAddStep() {
   pb.steps.push({
     id: `step_${pb.steps.length + 1}`,
     name: '',
-    connector_type: '',
-    connector_config: '',
+    connector_type: 'postgresql',   /* по умолчанию новый шаг — Источник */
+    connector_config: '{}',
     transform_sql: '',
     target_table: '',
     deps: [],
@@ -1382,7 +1411,7 @@ async function pbPreviewSource(idx) {
   if (!out) return;
   const cfg = safeParse(step.connector_config, {});
   /* file/HTTP sources have no SQL — the source is in their own config */
-  const isHttp = ['json_http','csv','parquet'].includes(step.connector_type);
+  const isHttp = ['json_http','csv','parquet','siebel','xml','soap'].includes(step.connector_type);
   const query = (cfg.query || cfg.table || '').trim();
   if (isHttp) {
     if (!cfg.url && !cfg.path) { out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи адрес (URL) или путь к файлу</div>'; return; }
@@ -1537,22 +1566,22 @@ const MATCH_RULES_STARTER =
       metric_function: 'word_similarity', operator: '>=', threshold: 0.80, normalize: 'name' }
   ], null, 2);
 
-const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','kafka'];
+const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','kafka','siebel','xml','soap'];
 
 /* Human-readable connector list for the unified «Источник» sub-selector. */
 const SOURCE_OPTIONS = [
   ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
-  ['kafka','Kafka'], ['json_http','HTTP / REST'],
-  ['csv','CSV'], ['parquet','Parquet'],
+  ['kafka','Kafka'], ['json_http','HTTP / REST'], ['soap','SOAP'], ['xml','XML'],
+  ['csv','CSV'], ['parquet','Parquet'], ['siebel','Siebel / EIM'],
 ];
 
 /* Connectors that can act as sinks (write_batch in ABI v2). */
-const SINK_TYPES = ['csv','json_http','postgresql','kafka','greenplum','oracle','parquet'];
+const SINK_TYPES = ['csv','json_http','postgresql','kafka','greenplum','oracle','parquet','siebel','xml','soap'];
 
 /* Human-readable sink list for the unified «Приёмник» sub-selector. */
 const SINK_OPTIONS = [
   ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
-  ['kafka','Kafka'], ['json_http','HTTP / Webhook'],
+  ['kafka','Kafka'], ['json_http','HTTP / Webhook'], ['soap','SOAP'], ['xml','XML'],
   ['csv','CSV'], ['parquet','Parquet'], ['siebel','Siebel / EIM'],
 ];
 
@@ -1902,7 +1931,7 @@ function stepTypeShort(t) {
 /* Открыть граф шагов крупнее в отдельной модалке (клон текущего SVG). */
 function openFlowModal() {
   const src = document.getElementById('pb-flow-graph');
-  if (!src || !src.innerHTML.trim()) return;   /* нет шагов — нечего показывать */
+  if (!src || !src.querySelector('svg')) return;   /* нет графа (только заглушка) — нечего показывать */
   document.getElementById('flow-modal-body').innerHTML = src.innerHTML;
   document.getElementById('flow-modal').classList.remove('hidden');
 }
@@ -1912,8 +1941,9 @@ function renderFlowGraph() {
   if (!wrap) return;
   const outer = wrap.closest('.pb-flow-wrap');
   if (!pb.steps.length) {
-    wrap.innerHTML = '';
-    if (outer) outer.style.display = 'none';   /* граф появляется только при наличии шагов */
+    /* Область графа видна всегда — при пустых шагах показываем заглушку. */
+    wrap.innerHTML = '<div class="pb-flow-empty">Шагов пока нет — добавьте шаг, чтобы построить граф</div>';
+    if (outer) outer.style.display = '';
     return;
   }
   if (outer) outer.style.display = '';
@@ -2046,14 +2076,14 @@ function makeStepCard(step, idx) {
       <div class="step-row-2">
         <div class="form-group" style="margin:0">
           <label>Тип шага <span class="label-hint">= какое поле заполнено</span></label>
-          <select onchange="pbChangeStepType(${idx}, this.value)">
+          <select class="step-type-select" onchange="pbChangeStepType(${idx}, this.value)">
+            <optgroup label="Загрузка данных">
+              <option value="source" ${CONNECTOR_TYPES.includes(t)?'selected':''}>Источник</option>
+            </optgroup>
             <optgroup label="Трансформации">
               <option value="transform" ${['sql','python','scala'].includes(t)?'selected':''}>Трансформация</option>
               <option value="scd2"   ${t==='scd2'  ?'selected':''}>Историзация изменений</option>
               <option value="match"  ${(t==='match'||t==='matchrules')?'selected':''}>Сопоставление</option>
-            </optgroup>
-            <optgroup label="Загрузка данных">
-              <option value="source" ${CONNECTOR_TYPES.includes(t)?'selected':''}>Источник</option>
             </optgroup>
             <optgroup label="Выгрузка данных">
               <option value="sink" ${t.startsWith('sink:')?'selected':''}>Приёмник</option>
@@ -2169,7 +2199,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>`}
       </div>
       ${step.is_sink ? '' : `
-      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
                 onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
@@ -2189,7 +2219,7 @@ function makeConnectorConfigHTML(step, idx) {
                oninput="pbUpdateConnConfig(${idx},'path',this.value)"
                placeholder="/data/exports/*.parquet">
       </div>
-      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
                 onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
@@ -2260,7 +2290,7 @@ function makeConnectorConfigHTML(step, idx) {
                   oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body || '')}</textarea>
       </div>` : ''}
       ${step.is_sink ? '' : `
-      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
                 onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
@@ -2271,37 +2301,163 @@ function makeConnectorConfigHTML(step, idx) {
     </div>`;
   }
 
-  if (type === 'siebel') return `
+  if (type === 'siebel') {
+    /* «Размер страницы» и кнопки предпросмотра — только для источника. */
+    const srcExtra = step.is_sink ? '' : `
+        <div class="form-group" style="margin:0">
+          <label>Размер страницы</label>
+          <input type="number" min="1" value="${escAttr(cfg.page_size || 1000)}"
+                 oninput="pbUpdateConnConfig(${idx},'page_size',parseInt(this.value,10)||1000)">
+        </div>`;
+    const actions = step.is_sink ? '' : `
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
+      </div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`;
+    return `
     <div class="conn-group">
-      <div class="conn-group-title">Подключение к Siebel / EIM (REST/EAI)</div>
+      <div class="conn-group-title">${step.is_sink ? 'Приёмник' : 'Источник'} Siebel</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">
         <div class="form-group" style="margin:0;grid-column:1/-1">
-          <label>URL REST/EAI-эндпоинта</label>
-          <input type="text" value="${escAttr(cfg.url || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'url',this.value)"
-                 placeholder="http://siebel.internal:8444/eai/CX_EIM_CONTACT">
+          <label>Адрес сервиса Siebel</label>
+          <input type="text" value="${escAttr(cfg.url || '')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Integration Object (io_name)</label>
-          <input type="text" value="${escAttr(cfg.io_name || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'io_name',this.value)" placeholder="CX_EIM_CONTACT">
+          <label>Объект интеграции</label>
+          <input type="text" value="${escAttr(cfg.io_name || '')}" oninput="pbUpdateConnConfig(${idx},'io_name',this.value)">
         </div>
         <div class="form-group" style="margin:0">
           <label>Пользователь</label>
-          <input type="text" value="${escAttr(cfg.user || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="SADMIN">
+          <input type="text" value="${escAttr(cfg.user || '')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)">
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль</label>
-          <input type="password" value="${escAttr(cfg.password || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="••••••">
+          <input type="password" value="${escAttr(cfg.password || '')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">
         </div>
+        ${srcExtra}
       </div>
-      <div style="font-size:.8rem;color:var(--muted);margin-top:.5rem">
-        Приёмник CDI→Siebel/EIM: каждый батч уходит POST-запросом как Siebel IO-конверт
-        <code>{"&lt;io_name&gt;":[…]}</code> с Basic-авторизацией.
-      </div>
+      ${actions}
     </div>`;
+  }
+
+  if (type === 'xml') {
+    const auth   = cfg.auth_type || 'none';
+    const method = cfg.method || 'GET';
+    const reR = `document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})`;
+    const f = [];
+    f.push(`<label>Веб-адрес</label>
+      <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">`);
+    f.push(`<label>Путь к файлу</label>
+      <input type="text" value="${escAttr(cfg.path||'')}" oninput="pbUpdateConnConfig(${idx},'path',this.value)">`);
+    f.push(`<label>Тег одной записи</label>
+      <input type="text" value="${escAttr(cfg.row_tag||'')}" oninput="pbUpdateConnConfig(${idx},'row_tag',this.value)">`);
+    if (!step.is_sink) {
+      f.push(`<label>Метод запроса</label>
+        <select onchange="pbUpdateConnConfig(${idx},'method',this.value);${reR}">
+          <option value="GET"  ${method==='GET' ?'selected':''}>GET</option>
+          <option value="POST" ${method==='POST'?'selected':''}>POST</option>
+        </select>`);
+      f.push(`<label>Параметр постраничной загрузки</label>
+        <input type="text" value="${escAttr(cfg.page_param||'')}" oninput="pbUpdateConnConfig(${idx},'page_param',this.value)">`);
+    } else {
+      f.push(`<label>Корневой тег документа</label>
+        <input type="text" value="${escAttr(cfg.root_tag||'rows')}" oninput="pbUpdateConnConfig(${idx},'root_tag',this.value)">`);
+    }
+    f.push(`<label>Авторизация</label>
+      <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value);${reR}">
+        <option value="none"   ${auth==='none'  ?'selected':''}>Нет</option>
+        <option value="basic"  ${auth==='basic' ?'selected':''}>Basic</option>
+        <option value="bearer" ${auth==='bearer'?'selected':''}>Bearer-токен</option>
+      </select>`);
+    if (auth==='basic') {
+      f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)">`);
+      f.push(`<label>Пароль</label><input type="password" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
+    } else if (auth==='bearer') {
+      f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)">`);
+    }
+    const grid = f.map((x,i)=>`<div class="form-group" style="margin:0${(i===f.length-1&&f.length%2===1)?';grid-column:1/-1':''}">${x}</div>`).join('');
+    const postBody = (!step.is_sink && method==='POST') ? `
+      <div class="form-group" style="margin:.5rem 0 0"><label>Тело запроса</label>
+        <textarea class="mono-textarea" rows="3" oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body||'')}</textarea></div>` : '';
+    const actions = step.is_sink ? '' : `
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok?';background:var(--green);border-color:var(--green);color:#fff':''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok?'✓ Подключено':'Подключиться'}</button>
+      </div><div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`;
+    return `
+    <div class="conn-group">
+      <div class="conn-group-title">${step.is_sink?'Приёмник':'Источник'} XML</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">${grid}</div>
+      ${postBody}
+      ${actions}
+    </div>`;
+  }
+
+  if (type === 'soap') {
+    const auth = cfg.auth_type || 'none';
+    const ver  = cfg.soap_version || '1.1';
+    const reR = `document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})`;
+    const f = [];
+    f.push(`<label>Адрес сервиса</label>
+      <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">`);
+    f.push(`<label>Действие SOAP</label>
+      <input type="text" value="${escAttr(cfg.soap_action||'')}" oninput="pbUpdateConnConfig(${idx},'soap_action',this.value)">`);
+    f.push(`<label>Версия SOAP</label>
+      <select onchange="pbUpdateConnConfig(${idx},'soap_version',this.value)">
+        <option value="1.1" ${ver==='1.1'?'selected':''}>1.1</option>
+        <option value="1.2" ${ver==='1.2'?'selected':''}>1.2</option>
+      </select>`);
+    if (step.is_sink) {
+      f.push(`<label>Имя операции</label>
+        <input type="text" value="${escAttr(cfg.operation||'')}" oninput="pbUpdateConnConfig(${idx},'operation',this.value)">`);
+      f.push(`<label>Пространство имён</label>
+        <input type="text" value="${escAttr(cfg.namespace||'')}" oninput="pbUpdateConnConfig(${idx},'namespace',this.value)">`);
+      f.push(`<label>Тег одной строки</label>
+        <input type="text" value="${escAttr(cfg.sink_row_tag||'row')}" oninput="pbUpdateConnConfig(${idx},'sink_row_tag',this.value)">`);
+    } else {
+      f.push(`<label>Тег записи в ответе</label>
+        <input type="text" value="${escAttr(cfg.row_tag||'')}" oninput="pbUpdateConnConfig(${idx},'row_tag',this.value)">`);
+    }
+    f.push(`<label>Авторизация</label>
+      <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value);${reR}">
+        <option value="none"   ${auth==='none'  ?'selected':''}>Нет</option>
+        <option value="basic"  ${auth==='basic' ?'selected':''}>Basic</option>
+        <option value="bearer" ${auth==='bearer'?'selected':''}>Bearer-токен</option>
+      </select>`);
+    if (auth==='basic') {
+      f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)">`);
+      f.push(`<label>Пароль</label><input type="password" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
+    } else if (auth==='bearer') {
+      f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)">`);
+    }
+    const grid = f.map((x,i)=>`<div class="form-group" style="margin:0${(i===f.length-1&&f.length%2===1)?';grid-column:1/-1':''}">${x}</div>`).join('');
+    const tpl = step.is_sink ? '' : `
+      <div class="form-group" style="margin:.5rem 0 0"><label>Шаблон SOAP-запроса</label>
+        <textarea class="mono-textarea" rows="5"
+                  oninput="pbUpdateConnConfig(${idx},'request_template',this.value)">${escHtml(cfg.request_template||'')}</textarea></div>`;
+    const actions = step.is_sink ? '' : `
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok?';background:var(--green);border-color:var(--green);color:#fff':''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok?'✓ Подключено':'Подключиться'}</button>
+      </div><div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`;
+    return `
+    <div class="conn-group">
+      <div class="conn-group-title">${step.is_sink?'Приёмник':'Источник'} SOAP</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">${grid}</div>
+      ${tpl}
+      ${actions}
+    </div>`;
+  }
 
   if (type === 'postgresql') return `
     <div class="conn-group">
@@ -2606,7 +2762,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
       </div>` : ''}
       ${step.is_sink ? '' : `
-      <div style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
                 onclick="event.stopPropagation();pbPreviewKafka(${idx})">▶ Показать сообщения</button>
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"

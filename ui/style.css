@@ -93,7 +93,7 @@ nav { padding: .75rem 0; flex: 1; }
 #view-builder.active { display: flex; flex-direction: column; gap: 1rem; }
 
 h1 {
-  font-size: 1.4rem; font-weight: 600; margin-bottom: 1.25rem;
+  font-size: 1.4rem; font-weight: 600; margin-bottom: .7rem;
   display: flex; align-items: center; gap: .75rem;
 }
 h2 { font-size: 1rem; font-weight: 600; margin: 1.25rem 0 .75rem; color: var(--text); }
@@ -296,17 +296,17 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 /* ── Pipelines ── */
 .pipeline-item {
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1rem; margin-bottom: .75rem;
-  display: flex; align-items: flex-start; gap: 1rem;
+  border-radius: var(--radius); padding: .5rem .8rem; margin-bottom: .4rem;
+  display: flex; align-items: center; gap: 1rem;
   transition: border-color .15s;
 }
 .pipeline-item:hover { border-color: var(--border); }
 .pipeline-item-clickable { cursor: pointer; }
 .pipeline-item-clickable:hover { border-color: var(--accent); }
 .pipeline-name { font-weight: 600; }
-.pipeline-meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
-.pipeline-actions { display: flex; gap: .4rem; flex-shrink: 0; margin-top: .1rem; }
-.step-list  { margin-top: .5rem; display: flex; gap: .4rem; flex-wrap: wrap; }
+.pipeline-meta { font-size: .72rem; color: var(--muted); margin-top: .1rem; }
+.pipeline-actions { display: flex; gap: .4rem; flex-shrink: 0; }
+.step-list  { margin-top: .25rem; display: flex; gap: .4rem; flex-wrap: wrap; }
 .step-badge {
   font-size: .7rem; background: var(--surface2);
   border-radius: 4px; padding: .15rem .5rem;
@@ -314,11 +314,11 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 }
 
 /* ── Pagination ── */
-.pager { display: flex; align-items: center; justify-content: center; gap: .5rem; margin: 1.25rem 0 .25rem; flex-wrap: nowrap; }
+.pager { position: relative; display: flex; align-items: center; justify-content: center; gap: .5rem; margin: 1.25rem 0 .25rem; flex-wrap: nowrap; }
 .pager .btn { height: 34px; min-width: 110px; justify-content: center; flex-shrink: 0; }
 .pager .btn[disabled] { opacity: .4; cursor: default; pointer-events: none; }
 .pager-info { font-size: .8rem; color: var(--muted); padding: 0 .75rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.pager-size { font-size: .78rem; color: var(--muted); display: inline-flex; align-items: center; gap: .45rem; margin-left: 1.25rem; white-space: nowrap; flex-shrink: 0; }
+.pager-size { position: absolute; right: 0; top: 50%; transform: translateY(-50%); font-size: .78rem; color: var(--muted); display: inline-flex; align-items: center; gap: .45rem; white-space: nowrap; flex-shrink: 0; }
 .pager-size select { height: 34px; padding: 0 .55rem; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); font-size: .8rem; cursor: pointer; }
 
 /* ── Status badges ── */
@@ -399,6 +399,23 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 .conn-group input[type=password],
 .conn-group input[type=number],
 .conn-group select { height: 38px; box-sizing: border-box; }
+/* Выпадающие списки в формах коннекторов — по ширине содержимого, а не на всю
+ * колонку (перебивает глобальное select{width:100%}). */
+.conn-group select { width: auto; min-width: 0; max-width: 100%; }
+/* Поля ввода чисел — тоже по содержимому: field-sizing сжимает поле под значение
+ * (Chromium), width:auto — запасной вариант для прочих браузеров. */
+.conn-group input[type=number] { field-sizing: content; width: auto; min-width: 4rem; max-width: 100%; }
+/* Селектор «Тип шага» — по ширине содержимого, а не на всю колонку. */
+.step-type-select { width: auto; min-width: 0; max-width: 100%; }
+/* Порядок кнопок в формах источников: «Подключиться» перед «Показать данные»
+ * (кнопка теста подключения получает order:-1, выравнивание справа сохраняется). */
+.conn-actions > [id^="pb-dbtest-"] { order: -1; }
+/* Содержимое однострочных полей форм коннекторов — по центру (многострочные
+ * textarea оставляем слева — это XML/шаблоны). */
+.conn-group input[type=text],
+.conn-group input[type=number],
+.conn-group input[type=password],
+.conn-group select { text-align: center; text-align-last: center; }
 .conn-group-title {
   font-size: .72rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .05em; color: var(--muted); margin-bottom: .6rem;
@@ -420,6 +437,7 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 }
 .pb-flow-graph { flex: 1; min-width: 0; overflow-x: auto; }
 .pb-flow-graph svg { display: block; margin: 0 auto; }   /* центрируем граф в форме */
+.pb-flow-empty { text-align: center; color: #94a3b8; font-size: .85rem; padding: 1.4rem 0; }
 #flow-modal-body svg { display: block; margin: 0 auto; } /* и в модалке */
 /* Клик по фону графа → модалка (обычный курсор); клик по ноде → переход к шагу (указатель). */
 .pb-flow-wrap { cursor: default; }
@@ -739,24 +757,37 @@ body {
   border-right: 1px solid var(--border);   /* разделитель меню | контент */
 }
 
+/* Контент — выделенная обведённая область (панель). Внутри неё: верхние кнопки
+ * (+ Конвейер / Импорт YAML), список и управление пагинацией. Белая на сером
+ * фоне окна + видимая рамка + тень — чтобы область чётко выделялась. */
 #main {
-  padding: 2.4rem 2.8rem 3rem;
+  padding: 1.5rem 1.75rem;
+  margin: 14px;
+  border: 1px solid #c7c7cf;
+  border-radius: var(--radius);
+  background: #eef0f4;                          /* чуть темнее фона окна — белые карточки внутри видны, область выделена */
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.07);
 }
 
-/* Одна общая рамка вокруг всего окна — фикс-оверлей поверх всего (верх/право/низ;
- * лево — край окна). Оверлей рисует линию ВНУТРИ вьюпорта (край не срезает), а
- * заметный серый даёт контраст на светлом фоне (тон панели #d2d2d7 у края сливался). */
-#window-frame {
-  position: fixed;
-  top: 0; right: 0; bottom: 0; left: 0;   /* явно, не inset (совместимость) */
-  pointer-events: none;                    /* не мешает кликам */
-  z-index: 99999;                          /* поверх всего */
-  /* 4px, читаемый серый тона панели. Ровно #d2d2d7 у края окна сливается с
-   * фоном (оттого «не видно»), поэтому тон семейства панели, но чуть темнее. */
-  border-top:    4px solid #9aa0a8;
-  border-right:  4px solid #9aa0a8;
-  border-bottom: 4px solid #9aa0a8;
+/* Конвейеры: высота блока ФИКСИРОВАНА так, чтобы 10 блоков заполняли всю область
+ * (--pipe-row-h вычисляется в JS под высоту окна). Размер блока не меняется; когда
+ * блоков больше 10 — они переполняют область и включается скролл. */
+#pipelines-list .pipeline-item {
+  height: var(--pipe-row-h, auto);
+  overflow: hidden;
 }
+
+/* «+ Конвейер» ровно над «▶ Запустить»: одинаковые ширины колонок и отступы +
+ * правый отступ тулбара под внутренний padding карточки (.8rem), иначе кнопки
+ * тулбара стоят на ~13px правее кнопок карточки.
+ * Верх: [+ Конвейер 116][Импорт YAML 138]. Карточка: [Запустить 116][История 96][✕ 36]. */
+#view-pipelines h1 { gap: .4rem; padding-right: .8rem; }
+#view-pipelines h1 > .btn:nth-child(1) { width: 116px; min-width: 116px; justify-content: center; }
+#view-pipelines h1 > .btn:nth-child(2) { width: 138px; min-width: 138px; justify-content: center; }
+#pipelines-list .pipeline-actions { gap: .4rem; }
+#pipelines-list .pipeline-actions > .btn:nth-child(1) { width: 116px; min-width: 116px; justify-content: center; }
+#pipelines-list .pipeline-actions > .btn:nth-child(2) { width: 96px;  min-width: 96px;  justify-content: center; }
+#pipelines-list .pipeline-actions > .btn:nth-child(3) { width: 36px;  min-width: 36px;  padding-left: 0; padding-right: 0; justify-content: center; }
 
 .logo {
   padding: 1.2rem 1rem;

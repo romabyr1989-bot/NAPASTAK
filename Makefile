@@ -64,6 +64,8 @@ SIEBEL_PLUGIN  = $(LIBDIR)/siebel_connector.so
 KAFKA_PLUGIN   = $(LIBDIR)/kafka_connector.so
 GP_PLUGIN      = $(LIBDIR)/gp_connector.so
 ORACLE_PLUGIN  = $(LIBDIR)/oracle_connector.so
+XML_PLUGIN     = $(LIBDIR)/xml_connector.so
+SOAP_PLUGIN    = $(LIBDIR)/soap_connector.so
 
 # Detect librdkafka
 _RDKAFKA_LOCAL := $(shell test -d /usr/local/opt/librdkafka/include && echo /usr/local/opt/librdkafka)
@@ -114,7 +116,7 @@ endif
         test-integration test-sql test-all bench flight gp oracle
 
 # Base targets always built
-_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(SIEBEL_PLUGIN)
+_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(SIEBEL_PLUGIN) $(XML_PLUGIN) $(SOAP_PLUGIN)
 ifeq ($(HAS_PQ),yes)
   _ALL_TARGETS += $(PG_PLUGIN) $(GP_PLUGIN)   # Greenplum reuses libpq
 endif
@@ -218,11 +220,33 @@ $(JSONHTTP_PLUGIN): lib/connector/plugins/json_http/json_http_connector.c \
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
-# Siebel/EIM sink connector (requires libcurl — EAI REST Inbound Web Service)
+# Siebel/EIM connector — source+sink (requires libcurl — EAI REST Inbound Web
+# Service; core/json for parsing read responses)
 $(SIEBEL_PLUGIN): lib/connector/plugins/siebel/siebel_connector.c \
                   $(OUTDIR)/lib/core/arena.o \
                   $(OUTDIR)/lib/storage/storage.o \
-                  $(OUTDIR)/lib/core/log.o
+                  $(OUTDIR)/lib/core/log.o \
+                  $(OUTDIR)/lib/core/json.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# XML connector — source+sink (libcurl for HTTP; core/xml for parsing)
+$(XML_PLUGIN): lib/connector/plugins/xml/xml_connector.c \
+               $(OUTDIR)/lib/core/arena.o \
+               $(OUTDIR)/lib/storage/storage.o \
+               $(OUTDIR)/lib/core/log.o \
+               $(OUTDIR)/lib/core/xml.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# SOAP connector — source+sink (libcurl HTTP envelope; core/xml for parsing)
+$(SOAP_PLUGIN): lib/connector/plugins/soap/soap_connector.c \
+                $(OUTDIR)/lib/core/arena.o \
+                $(OUTDIR)/lib/storage/storage.o \
+                $(OUTDIR)/lib/core/log.o \
+                $(OUTDIR)/lib/core/xml.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)

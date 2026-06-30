@@ -427,7 +427,12 @@ static int emit_block_scalar(Yaml *y, int *idx, int parent_indent,
         if (truly_blank) {
             content = "";
         } else {
-            if (child_indent < 0) child_indent = count_indent(raw);
+            int ind = count_indent(raw);
+            if (child_indent < 0) child_indent = ind;
+            /* Строка с отступом МЕНЬШЕ блока завершает block scalar (правило YAML).
+             * Без этого дедентованный комментарий «  # …» втягивался в значение, а
+             * срез child_indent байт резал многобайтный символ → битый UTF-8. */
+            else if (ind < child_indent) break;
             int strip = child_indent > 0 ? child_indent : 0;
             int rl = (int)strlen(raw);
             if (strip > rl) strip = rl;
