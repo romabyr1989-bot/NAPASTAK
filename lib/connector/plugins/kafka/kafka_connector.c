@@ -5,6 +5,14 @@
 #include "../../../core/log.h"
 #include "avro_record.h"   /* AvroType/AvroField/AvroSchemaNode + parse/decode */
 #include <librdkafka/rdkafka.h>
+/* RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_ID was added in librdkafka 2.1.0 (KIP-516).
+ * On older clients — e.g. RedOS 8 / EL9 ship librdkafka 1.6.1 — the enum does
+ * not exist AND is never returned by the broker, so alias it to
+ * UNKNOWN_TOPIC_OR_PART: the topic-does-not-exist check keeps compiling and the
+ * behaviour is identical (that branch and this one both report "does not exist"). */
+#if !defined(RD_KAFKA_VERSION) || RD_KAFKA_VERSION < 0x020100ff
+#define RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_ID RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART
+#endif
 #include <curl/curl.h>
 #include <pthread.h>
 #include <string.h>

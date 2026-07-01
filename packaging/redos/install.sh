@@ -19,6 +19,13 @@ else
     echo "  ! dnf не сработал — установите sqlite-libs/libcurl/openssl-libs/zlib вручную"
   ls "$SRC"/lib/pg_connector.so "$SRC"/lib/gp_connector.so >/dev/null 2>&1 && \
     { dnf -y install libpq >/dev/null 2>&1 || echo "  ! libpq не установлен (нужен для PG/Greenplum)"; }
+  ls "$SRC"/lib/kafka_connector.so >/dev/null 2>&1 && \
+    { dnf -y install epel-release >/dev/null 2>&1; dnf -y install librdkafka >/dev/null 2>&1 || echo "  ! librdkafka не установлен (нужен для Kafka; из EPEL)"; }
+fi
+# Oracle: коннектор и libodpic грузятся из бандла, но подключение требует
+# проприетарный Oracle Instant Client (libclntsh.so) — см. README → Oracle.
+if ls "$SRC"/lib/oracle_connector.so >/dev/null 2>&1 && ! ls "$SRC"/lib/deps/libclntsh.so* >/dev/null 2>&1; then
+  echo "  i Oracle: для подключения установите Oracle Instant Client (libclntsh.so) — см. README"
 fi
 
 echo "==> Системный пользователь $SVC_USER"

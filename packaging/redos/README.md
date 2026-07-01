@@ -41,9 +41,11 @@ ssh user@server 'cd /tmp && tar xzf dataflow-os-*.tar.gz && cd dataflow-os-* && 
 
 ## Автономная (офлайн) установка
 
-`make dist` вкладывает в `lib/deps/` все рантайм-библиотеки (`libsqlite3 libcurl
-libssl libcrypto libz libpq` + транзитивные), кроме glibc/ld-linux. Поэтому папку
-можно поставить на сервер **без интернета и без dnf**:
+`make dist` вкладывает в `lib/deps/` все рантайм-библиотеки — `libsqlite3 libcurl
+libssl libcrypto libz libpq librdkafka libodpic` + транзитивные (sasl2, lz4,
+zstd, krb5, ldap, …), кроме glibc/ld-linux/libgcc_s (берутся из целевой ОС).
+Docker-сборка (вариант B) ставит зависимости **всех 10 коннекторов**, поэтому
+бандл self-contained. Папку можно поставить на сервер **без интернета и без dnf**:
 
 ```bash
 scp -r dataflow-os-<ver>-linux-x86_64 user@server:/tmp/
@@ -89,16 +91,49 @@ journalctl -u dataflow-os -f
 `libcurl.so.4` (libcurl), `libz.so.1` (zlib), `libpthread/libm/libdl/libc` (glibc).
 PG/Greenplum дополнительно: `libpq.so.5` (libpq).
 
-## Опциональные коннекторы
+## Коннекторы — все 10 в бандле
 
-| Коннектор | Сборочная зависимость | Примечание |
+Docker-сборка (`packaging/redos/build.sh`, вариант B) собирает и вкладывает в
+бандл **все 10 коннекторов** вместе с их рантайм-`.so` в `lib/deps` — работают
+офлайн «из коробки»:
+
+| Коннектор | Рантайм-либа (вложена в `lib/deps`) | Дополнительно |
 |---|---|---|
-| PostgreSQL / Greenplum | `libpq-devel` | собираются автоматически при наличии |
-| Kafka | `librdkafka-devel` | из EPEL: `dnf install epel-release && dnf install librdkafka-devel` |
-| Oracle | ODPI-C (`libodpic`) | + Oracle Instant Client в рантайме; ставится вручную |
+| csv, parquet, json_http, siebel, xml, soap | libcurl, libz (+ ssl) | — |
+| pg, greenplum | `libpq.so.5` | нужен доступ к серверу PostgreSQL/Greenplum |
+| kafka | `librdkafka.so.1` | нужен брокер Kafka |
+| oracle | `libodpic.so.4` (ODPI-C) | **+ Oracle Instant Client в рантайме — см. ниже** |
 
-Makefile определяет наличие зависимостей сам и собирает только доступные плагины
-(базовый набор csv/parquet/json_http/siebel/xml/soap требует только libcurl+zlib).
+Dockerfile ставит `libpq-devel`, `librdkafka-devel` (EPEL+CRB) и собирает ODPI-C
+из исходников (UPL/Apache — свободно распространяется). Сборка **падает**, если
+хоть один из 10 коннекторов не попал в бандл (sanity-проверка в конце).
+
+При сборке **прямо на сервере** (вариант A) для kafka/oracle доустановите:
+```bash
+sudo dnf install -y epel-release && sudo dnf config-manager --set-enabled crb
+sudo dnf install -y librdkafka-devel                     # kafka
+# ODPI-C (oracle): собрать из исходников (проприетарный клиент — отдельно):
+curl -fsSL https://github.com/oracle/odpi/archive/refs/tags/v4.6.1.tar.gz | tar xz
+make -C odpi-4.6.1 && sudo cp odpi-4.6.1/lib/libodpic.so* /usr/local/lib/ \
+  && sudo cp odpi-4.6.1/include/dpi.h /usr/local/include/ \
+  && echo /usr/local/lib | sudo tee /etc/ld.so.conf.d/odpi.conf && sudo ldconfig
+```
+
+### Oracle: Instant Client (единственная невложимая зависимость)
+
+`oracle_connector.so` и `libodpic.so` **загружаются офлайн из бандла**, но само
+подключение к Oracle требует проприетарный **Oracle Instant Client** (`libclntsh.so`),
+который нельзя распространять в бандле. Установите его на сервере один раз:
+
+```bash
+# со скачанного RPM (basic-пакет) или tar.gz с сайта Oracle:
+sudo dnf install -y oracle-instantclient-basic-*.rpm     # ставит libclntsh.so в /usr/lib/oracle/.../lib
+# и добавьте путь в LD_LIBRARY_PATH сервиса, либо скопируйте libclntsh.so* и его
+# зависимости в /opt/dataflow-os/lib/deps (systemd уже смотрит туда):
+sudo cp /usr/lib/oracle/*/client64/lib/libclntsh.so* /opt/dataflow-os/lib/deps/ && sudo ldconfig
+sudo systemctl restart dataflow-os
+```
+Остальные 9 коннекторов работают без каких-либо внешних установок.
 
 ## Примечание про базовый образ
 

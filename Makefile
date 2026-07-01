@@ -163,11 +163,13 @@ dist: all
 	@chmod +x $(DIST_DIR)/install.sh $(DIST_DIR)/run.sh
 	@# Автономность (офлайн-установка): вложить рантайм-.so, кроме glibc/ld-linux,
 	@# чтобы сервер не требовал dnf/интернет. Только на Linux (нужен ldd).
+	@# libgcc_s НЕ вкладываем: он жёстко связан с системным glibc — вложенный с
+	@# хоста может требовать GLIBC-версию новее целевой; берём его из целевой ОС.
 	@if command -v ldd >/dev/null 2>&1; then \
 	  mkdir -p $(DIST_DIR)/lib/deps; \
 	  for b in $(DIST_DIR)/bin/dfo_gateway $(DIST_DIR)/lib/*.so; do ldd "$$b" 2>/dev/null; done \
 	    | awk '/=> \//{print $$3}' | sort -u \
-	    | grep -vE '/(ld-linux|libc|libm|libdl|librt|libpthread|libresolv|libnsl)\.so' \
+	    | grep -vE '/(ld-linux|libc|libm|libdl|librt|libpthread|libresolv|libnsl|libgcc_s)\.so' \
 	    | while read -r so; do cp -Lu "$$so" $(DIST_DIR)/lib/deps/ 2>/dev/null || true; done; \
 	  echo "  bundled $$(ls $(DIST_DIR)/lib/deps 2>/dev/null | wc -l | tr -d ' ') runtime .so → lib/deps"; \
 	fi
