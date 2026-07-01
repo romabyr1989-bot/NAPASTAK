@@ -10,6 +10,8 @@ User=dataflow
 Group=dataflow
 # UI и плагины ищутся относительно рабочего каталога (ui/index.html, lib/*.so)
 WorkingDirectory=/opt/dataflow-os
+# Автономность: рантайм-библиотеки берутся из вложенной папки lib/deps (офлайн)
+Environment=LD_LIBRARY_PATH=/opt/dataflow-os/lib/deps
 ExecStart=/opt/dataflow-os/bin/dfo_gateway -c /opt/dataflow-os/config.json
 Restart=on-failure
 RestartSec=3

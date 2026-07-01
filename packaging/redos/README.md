@@ -39,9 +39,30 @@ scp dist/dataflow-os-*.tar.gz user@server:/tmp/
 ssh user@server 'cd /tmp && tar xzf dataflow-os-*.tar.gz && cd dataflow-os-* && sudo ./install.sh'
 ```
 
+## Автономная (офлайн) установка
+
+`make dist` вкладывает в `lib/deps/` все рантайм-библиотеки (`libsqlite3 libcurl
+libssl libcrypto libz libpq` + транзитивные), кроме glibc/ld-linux. Поэтому папку
+можно поставить на сервер **без интернета и без dnf**:
+
+```bash
+scp -r dataflow-os-<ver>-linux-x86_64 user@server:/tmp/
+ssh user@server 'cd /tmp/dataflow-os-* && sudo ./install.sh'   # dnf не нужен — библиотеки вложены
+```
+
+Или запустить прямо из папки, ничего не устанавливая:
+
+```bash
+./run.sh                 # поднимет gateway с LD_LIBRARY_PATH=lib/deps
+```
+
+systemd-юнит и install.sh используют `LD_LIBRARY_PATH=/opt/dataflow-os/lib/deps`.
+Если `lib/deps/` нет (сборка не на Linux), install.sh откатывается на `dnf install`.
+
 ## Что делает install.sh
 
-- Ставит рантайм-библиотеки (`sqlite-libs libcurl openssl-libs zlib`, при наличии PG-плагинов — `libpq`).
+- Рантайм-библиотеки: если вложены в `lib/deps` — ставить ничего не нужно (офлайн);
+  иначе ставит через dnf (`sqlite-libs libcurl openssl-libs zlib`, при PG — `libpq`).
 - Создаёт системного пользователя `dataflow`.
 - Кладёт программу в `/opt/dataflow-os` (bin/, lib/, ui/), данные — в `/var/lib/dataflow-os` (data/, pipelines/).
 - Генерирует `config.json` со случайными `jwt_secret` и admin-паролем (печатает пароль).

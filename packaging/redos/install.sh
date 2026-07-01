@@ -10,13 +10,15 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 [ "$(id -u)" -eq 0 ] || { echo "Нужны права root: sudo ./install.sh"; exit 1; }
 
-echo "==> Рантайм-зависимости (dnf)"
-# Бинарь динамически линкуется с этими библиотеками
-dnf -y install sqlite-libs libcurl openssl-libs zlib >/dev/null 2>&1 || \
-  echo "  ! не удалось dnf install — убедитесь, что sqlite-libs/libcurl/openssl-libs/zlib установлены"
-# libpq нужен только если используете коннекторы PostgreSQL/Greenplum
-if ls "$SRC"/lib/pg_connector.so "$SRC"/lib/gp_connector.so >/dev/null 2>&1; then
-  dnf -y install libpq >/dev/null 2>&1 || echo "  ! libpq не установлен (нужен для PG/Greenplum)"
+echo "==> Рантайм-зависимости"
+if [ -d "$SRC/lib/deps" ] && [ -n "$(ls -A "$SRC/lib/deps" 2>/dev/null)" ]; then
+  echo "  вложены в lib/deps ($(ls "$SRC/lib/deps" | wc -l | tr -d ' ') .so) — установка автономна, dnf/интернет не нужны"
+else
+  echo "  lib/deps не найден — ставлю через dnf (нужен репозиторий/интернет)"
+  dnf -y install sqlite-libs libcurl openssl-libs zlib >/dev/null 2>&1 || \
+    echo "  ! dnf не сработал — установите sqlite-libs/libcurl/openssl-libs/zlib вручную"
+  ls "$SRC"/lib/pg_connector.so "$SRC"/lib/gp_connector.so >/dev/null 2>&1 && \
+    { dnf -y install libpq >/dev/null 2>&1 || echo "  ! libpq не установлен (нужен для PG/Greenplum)"; }
 fi
 
 echo "==> Системный пользователь $SVC_USER"
