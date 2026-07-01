@@ -224,8 +224,17 @@ int audit_log_query(AuditLog *l, const char *user_id_filter,
         return -1;
     }
 
-    char *buf = arena_alloc(a, 131072);
-    int boff = snprintf(buf, 131072, "[");
+    /* Ответ строим в буфере под фактический объём: до `limit` событий, каждое
+     * ≤ ~512 байт (resource[128], correlation_id, client_ip, user_id + фикс. поля).
+     * Раньше был жёсткий 128 КБ: при большом числе событий JSON обрезался посреди
+     * строки → невалидный (журнал в UI пуст), а boff мог перерасти буфер и вызвать
+     * size_t-underflow в `131072-(size_t)boff` (запись за пределы буфера). Теперь
+     * каждая запись добавляется под контролем границ, массив всегда закрывается. */
+    size_t cap = (size_t)limit * 512 + 64;
+    char *buf = arena_alloc(a, cap);
+    if (!buf) { sqlite3_finalize(stmt); pthread_mutex_unlock(&l->db_mu); return -1; }
+    size_t boff = 0;
+    buf[boff++] = '[';
     int first = 1;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         int64_t ts     = sqlite3_column_int64(stmt, 0);
@@ -233,22 +242,24 @@ int audit_log_query(AuditLog *l, const char *user_id_filter,
         const char *uid = (const char *)sqlite3_column_text(stmt, 2);
         int     role   = sqlite3_column_int(stmt, 3);
         const char *res= (const char *)sqlite3_column_text(stmt, 4);
-        const char *det= (const char *)sqlite3_column_text(stmt, 5);
         const char *cid= (const char *)sqlite3_column_text(stmt, 6);
         const char *ip = (const char *)sqlite3_column_text(stmt, 7);
         int     rc_val = sqlite3_column_int(stmt, 8);
         int64_t dur    = sqlite3_column_int64(stmt, 9);
 
-        if (!first) boff += snprintf(buf+boff, 131072-(size_t)boff, ",");
-        boff += snprintf(buf+boff, 131072-(size_t)boff,
-            "{\"ts\":%lld,\"event_type\":%d,\"user_id\":\"%s\","
+        int n = snprintf(buf+boff, cap-boff,
+            "%s{\"ts\":%lld,\"event_type\":%d,\"user_id\":\"%s\","
             "\"role\":%d,\"resource\":\"%s\",\"result_code\":%d,"
             "\"duration_ms\":%lld,\"correlation_id\":\"%s\",\"client_ip\":\"%s\"}",
+            first ? "" : ",",
             (long long)ts, etype, uid?uid:"", role, res?res:"",
             rc_val, (long long)dur, cid?cid:"", ip?ip:"");
+        if (n < 0 || (size_t)n + 2 > cap - boff) break;  /* +2: место под ']' и '\0' */
+        boff += (size_t)n;
         first = 0;
     }
-    snprintf(buf+boff, 131072-(size_t)boff, "]");
+    buf[boff++] = ']';
+    buf[boff]   = '\0';
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&l->db_mu);
     *json_out = buf;

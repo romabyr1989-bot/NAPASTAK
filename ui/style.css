@@ -778,8 +778,11 @@ body {
 #an-saved-list .pipeline-item,
 #metrics-pipelines-list .pipeline-item,
 #metrics-matviews-list .pipeline-item {
-  height: var(--pipe-row-h, auto);
-  overflow: hidden;
+  min-height: var(--pipe-row-h, auto);   /* пол, а не потолок: карточки заполняют экран, когда их мало,
+                                            но РАСТУТ под контент (многошаговые пайплайны переносят теги
+                                            на 2-ю строку → ~103px). Раньше здесь была фикс. height +
+                                            overflow:hidden → контент центрировался и обрезался (заголовок
+                                            срезан) — формы выглядели «кривыми». */
   flex-shrink: 0;   /* не сжиматься в flex-колонке списка: лишнее уходит в прокрутку, карточки не плющит */
 }
 
