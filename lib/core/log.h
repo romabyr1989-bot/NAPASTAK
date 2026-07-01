@@ -1,5 +1,5 @@
 #pragma once
-/* log.h — потокобезопасный логгер ядра DataFlow OS.
+/* log.h — потокобезопасный логгер ядра NAPASTAK.
  * Предоставляет уровни логирования, опциональный JSON-вывод и
  * per-thread correlation ID для трассировки HTTP-запросов. */
 #include <stdio.h>

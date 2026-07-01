@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Автономный запуск DataFlow OS прямо из этой папки — без установки, без dnf.
+# Автономный запуск NAPASTAK прямо из этой папки — без установки, без dnf.
 # Использует вложенные библиотеки из lib/deps (см. сборку `make dist`).
 #   ./run.sh [config.json]
 set -euo pipefail

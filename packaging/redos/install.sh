@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DataFlow OS — установка на сервер (RedOS 8 / RHEL 9-совместимые).
+# NAPASTAK — установка на сервер (RedOS 8 / RHEL 9-совместимые).
 # Запускать из распакованного дистрибутива от root:  sudo ./install.sh
 set -euo pipefail
 

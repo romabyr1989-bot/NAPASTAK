@@ -1,5 +1,5 @@
 /*
- * auth.c — модуль аутентификации DataFlow OS.
+ * auth.c — модуль аутентификации NAPASTAK.
  * Реализует два механизма доступа: API-ключи (хранятся в SQLite) и
  * JWT-токены (HS256/HMAC-SHA256). auth_check_request связывает их с
  * HTTP-запросом, проверяя заголовки и query-параметры.
@@ -10,6 +10,9 @@
 #include <sqlite3.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -60,7 +63,12 @@ static int base64url_decode(const char *in, unsigned char *out, size_t out_len) 
 /* Открывает (или создаёт) SQLite-БД ключей и гарантирует наличие таблицы auth_keys. */
 AuthStore *auth_store_create(const char *db_path) {
     AuthStore *s = calloc(1, sizeof(AuthStore));
-    if (sqlite3_open(db_path, &s->db) != SQLITE_OK) {
+    /* FULLMUTEX: соединение используется из нескольких conn_thread одновременно
+     * (auth-проверка ключей + эндпоинты users/apikeys) — сериализованный режим
+     * заставляет sqlite защищать доступ своим мьютексом, иначе — гонка и segfault. */
+    if (sqlite3_open_v2(db_path, &s->db,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                        NULL) != SQLITE_OK) {
         LOG_ERROR("failed to open auth db: %s", sqlite3_errmsg(s->db));
         free(s);
         return NULL;
@@ -77,7 +85,124 @@ AuthStore *auth_store_create(const char *db_path) {
         free(s);
         return NULL;
     }
+    /* Таблица учётных записей для входа (логин+пароль+роль). */
+    const char *usql = "CREATE TABLE IF NOT EXISTS users ("
+                       "username TEXT PRIMARY KEY, "
+                       "pass_hash TEXT NOT NULL, "
+                       "pass_salt TEXT NOT NULL, "
+                       "role INTEGER NOT NULL, "
+                       "created_at INTEGER NOT NULL, "
+                       "enabled INTEGER NOT NULL DEFAULT 1);";
+    if (sqlite3_exec(s->db, usql, NULL, NULL, NULL) != SQLITE_OK) {
+        LOG_ERROR("failed to create users table: %s", sqlite3_errmsg(s->db));
+        sqlite3_close(s->db);
+        free(s);
+        return NULL;
+    }
     return s;
+}
+
+/* ── Учётные записи для входа: PBKDF2-HMAC-SHA256 ── */
+#define PW_SALT_LEN 16
+#define PW_HASH_LEN 32
+#define PW_ITER     100000
+
+/* Хэширует пароль PBKDF2-HMAC-SHA256 с данной солью; out_hex >= 2*PW_HASH_LEN+1. */
+static int pw_hash_hex(const char *password, const unsigned char *salt,
+                       char *out_hex, size_t out_len) {
+    if (out_len < (size_t)PW_HASH_LEN * 2 + 1) return -1;
+    unsigned char key[PW_HASH_LEN];
+    if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password), salt, PW_SALT_LEN,
+                          PW_ITER, EVP_sha256(), PW_HASH_LEN, key) != 1) return -1;
+    for (int i = 0; i < PW_HASH_LEN; i++) sprintf(out_hex + i * 2, "%02x", key[i]);
+    return 0;
+}
+
+/* hex-строка → байты (для восстановления соли при проверке). */
+static int hex_to_bytes(const char *hex, unsigned char *out, size_t out_len) {
+    size_t n = strlen(hex) / 2;
+    if (n > out_len) return -1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned int b;
+        if (sscanf(hex + i * 2, "%2x", &b) != 1) return -1;
+        out[i] = (unsigned char)b;
+    }
+    return (int)n;
+}
+
+/* Создаёт учётку: генерит соль, хэширует пароль, пишет в users. */
+int auth_user_create(AuthStore *s, const char *username, const char *password,
+                     AuthRole role) {
+    if (!s || !username || !password || !*username || !*password) return -1;
+    unsigned char salt[PW_SALT_LEN];
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f || fread(salt, 1, sizeof(salt), f) != sizeof(salt)) { if (f) fclose(f); return -1; }
+    fclose(f);
+    char salt_hex[PW_SALT_LEN * 2 + 1], hash_hex[PW_HASH_LEN * 2 + 1];
+    for (int i = 0; i < PW_SALT_LEN; i++) sprintf(salt_hex + i * 2, "%02x", salt[i]);
+    if (pw_hash_hex(password, salt, hash_hex, sizeof(hash_hex)) != 0) return -1;
+    int64_t now = (int64_t)time(NULL);
+    const char *sql = "INSERT INTO users (username, pass_hash, pass_salt, role, created_at, enabled) "
+                      "VALUES (?, ?, ?, ?, ?, 1);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, salt_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, (int)role);
+    sqlite3_bind_int64(stmt, 5, now);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_CONSTRAINT) return -2;   /* логин уже существует */
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/* Проверяет логин/пароль; при успехе заполняет claims (user_id, role). */
+int auth_user_verify(AuthStore *s, const char *username, const char *password,
+                     AuthClaims *claims_out) {
+    if (!s || !username || !password) return -1;
+    const char *sql = "SELECT pass_hash, pass_salt, role FROM users "
+                      "WHERE username = ? AND enabled = 1;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    int result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 0);
+        const char *salt_hex = (const char *)sqlite3_column_text(stmt, 1);
+        int role = sqlite3_column_int(stmt, 2);
+        unsigned char salt[PW_SALT_LEN];
+        char calc_hex[PW_HASH_LEN * 2 + 1];
+        if (hash_hex && salt_hex &&
+            hex_to_bytes(salt_hex, salt, sizeof(salt)) == PW_SALT_LEN &&
+            pw_hash_hex(password, salt, calc_hex, sizeof(calc_hex)) == 0 &&
+            strlen(hash_hex) == strlen(calc_hex) &&
+            CRYPTO_memcmp(hash_hex, calc_hex, strlen(calc_hex)) == 0) {
+            if (claims_out) {
+                strncpy(claims_out->user_id, username, sizeof(claims_out->user_id) - 1);
+                claims_out->user_id[sizeof(claims_out->user_id) - 1] = '\0';
+                claims_out->role = (AuthRole)role;
+                claims_out->exp = 0;
+            }
+            result = 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* Удаляет учётку по логину. */
+int auth_user_delete(AuthStore *s, const char *username) {
+    if (!s || !username) return -1;
+    const char *sql = "DELETE FROM users WHERE username = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(s->db);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+    return changes > 0 ? 0 : -1;
 }
 
 /* Закрывает соединение с БД и освобождает хранилище. */

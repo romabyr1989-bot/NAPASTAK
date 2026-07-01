@@ -1,6 +1,6 @@
 # Oracle connector (`oracle_connector.so`)
 
-Reads data from **Oracle Database** into DataFlow OS via **ODPI-C** (Oracle
+Reads data from **Oracle Database** into NAPASTAK via **ODPI-C** (Oracle
 Database Programming Interface for C — a thin wrapper over OCI). Mirrors the
 two read modes of the [pg connector](../pg/) (OFFSET pagination / incremental
 high-watermark on `cursor_column`) with Oracle-version-aware SQL.

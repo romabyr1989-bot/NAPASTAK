@@ -102,22 +102,25 @@ TOKEN=$(echo "$BODY" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 check "admin auth in cluster mode returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 AUTH="Authorization: Bearer $TOKEN"
 
-# Create a table via gateway
-RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/tables/query" \
-    -H "Content-Type: application/json" \
-    -H "$AUTH" \
-    -d '{"sql":"CREATE TABLE repl_test (id TEXT, payload TEXT)"}')
-HTTP_CODE=$(echo "$RESP" | tail -1)
+# Create the table via CSV ingest. NAPASTAK does not support SQL CREATE TABLE /
+# INSERT ... VALUES via /api/tables/query — tables come alive through the CSV
+# ingest endpoint (same convention as test_rbac.sh / test_txn.sh). Seed one row
+# so the (id,payload) schema is inferred.
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$BASE/api/ingest/csv?table=repl_test" \
+    -H "$AUTH" -H 'Content-Type: text/csv' \
+    --data-binary $'id,payload\nr0,data_0\n')
 check "CREATE TABLE repl_test via gateway (cluster mode)" \
     "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 
-# INSERT rows via gateway
+# Append rows via CSV ingest (INSERT ... VALUES is likewise unsupported by the
+# gateway SQL engine). Each ingest re-sends the header plus one data row; the
+# endpoint appends to the existing table.
 for i in 1 2 3; do
-    RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/tables/query" \
-        -H "Content-Type: application/json" \
-        -H "$AUTH" \
-        -d "{\"sql\":\"INSERT INTO repl_test VALUES ('r$i', 'data_$i')\"}")
-    HTTP_CODE=$(echo "$RESP" | tail -1)
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+        "$BASE/api/ingest/csv?table=repl_test" \
+        -H "$AUTH" -H 'Content-Type: text/csv' \
+        --data-binary "$(printf 'id,payload\nr%d,data_%d\n' "$i" "$i")")
     check "INSERT row $i into repl_test" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 done
 

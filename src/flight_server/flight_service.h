@@ -1,4 +1,4 @@
-/* flight_service.h — Arrow Flight service that bridges to the DataFlow OS
+/* flight_service.h — Arrow Flight service that bridges to the NAPASTAK
  * gateway over HTTP. Implements a minimal subset of the Flight protocol:
  *
  *   ListFlights     — enumerate tables as flights
@@ -21,7 +21,7 @@
 namespace dfo {
 
 /* Реализация Arrow Flight-сервера, проксирующего запросы в HTTP-gateway
- * DataFlow OS. Каждый Flight-вызов транслируется в обращение к /api,
+ * NAPASTAK. Каждый Flight-вызов транслируется в обращение к /api,
  * а ответ конвертируется в Arrow-структуры. */
 class DfoFlightService : public arrow::flight::FlightServerBase {
 public:

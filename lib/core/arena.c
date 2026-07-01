@@ -39,9 +39,15 @@ void *arena_alloc(Arena *a, size_t sz) {
     if (!sz) sz = 1;
     sz = align_up(sz, ARENA_ALIGN);
     ArenaBlock *b = a->top;
-    if (b && b->used + sz <= b->cap) {
-        /* Быстрый путь: просто сдвигаем указатель внутри текущего блока. */
-        void *p = b->data + b->used; b->used += sz; a->total_allocated += sz; return p;
+    if (b) {
+        /* Выравниваем возвращаемый АДРЕС, а не только размер: b->data не кратен
+         * ARENA_ALIGN (заголовок блока — 24 байта на 64-битных платформах), поэтому
+         * выравнивание одного лишь размера давало адреса, кратные 8, но не 16. */
+        size_t off = (size_t)(align_up((uintptr_t)b->data + b->used, ARENA_ALIGN) - (uintptr_t)b->data);
+        if (off + sz <= b->cap) {
+            /* Быстрый путь: просто сдвигаем указатель внутри текущего блока. */
+            void *p = b->data + off; b->used = off + sz; a->total_allocated += sz; return p;
+        }
     }
     /* Текущий блок переполнен — фиксируем потери и выделяем новый.
      * total_wasted помогает диагностировать слишком маленький начальный размер. */
@@ -49,10 +55,12 @@ void *arena_alloc(Arena *a, size_t sz) {
     /* Если запрос больше стандартного блока — выделяем блок с удвоенным запасом,
      * чтобы следующее выделение тоже поместилось без нового malloc. */
     size_t cap = sz > ARENA_DEFAULT_BLOCK ? sz * 2 : ARENA_DEFAULT_BLOCK;
+    cap += ARENA_ALIGN;   /* запас на выравнивание nb->data (заголовок не кратен ARENA_ALIGN) */
     ArenaBlock *nb = block_new(cap, b);
     if (!nb) return NULL;
-    a->top = nb; nb->used = sz; a->total_allocated += sz;
-    return nb->data;
+    size_t off = (size_t)(align_up((uintptr_t)nb->data, ARENA_ALIGN) - (uintptr_t)nb->data);
+    a->top = nb; nb->used = off + sz; a->total_allocated += sz;
+    return nb->data + off;
 }
 
 void *arena_calloc(Arena *a, size_t sz) {

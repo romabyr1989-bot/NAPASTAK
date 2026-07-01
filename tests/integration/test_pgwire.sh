@@ -42,7 +42,7 @@ check "SELECT 1 returns 1"                 "[[ '$RESP' == '1' ]]"
 
 # 2. version()
 RESP=$(PGPASSWORD=admin $PSQL "SELECT version()" 2>&1)
-check "version() mentions DataFlow OS"     "[[ '$RESP' == *DataFlow* ]]"
+check "version() mentions NAPASTAK"     "[[ '$RESP' == *NAPASTAK* ]]"
 
 # 3. current_database / current_user
 RESP=$(PGPASSWORD=admin $PSQL "SELECT current_database()" 2>&1)
@@ -52,7 +52,7 @@ check "current_user returns admin"         "[[ '$RESP' == 'admin' ]]"
 
 # 4. SHOW server_version
 RESP=$(PGPASSWORD=admin $PSQL "SHOW server_version" 2>&1)
-check "SHOW server_version works"          "[[ '$RESP' == *DataFlow* ]]"
+check "SHOW server_version works"          "[[ '$RESP' == *NAPASTAK* ]]"
 
 # 5. Multiple constants
 RESP=$(PGPASSWORD=admin $PSQL "SELECT 42" 2>&1)

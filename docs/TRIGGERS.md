@@ -1,6 +1,6 @@
 # Pipeline Triggers
 
-DataFlow OS pipelines fire from any combination of these triggers. A
+NAPASTAK pipelines fire from any combination of these triggers. A
 single pipeline can have up to 8 triggers — they're OR-ed (any one fires
 the pipeline).
 

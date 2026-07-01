@@ -1,7 +1,7 @@
-# DataFlow OS — Airbyte Connector Runner
+# NAPASTAK — Airbyte Connector Runner
 
 `lib/connector/plugins/airbyte/airbyte_runner.c` ships as `airbyte_connector.so`
-and lets DataFlow OS run **any** Airbyte source image as a pipeline data source —
+and lets NAPASTAK run **any** Airbyte source image as a pipeline data source —
 PostgreSQL, Stripe, HubSpot, Salesforce, GitHub, Slack, Notion, and ~600 others.
 
 The runner shells out to `docker run` (or `podman run`) for each of the four

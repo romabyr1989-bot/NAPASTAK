@@ -1,4 +1,4 @@
-# DataFlow OS — build system
+# NAPASTAK — build system
 CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic \
            -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fPIC \

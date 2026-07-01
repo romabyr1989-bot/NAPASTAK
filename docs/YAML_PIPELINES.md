@@ -1,6 +1,6 @@
 # YAML pipelines + GitOps
 
-DataFlow OS pipelines can be authored as YAML files and auto-loaded from a
+NAPASTAK pipelines can be authored as YAML files and auto-loaded from a
 directory on the gateway host. Combined with `git`, this enables a GitOps
 workflow: pipelines live in version control; the gateway picks up changes
 on restart.

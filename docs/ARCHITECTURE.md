@@ -1,4 +1,4 @@
-# DataFlow OS — Architecture
+# NAPASTAK — Architecture
 
 ## Process model
 

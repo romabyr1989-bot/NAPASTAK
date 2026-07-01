@@ -392,7 +392,7 @@ static Expr *parse_primary(Lexer *l) {
     lex_consume(l);
 
     switch (t.type) {
-        case TK_NUM_INT:   e->type=EXPR_LITERAL_INT; e->ival=t.ival; return e;
+        case TK_NUM_INT:   e->type=EXPR_LITERAL_INT; e->ival=t.ival; e->litstr=arena_strndup(l->a,t.start,t.len); return e;
         case TK_NUM_FLOAT: e->type=EXPR_LITERAL_FLOAT; e->fval=t.fval; return e;
         case TK_STRING:    e->type=EXPR_LITERAL_STR; e->sval=arena_strndup(l->a,t.start,t.len); return e;
         case TK_NULL:      e->type=EXPR_LITERAL_NULL; return e;

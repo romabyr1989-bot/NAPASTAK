@@ -1,5 +1,5 @@
 /*
- * qengine.c — векторизованный (батчевый) исполнитель запросов DataFlow OS.
+ * qengine.c — векторизованный (батчевый) исполнитель запросов NAPASTAK.
  *
  * Содержит: вычислитель выражений (eval_expr/eval_bool) со строковыми и
  * fuzzy-match builtin'ами для MDM (levenshtein/jaro_winkler/normalize_*),

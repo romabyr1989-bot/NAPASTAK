@@ -771,11 +771,49 @@ body {
 
 /* Конвейеры: высота блока ФИКСИРОВАНА так, чтобы 10 блоков заполняли всю область
  * (--pipe-row-h вычисляется в JS под высоту окна). Размер блока не меняется; когда
- * блоков больше 10 — они переполняют область и включается скролл. */
-#pipelines-list .pipeline-item {
+ * блоков больше 10 — они переполняют область и включается скролл.
+ * Та же высота применяется к плашкам витрин и аналитики — единый размер везде. */
+#pipelines-list .pipeline-item,
+#matviews-list .pipeline-item,
+#an-saved-list .pipeline-item,
+#metrics-pipelines-list .pipeline-item,
+#metrics-matviews-list .pipeline-item {
   height: var(--pipe-row-h, auto);
   overflow: hidden;
+  flex-shrink: 0;   /* не сжиматься в flex-колонке списка: лишнее уходит в прокрутку, карточки не плющит */
 }
+
+/* ── Управление пагинацией всегда у нижней кромки страницы ──
+ * Каждый список — flex-колонка; JS (sizeListRows) растягивает его min-height до низа
+ * панели по геометрии, а .pager с margin-top:auto прижимается к нижней кромке. Трогаем
+ * ТОЛЬКО контейнеры списков (не разделы), поэтому многоэкранные формы — Аналитика,
+ * Безопасность — не ломаются. Карточки — фикс. высота (--pipe-row-h, flex-shrink:0);
+ * при переполнении список растёт и прокручивается общий #main. */
+#pipelines-list,
+#matviews-list,
+#metrics-pipelines-list,
+#metrics-matviews-list,
+#an-saved-list,
+#audit-log-list { display: flex; flex-direction: column; }
+#pipelines-list > .pager,
+#matviews-list > .pager,
+#metrics-pipelines-list > .pager,
+#metrics-matviews-list > .pager,
+#an-saved-list > .pager,
+#audit-log-list > .pager { margin-top: auto; }
+#audit-log-list > table { flex-shrink: 0; }
+
+/* Вкладки в «Метриках»: Конвейеры / Витрины */
+.metrics-tabs { display: flex; gap: .25rem; margin: 1.75rem 0 1rem; border-bottom: 1px solid var(--border); }
+.metrics-tab {
+  background: none; border: none; cursor: pointer;
+  font-size: 1.02rem; font-weight: 600; color: var(--muted);
+  padding: .5rem .9rem; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  transition: color .15s;
+}
+.metrics-tab:hover { color: var(--text); }
+.metrics-tab.active { color: var(--text); border-bottom-color: var(--accent, #5b6ef5); }
+.metrics-tab-sum { font-size: .72rem; color: var(--muted); font-weight: 400; margin-left: .4rem; }
 
 /* «+ Конвейер» ровно над «▶ Запустить»: одинаковые ширины колонок и отступы +
  * правый отступ тулбара под внутренний padding карточки (.8rem), иначе кнопки
@@ -784,6 +822,20 @@ body {
 #view-pipelines h1 { gap: .4rem; padding-right: .8rem; }
 #view-pipelines h1 > .btn:nth-child(1) { width: 116px; min-width: 116px; justify-content: center; }
 #view-pipelines h1 > .btn:nth-child(2) { width: 138px; min-width: 138px; justify-content: center; }
+/* Витрины: верхние кнопки выровнены по кнопкам действий в карточках.
+ * «+ Витрина» = ширине карточной «Обновить» (116px) и стоит ровно над ней;
+ * «Обновить все» = «Изменить»+зазор+«✕» (116+.4rem+36); зазор и правый отступ
+ * повторяют карточку — правый край ряда совпадает с «✕». */
+#view-matviews h1 { gap: .4rem; padding-right: .8rem; box-sizing: border-box; }
+#view-matviews h1 > .btn { height: 32px; box-sizing: border-box; flex: none; justify-content: center; align-items: center; }
+#view-matviews h1 > .btn:nth-child(1) { width: 116px;   min-width: 116px; }
+#view-matviews h1 > .btn:nth-child(2) { width: 158.4px; min-width: 158.4px; }
+/* Витрины: кнопки действий на карточках — «Обновить» и «Изменить» одной ширины И высоты (как у Конвейеров). */
+#matviews-list .pipeline-actions { gap: .4rem; }
+#matviews-list .pipeline-actions > .btn { height: 32px; box-sizing: border-box; align-items: center; }
+#matviews-list .pipeline-actions > .btn:nth-child(1) { width: 116px; min-width: 116px; justify-content: center; }
+#matviews-list .pipeline-actions > .btn:nth-child(2) { width: 116px; min-width: 116px; justify-content: center; }
+#matviews-list .pipeline-actions > .btn:nth-child(3) { width: 36px;  min-width: 36px;  padding-left: 0; padding-right: 0; justify-content: center; }
 #pipelines-list .pipeline-actions { gap: .4rem; }
 #pipelines-list .pipeline-actions > .btn:nth-child(1) { width: 116px; min-width: 116px; justify-content: center; }
 #pipelines-list .pipeline-actions > .btn:nth-child(2) { width: 96px;  min-width: 96px;  justify-content: center; }

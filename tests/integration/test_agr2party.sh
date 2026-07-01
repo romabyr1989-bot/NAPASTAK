@@ -68,7 +68,7 @@ curl -sf -X POST "$GW/api/ingest/csv?table=crm_key_updates" "${AUTH[@]}" -H 'Con
 
 # ── 3. Run agr2party ──
 PID=$(curl -sf "$GW/api/pipelines" "${AUTH[@]}" | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin) if p['name']=='agr2party']" | head -1)
-curl -sf -X POST "$GW/api/pipelines/$PID/run" "${AUTH[@]}" >/dev/null
+curl -sf -X POST "$GW/api/pipelines/$PID/run?wait=true" "${AUTH[@]}" >/dev/null
 
 check "agr2party: agreement2party created (rows > 0)" \
   "[[ \"\$(qval 'SELECT count(*) FROM agreements_agreement2party')\" -gt 0 ]]"

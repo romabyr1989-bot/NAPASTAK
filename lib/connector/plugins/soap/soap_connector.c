@@ -1,4 +1,4 @@
-/* soap_connector.c — SOAP/EAI коннектор DataFlow OS (источник + приёмник).
+/* soap_connector.c — SOAP/EAI коннектор NAPASTAK (источник + приёмник).
  *
  * SOAP = XML-конверт поверх HTTP POST. Этот коннектор:
  *

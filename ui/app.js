@@ -1,4 +1,4 @@
-/* DataFlow OS — frontend application */
+/* NAPASTAK — frontend application */
 'use strict';
 
 /* ═══════════════════════════════════════════════════
@@ -12,8 +12,32 @@ let analyticsState = { tables: [], currentRows: [], currentCols: [], charts: [] 
 let lastStatsReport = null;
 
 /* Auth */
-let jwtToken = sessionStorage.getItem('dfo_jwt') || null;
+/* Токен в localStorage — переживает закрытие браузера, чтобы не логиниться каждый раз
+ * (sessionStorage очищался при закрытии вкладки). Протухший токен сбрасываем ниже. */
+let jwtToken = localStorage.getItem('dfo_jwt') || null;
 let isLoggedIn = !!jwtToken;
+
+/* Текущий пользователь из JWT (payload {sub, role}). Единственный админ — встроенный 'admin'. */
+function parseJwt(t) {
+  try {
+    let p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (p.length % 4) p += '=';
+    return JSON.parse(decodeURIComponent(atob(p).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')));
+  } catch (_) { return null; }
+}
+let currentUser = jwtToken ? parseJwt(jwtToken) : null;
+/* Просроченный токен → сбрасываем сразу (иначе мигнёт «вошёл» и тут же 401). */
+if (currentUser && currentUser.exp && currentUser.exp * 1000 < Date.now()) {
+  jwtToken = null; currentUser = null; isLoggedIn = false;
+  try { localStorage.removeItem('dfo_jwt'); } catch (_) {}
+}
+function userIsAdmin() { return !!currentUser && currentUser.sub === 'admin'; }
+
+/* Раздел «Администрирование» доступен только пользователю admin — прячем пункт меню остальным. */
+function applyRoleVisibility() {
+  const adm = document.querySelector('.nav-item[data-view="admin"]');
+  if (adm) adm.style.display = userIsAdmin() ? '' : 'none';
+}
 
 /* Pipeline builder */
 const pb = { steps: [], editId: null, max_retries: 3, retry_delay_sec: 30, webhook_url: '', webhook_on: 'failure' };
@@ -65,6 +89,10 @@ const ADMIN_TABS  = ['settings','security'];   /* grouped under «Админис
 let _adminTab = 'settings';                    /* какая вкладка открывается при входе */
 
 function switchView(name, { pushState = true } = {}) {
+  /* Администрирование (Настройки/Безопасность) — только для встроенного admin. */
+  if ((name === 'admin' || name === 'settings' || name === 'security') && !userIsAdmin()) {
+    name = 'pipelines';
+  }
   if (name === 'admin') name = ADMIN_TABS[0];    /* клик по «Администрирование» → всегда первая вкладка (Настройки) */
   if (!VALID_VIEWS.has(name)) name = 'pipelines';
   const isAdmin = ADMIN_TABS.includes(name);
@@ -108,7 +136,7 @@ function switchView(name, { pushState = true } = {}) {
 function restoreSecTab() {
   let st;
   try { st = localStorage.getItem('dfo_sec_tab'); } catch (_) {}
-  switchSecTab(['rbac', 'audit', 'apikeys'].includes(st) ? st : 'rbac');
+  switchSecTab(['users', 'rbac', 'audit', 'apikeys'].includes(st) ? st : 'users');
 }
 
 /* Pipelines view now also hosts the tables panel (formerly a separate view). */
@@ -161,6 +189,7 @@ function handleWsEvent(msg) {
 
 function setBadge(cls, text) {
   const el = document.getElementById('ws-status');
+  if (!el) return;   /* индикатор заменён кнопкой выхода — тихо пропускаем */
   el.className   = 'badge badge-' + cls;
   el.textContent = text;
 }
@@ -738,25 +767,44 @@ async function applyYaml() {
 ═══════════════════════════════════════════════════ */
 let _pipelinesPerPage = 10;   /* 10 блоков на странице по умолчанию (Infinity = «Все») */
 
-/* Фиксируем высоту блока так, чтобы РОВНО 10 блоков заполняли область панели.
- * Размер блока не зависит от их числа: 10 → заполняют без скролла, больше → скролл. */
-function pipelinesSizeRows() {
+/* Растягивает контейнер списка до нижней кромки панели (min-height по геометрии), чтобы
+ * .pager с margin-top:auto всегда был внизу страницы — на ЛЮБОЙ форме, включая
+ * многоэкранные (Аналитика/Безопасность): трогаем ТОЛЬКО сам список, а не раздел,
+ * поэтому соседние формы не ломаются. Для списков карточек (cards!==false) заодно
+ * подбираем высоту строки так, чтобы РОВНО 10 умещались без скролла; при переполнении
+ * список растёт и прокручивается общий #main. */
+function sizeListRows(listId, opts) {
+  const sizeCards = !opts || opts.cards !== false;
+  const list = document.getElementById(listId);
+  if (!list || list.offsetParent === null) return;   /* нет в DOM или скрыт (display:none) */
   const main = document.getElementById('main');
-  const list = document.getElementById('pipelines-list');
-  const view = document.getElementById('view-pipelines');
-  if (!main || !list || !view || !view.classList.contains('active')) return;
-  const rows = list.querySelectorAll('.pipeline-item');
-  if (!rows.length) return;
-  const cs    = getComputedStyle(main);
-  const usable = main.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
-  const h1    = view.querySelector('h1');
-  const toolbarH = h1 ? h1.offsetHeight + parseFloat(getComputedStyle(h1).marginBottom || 0) : 0;
-  const pager = list.querySelector('.pager');
-  const pagerH = pager ? pager.offsetHeight + 12 : 0;
-  const rowMargin = parseFloat(getComputedStyle(rows[0]).marginBottom || 0) || 0;
-  const rowH = Math.max(44, Math.floor((usable - toolbarH - pagerH) / 10) - rowMargin);
-  list.style.setProperty('--pipe-row-h', rowH + 'px');
+  if (!main) return;
+  const mainRect  = main.getBoundingClientRect();
+  const padBottom = parseFloat(getComputedStyle(main).paddingBottom) || 0;
+  /* Свободная высота от верха списка до нижней кромки панели (внутри её padding). */
+  const avail = Math.floor((mainRect.bottom - padBottom) - list.getBoundingClientRect().top);
+  if (avail <= 0) return;
+  list.style.minHeight = avail + 'px';               /* прижать пагинатор к низу */
+  if (sizeCards) {
+    const pager  = list.querySelector('.pager');
+    const pagerH = pager ? pager.offsetHeight + 12 : 0;
+    const row    = list.querySelector('.pipeline-item');
+    const rowMargin = row ? (parseFloat(getComputedStyle(row).marginBottom) || 0) : 6;
+    const rowH = Math.max(44, Math.floor((avail - pagerH) / 10) - rowMargin);
+    document.documentElement.style.setProperty('--pipe-row-h', rowH + 'px');
+  }
 }
+
+/* Пересчёт для активной формы (ресайз/переключение). Скрытые отсеются по offsetParent,
+ * видимый список выставит min-height (и высоту строк) под свою область. */
+function sizeActiveList() {
+  ['pipelines-list', 'metrics-pipelines-list', 'metrics-matviews-list', 'matviews-list', 'an-saved-list']
+    .forEach(id => sizeListRows(id));
+  sizeListRows('audit-log-list', { cards: false });   /* аудит — таблица, высоту строк не трогаем */
+}
+
+/* Совместимость со старым именем вызова. */
+function pipelinesSizeRows() { sizeListRows('pipelines-list'); }
 let _pipelinesAll = [];
 let _pipelinesPage = 0;
 
@@ -841,7 +889,7 @@ function pipelinesSetPerPage(v) {
 let _pipResizeT;
 window.addEventListener('resize', () => {
   clearTimeout(_pipResizeT);
-  _pipResizeT = setTimeout(pipelinesSizeRows, 120);
+  _pipResizeT = setTimeout(sizeActiveList, 120);
 });
 
 const STATUS_LABELS = ['ожидание','выполняется','успех','ошибка','отменён'];
@@ -2910,6 +2958,17 @@ function metricMvCardHTML(v) {
   </div>`;
 }
 
+/* Переключение вкладок в «Метриках»: Конвейеры / Витрины. */
+function metricsTab(name) {
+  const pipes = name === 'pipelines';
+  document.getElementById('metrics-tab-pipelines').style.display = pipes ? '' : 'none';
+  document.getElementById('metrics-tab-matviews').style.display  = pipes ? 'none' : '';
+  document.getElementById('mtab-pipelines').classList.toggle('active', pipes);
+  document.getElementById('mtab-matviews').classList.toggle('active', !pipes);
+  /* Показанный список только теперь получил высоту — пересчитать под 10 без скролла. */
+  sizeListRows(pipes ? 'metrics-pipelines-list' : 'metrics-matviews-list');
+}
+
 function renderMetricsPipes() {
   const list = document.getElementById('metrics-pipelines-list');
   if (!list) return;
@@ -2924,6 +2983,7 @@ function renderMetricsPipes() {
   const slice = all ? _mPipesAll : _mPipesAll.slice(start, end);
   list.innerHTML = slice.map(metricPipeCardHTML).join('') +
     metricsPagerHTML(total, start, end, pages, _mPipesPage, all, perPage, 'mPipesGoPage', 'mPipesSetPerPage');
+  sizeListRows('metrics-pipelines-list');
 }
 function mPipesGoPage(p)     { _mPipesPage = p; renderMetricsPipes(); }
 function mPipesSetPerPage(v) { _mPipesPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _mPipesPage = 0; renderMetricsPipes(); }
@@ -2942,6 +3002,7 @@ function renderMetricsMv() {
   const slice = all ? _mMvAll : _mMvAll.slice(start, end);
   list.innerHTML = slice.map(metricMvCardHTML).join('') +
     metricsPagerHTML(total, start, end, pages, _mMvPage, all, perPage, 'mMvGoPage', 'mMvSetPerPage');
+  sizeListRows('metrics-matviews-list');
 }
 function mMvGoPage(p)     { _mMvPage = p; renderMetricsMv(); }
 function mMvSetPerPage(v) { _mMvPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _mMvPage = 0; renderMetricsMv(); }
@@ -3125,6 +3186,8 @@ function showAnScreen(screen) {
   document.getElementById('an-list-screen').style.display   = screen === 'list'   ? '' : 'none';
   document.getElementById('an-view-screen').style.display   = screen === 'view'   ? '' : 'none';
   document.getElementById('an-editor-screen').style.display = screen === 'editor' ? '' : 'none';
+  /* при возврате к списку пересчитать min-height, чтобы пагинатор встал внизу */
+  if (screen === 'list') sizeListRows('an-saved-list');
 }
 
 function openNewAnalytics() {
@@ -4709,7 +4772,7 @@ async function loadApiKeys() {
   try {
     const keys = await apiFetch('/api/auth/apikeys');
     if (!Array.isArray(keys) || !keys.length) {
-      el.innerHTML = '<div class="settings-loading">Ключей нет</div>';
+      el.innerHTML = '';
       return;
     }
     const roleLabel = { admin: 'admin', analyst: 'analyst', viewer: 'viewer' };
@@ -4770,34 +4833,60 @@ async function loadSettings() {
 }
 
 /* ── Saved Results ── */
+let _anSavedAll = [], _anSavedPage = 0, _anSavedPerPage = 10;
+
 async function loadSavedResults() {
   try {
     const list = await apiGet('/api/analytics/results');
     const el = document.getElementById('an-saved-list');
     if (!el) return;
-    if (!list.length) {
+    _anSavedAll = Array.isArray(list) ? list : [];
+    if (!_anSavedAll.length) {
       el.innerHTML = '<div class="empty-state">Нет сохранённых результатов.<br>Нажмите «+ Добавить аналитику» чтобы создать первый анализ.</div>';
       return;
     }
-    el.innerHTML = list.map(r => {
-      const cols = Array.isArray(r.columns_json) ? r.columns_json
-        : (r.columns_json ? JSON.parse(r.columns_json) : []);
-      const pills = cols.map(c => `<span class="step-badge">${escHtml(c)}</span>`).join('');
-      return `<div class="pipeline-item pipeline-item-clickable" id="sr_${r.id}" onclick="openSavedResult(${r.id})">
-        <div style="flex:1;min-width:0">
-          <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
-            <span class="pipeline-name">${escHtml(r.name)}</span>
-          </div>
-          <div class="pipeline-meta">${r.row_count} строк · ${new Date(r.created_at*1000).toLocaleDateString('ru')}</div>
-          ${pills ? `<div class="step-list">${pills}</div>` : ''}
-        </div>
-        <div class="pipeline-actions">
-          <button class="btn btn-sm btn-danger" title="Удалить" onclick="event.stopPropagation();deleteSavedResult(${r.id})">✕</button>
-        </div>
-      </div>`;
-    }).join('');
+    _anSavedPage = 0;
+    renderAnSavedPage();
   } catch(e) { console.error('loadSavedResults', e); }
 }
+
+function anSavedCardHTML(r) {
+  const cols = Array.isArray(r.columns_json) ? r.columns_json
+    : (r.columns_json ? JSON.parse(r.columns_json) : []);
+  const pills = cols.map(c => `<span class="step-badge">${escHtml(c)}</span>`).join('');
+  return `<div class="pipeline-item pipeline-item-clickable" id="sr_${r.id}" onclick="openSavedResult(${r.id})">
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <span class="pipeline-name">${escHtml(r.name)}</span>
+      </div>
+      <div class="pipeline-meta">${r.row_count} строк · ${new Date(r.created_at*1000).toLocaleDateString('ru')}</div>
+      ${pills ? `<div class="step-list">${pills}</div>` : ''}
+    </div>
+    <div class="pipeline-actions">
+      <button class="btn btn-sm btn-danger" title="Удалить" onclick="event.stopPropagation();deleteSavedResult(${r.id})">✕</button>
+    </div>
+  </div>`;
+}
+
+/* Пагинация сохранённой аналитики — как у конвейеров/витрин: 10 на странице по умолчанию. */
+function renderAnSavedPage() {
+  const el = document.getElementById('an-saved-list');
+  if (!el) return;
+  const total   = _anSavedAll.length;
+  const perPage = _anSavedPerPage;
+  const all     = perPage === Infinity;
+  const pages   = all ? 1 : Math.max(1, Math.ceil(total / perPage));
+  if (_anSavedPage > pages - 1) _anSavedPage = pages - 1;
+  if (_anSavedPage < 0) _anSavedPage = 0;
+  const start = all ? 0 : _anSavedPage * perPage;
+  const end   = all ? total : Math.min(start + perPage, total);
+  const slice = all ? _anSavedAll : _anSavedAll.slice(start, end);
+  el.innerHTML = slice.map(anSavedCardHTML).join('') +
+    metricsPagerHTML(total, start, end, pages, _anSavedPage, all, perPage, 'anSavedGoPage', 'anSavedSetPerPage');
+  sizeListRows('an-saved-list');
+}
+function anSavedGoPage(p)     { _anSavedPage = p; renderAnSavedPage(); }
+function anSavedSetPerPage(v) { _anSavedPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _anSavedPage = 0; renderAnSavedPage(); }
 
 function saveAnalyticsResult() {
   if (!analyticsState.currentRows.length) return;
@@ -5066,7 +5155,8 @@ async function login(username, password) {
     if (!resp.ok) throw new Error('Invalid credentials');
     const data = await resp.json();
     jwtToken = data.token;
-    sessionStorage.setItem('dfo_jwt', jwtToken);
+    currentUser = parseJwt(jwtToken);
+    localStorage.setItem('dfo_jwt', jwtToken);
     isLoggedIn = true;
     hideLogin();
     initApp();
@@ -5077,7 +5167,8 @@ async function login(username, password) {
 
 function logout() {
   jwtToken = null;
-  sessionStorage.removeItem('dfo_jwt');
+  currentUser = null;
+  localStorage.removeItem('dfo_jwt');
   isLoggedIn = false;
   showLogin();
 }
@@ -5096,6 +5187,7 @@ function initApp() {
   loadPrefs();
   applyPrefs();
   applyPrefsToSettingsForm();
+  applyRoleVisibility();   /* скрыть «Администрирование» не-admin пользователям */
 
   const { view, id } = parseHash();
 
@@ -5156,13 +5248,7 @@ async function loadMatviews() {
     const list = await apiFetch('/api/matviews');
     _mvList = list || [];
     if (!_mvList.length) {
-      el.innerHTML = `
-        <div class="empty-state">
-          Витрин пока нет.<br>
-          <button class="btn btn-primary" style="margin-top:.75rem" onclick="openCreateMatview()">
-            + Создать первую витрину
-          </button>
-        </div>`;
+      el.innerHTML = '<div class="empty-state">Витрин пока нет.</div>';
       return;
     }
     _mvPage = 0;
@@ -5203,6 +5289,7 @@ function renderMatviewsPage() {
        </label>`;
     el.appendChild(nav);
   }
+  sizeListRows('matviews-list');
 }
 
 function mvGoPage(p) {
@@ -5426,14 +5513,93 @@ function rbacActionsLabel(mask) {
 }
 
 function switchSecTab(tab) {
-  ['rbac','audit','apikeys'].forEach(t => {
+  ['users','rbac','audit','apikeys'].forEach(t => {
     document.getElementById(`sec-tab-${t}`).classList.toggle('active', t === tab);
     document.getElementById(`sec-pane-${t}`).style.display = t === tab ? '' : 'none';
   });
   try { localStorage.setItem('dfo_sec_tab', tab); } catch (_) {}
-  if (tab === 'audit')        loadAuditLog();
+  if (tab === 'users')        loadUsers();
+  else if (tab === 'audit')   loadAuditLog();
   else if (tab === 'apikeys') loadApiKeys();
   else                        loadRbacPolicies();
+}
+
+/* ── Пользователи (учётки для входа) ── */
+async function loadUsers() {
+  const el = document.getElementById('settings-users-list');
+  if (!el) return;
+  try {
+    const users = await apiFetch('/api/auth/users');
+    if (!Array.isArray(users) || !users.length) {
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML = users.map(u => {
+      const created = u.created_at ? new Date(u.created_at * 1000).toLocaleString('ru') : '—';
+      return `
+        <div class="pipeline-item" id="urow-${escAttr(u.username)}">
+          <div style="flex:1;min-width:0">
+            <div class="pipeline-name">${escHtml(u.username || '—')}</div>
+            <div class="pipeline-meta">роль: ${escHtml(u.role || '—')} &nbsp;·&nbsp; создан: ${created}</div>
+          </div>
+          <div class="pipeline-actions">
+            <button class="btn btn-sm btn-danger" title="Удалить пользователя" onclick="deleteUser('${escAttr(u.username)}')">✕</button>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (err) {
+    el.innerHTML = `<div style="color:var(--red);padding:.5rem">Ошибка: ${escHtml(String(err))}</div>`;
+  }
+}
+
+/* Открыть/закрыть форму создания пользователя (как «+ Витрина»). */
+function openCreateUser() {
+  const f = document.getElementById('user-create-form');
+  if (!f) return;
+  const n = document.getElementById('new-user-name');
+  const p = document.getElementById('new-user-pass');
+  const r = document.getElementById('new-user-role');
+  if (n) n.value = '';
+  if (p) p.value = '';
+  if (r) r.value = 'analyst';
+  f.style.display = '';
+  if (n) n.focus();
+}
+function closeCreateUser() {
+  const f = document.getElementById('user-create-form');
+  if (f) f.style.display = 'none';
+}
+
+async function createUser() {
+  const nameEl = document.getElementById('new-user-name');
+  const passEl = document.getElementById('new-user-pass');
+  const roleEl = document.getElementById('new-user-role');
+  const username = (nameEl?.value || '').trim();
+  const password = passEl?.value || '';
+  const role     = roleEl?.value || 'analyst';
+  if (!username) { showToast('Введите логин', 'warn'); return; }
+  if (!password) { showToast('Введите пароль', 'warn'); return; }
+  try {
+    await apiPost('/api/auth/users', { username, password, role });
+    showToast(`Пользователь «${username}» заведён (роль: ${role})`, 'ok');
+    if (nameEl) nameEl.value = '';
+    if (passEl) passEl.value = '';
+    closeCreateUser();
+    loadUsers();
+  } catch (err) {
+    showToast(`Ошибка: ${err}`, 'error');
+  }
+}
+
+async function deleteUser(username) {
+  if (!confirm(`Удалить пользователя «${username}»?`)) return;
+  try {
+    await apiDelete(`/api/auth/users/${encodeURIComponent(username)}`);
+    showToast('Пользователь удалён', 'ok');
+    loadUsers();
+  } catch (err) {
+    showToast(`Ошибка: ${err}`, 'error');
+  }
 }
 
 /* ── RBAC ── */
@@ -5565,6 +5731,7 @@ function renderAuditFiltered() {
     </tr>`;
     }).join('')}</tbody></table>` +
     metricsPagerHTML(total, start, end, pages, _auditPage, all, perPage, 'auditGoPage', 'auditSetPerPage');
+  sizeListRows('audit-log-list', { cards: false });
 }
 
 /* ═══════════════════════════════════════════════════

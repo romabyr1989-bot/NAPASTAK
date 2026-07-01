@@ -1,5 +1,5 @@
 /*
- * storage.c — слой хранения DataFlow OS.
+ * storage.c — слой хранения NAPASTAK.
  *
  * Содержит три подсистемы:
  *   1. WAL — append-only журнал записи (вставки строк, тумбстоны DELETE/UPDATE),

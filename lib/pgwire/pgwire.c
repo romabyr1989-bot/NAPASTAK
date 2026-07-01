@@ -776,7 +776,7 @@ static void *connection_thread(void *arg) {
         send_param_status(c->fd, "client_encoding", "UTF8")      != 0 ||
         send_param_status(c->fd, "DateStyle",       "ISO, MDY")  != 0 ||
         send_param_status(c->fd, "TimeZone",        "UTC")       != 0 ||
-        send_param_status(c->fd, "server_version",  "16.0 (DataFlow OS)") != 0 ||
+        send_param_status(c->fd, "server_version",  "16.0 (NAPASTAK)") != 0 ||
         send_backend_key_data(c->fd, c->proc_id, c->secret_key)  != 0 ||
         send_ready_for_query(c->fd, 'I')                         != 0)
         goto done;

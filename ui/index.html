@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🐇 NAPASTAK</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=26">
 </head>
 <body>
 <div id="app">
@@ -12,7 +12,10 @@
   <!-- ── Login Screen ── -->
   <div id="login-screen" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); z-index: 1000; justify-content: center; align-items: center; flex-direction: column;">
     <div style="background: var(--card-bg, var(--surface)); padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.12); max-width: 400px; width: 100%;">
-      <h2 style="margin: 0 0 1rem 0; text-align: center;">🐇 NAPASTAK</h2>
+      <!-- Логотип на маленьком фоне армянского флага — только под зайчиком и надписью -->
+      <div style="text-align:center;margin:0 0 1.25rem">
+        <h2 style="margin:0;font-size:1.4rem;display:inline-flex;align-items:center;gap:.4rem;color:var(--text)"><span style="display:inline-block;padding:.15rem .3rem;border-radius:4px;background:linear-gradient(to bottom,#D90012 0 33.34%,#0033A0 33.34% 66.67%,#F2A800 66.67% 100%)">🐇</span>NAPASTAK</h2>
+      </div>
       <form id="login-form">
         <div style="margin-bottom: 1rem;">
           <label for="login-username" style="display: block; margin-bottom: 0.5rem;">Пользователь</label>
@@ -45,7 +48,7 @@
       <a class="nav-item"        data-view="admin"     href="#admin">Администрирование</a>
     </nav>
     <div class="sidebar-footer">
-      <span id="ws-status" class="badge badge-warn">подключение…</span>
+      <button class="btn btn-sm" style="width:100%;justify-content:center" onclick="logout()" title="Выйти из приложения">⎋ Выход</button>
     </div>
   </aside>
 
@@ -156,15 +159,21 @@
     <section id="view-metrics" class="view">
       <div class="stat-grid" id="metrics-detail"></div>
 
-      <h2 style="display:flex;align-items:center;gap:.75rem;margin-top:1.75rem">Конвейеры
-        <span id="metrics-pipelines-sum" style="font-size:.72rem;color:var(--muted);font-weight:400"></span>
-      </h2>
-      <div id="metrics-pipelines-list"></div>
+      <div class="metrics-tabs">
+        <button id="mtab-pipelines" class="metrics-tab active" onclick="metricsTab('pipelines')">Конвейеры
+          <span id="metrics-pipelines-sum" class="metrics-tab-sum"></span>
+        </button>
+        <button id="mtab-matviews" class="metrics-tab" onclick="metricsTab('matviews')">Витрины
+          <span id="metrics-matviews-sum" class="metrics-tab-sum"></span>
+        </button>
+      </div>
 
-      <h2 style="display:flex;align-items:center;gap:.75rem;margin-top:1.75rem">Витрины данных
-        <span id="metrics-matviews-sum" style="font-size:.72rem;color:var(--muted);font-weight:400"></span>
-      </h2>
-      <div id="metrics-matviews-list"></div>
+      <div id="metrics-tab-pipelines" class="metrics-tab-content">
+        <div id="metrics-pipelines-list"></div>
+      </div>
+      <div id="metrics-tab-matviews" class="metrics-tab-content" style="display:none">
+        <div id="metrics-matviews-list"></div>
+      </div>
     </section>
 
     <!-- ═══ Analytics ═══ -->
@@ -391,9 +400,9 @@
 
     <!-- ═══ Materialized Views ═══ -->
     <section id="view-matviews" class="view">
-      <h1 style="display:flex;justify-content:flex-end;gap:.5rem">
-        <button class="btn btn-primary btn-sm" style="min-width:136px;justify-content:center" onclick="openCreateMatview()" title="Создать новую витрину данных">+ Витрина</button>
-        <button class="btn btn-sm" style="min-width:136px;justify-content:center" onclick="refreshAllMatviews()" title="Пересчитать все витрины">⟳ Обновить все</button>
+      <h1 style="display:flex;justify-content:flex-end;align-items:center">
+        <button class="btn btn-primary btn-sm" style="justify-content:center" onclick="openCreateMatview()" title="Создать новую витрину данных">+ Витрина</button>
+        <button class="btn btn-sm" style="justify-content:center" onclick="refreshAllMatviews()" title="Пересчитать все витрины">⟳ Обновить все</button>
       </h1>
 
       <!-- Create/edit form — appears above the list -->
@@ -433,12 +442,47 @@
 
     <!-- ═══ Security (RBAC + Audit) ═══ -->
     <section id="view-security" class="view">
-      <h1>Безопасность</h1>
 
       <div class="ingest-tabs" id="security-tabs" style="margin-bottom:1rem">
-        <button class="ingest-tab active" id="sec-tab-rbac"    onclick="switchSecTab('rbac')">Политики RBAC</button>
+        <button class="ingest-tab active" id="sec-tab-users"   onclick="switchSecTab('users')">Пользователи</button>
+        <button class="ingest-tab"        id="sec-tab-rbac"    onclick="switchSecTab('rbac')">Политики RBAC</button>
         <button class="ingest-tab"        id="sec-tab-audit"   onclick="switchSecTab('audit')">Журнал аудита</button>
         <button class="ingest-tab"        id="sec-tab-apikeys" onclick="switchSecTab('apikeys')">API-ключи</button>
+      </div>
+
+      <!-- Users pane -->
+      <div id="sec-pane-users">
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end;padding-right:calc(1.25rem + 1px)">
+          <button class="btn btn-primary btn-sm" style="justify-content:center;width:216px" onclick="openCreateUser()">+ Завести пользователя</button>
+        </div>
+        <!-- Форма создания — открывается по кнопке, по умолчанию скрыта -->
+        <div id="user-create-form" class="builder-settings" style="display:none;margin-bottom:1rem">
+          <div class="builder-settings-row" style="align-items:flex-end">
+            <div class="bsr-field" style="flex:1 1 180px">
+              <label>Логин</label>
+              <input id="new-user-name" type="text" placeholder="например: ivanov" autocomplete="off">
+            </div>
+            <div class="bsr-field" style="flex:1 1 180px">
+              <label>Пароль</label>
+              <input id="new-user-pass" type="password" placeholder="пароль" autocomplete="new-password">
+            </div>
+            <div class="bsr-field" style="flex:1 1 150px">
+              <label>Роль</label>
+              <select id="new-user-role">
+                <option value="viewer">viewer</option>
+                <option value="analyst" selected>analyst</option>
+              </select>
+            </div>
+            <div class="bsr-field" style="flex:0 0 auto">
+              <label>&nbsp;</label>
+              <div style="display:flex;gap:.5rem">
+                <button class="btn btn-primary btn-sm" style="justify-content:center;min-width:104px" onclick="createUser()">Создать</button>
+                <button class="btn btn-sm" style="justify-content:center;min-width:104px" onclick="closeCreateUser()">Отмена</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="settings-users-list"><div class="settings-loading">Загрузка…</div></div>
       </div>
 
       <!-- RBAC pane -->
@@ -558,7 +602,6 @@
 
     <!-- ═══ Settings ═══ -->
     <section id="view-settings" class="view">
-      <h1>Настройки</h1>
 
       <h2>Отображение</h2>
       <div class="builder-settings">
@@ -674,7 +717,7 @@
 </div>
 
 <div id="toast-container"></div>
-<script src="app.js"></script>
+<script src="app.js?v=26"></script>
 
 <div id="save-result-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeSaveModal()">
   <div class="modal-box">

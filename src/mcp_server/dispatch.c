@@ -204,14 +204,14 @@ void mcp_handle_tools_list(JVal *id, JVal *params, Arena *a) {
     jb_arr_begin(&b);
 
     emit_tool(&b, "query",
-        "Execute SQL on DataFlow OS. Supports SELECT/INSERT/UPDATE/DELETE/"
+        "Execute SQL on NAPASTAK. Supports SELECT/INSERT/UPDATE/DELETE/"
         "BEGIN/COMMIT/ROLLBACK and aggregates with GROUP BY, JOIN, window functions. "
         "Returns rows + columns + duration_ms. RBAC applies based on the configured API key.",
         "{\"sql\":{\"type\":\"string\",\"description\":\"SQL statement to execute\"}}",
         "sql");
 
     emit_tool(&b, "list_tables",
-        "List all tables in DataFlow OS with metadata (row count, columns, source).",
+        "List all tables in NAPASTAK with metadata (row count, columns, source).",
         "{}", "");
 
     emit_tool(&b, "describe_table",

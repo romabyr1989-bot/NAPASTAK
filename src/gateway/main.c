@@ -1,4 +1,4 @@
-/* gateway/main.c — точка входа DataFlow OS.
+/* gateway/main.c — точка входа NAPASTAK.
  * Поднимает все подсистемы (catalog, auth, scheduler, matviews, кластер),
  * HTTP/HTTPS-сервер и опциональный PostgreSQL wire-протокол, обрабатывает
  * CLI-аргументы, конфиг и graceful-shutdown по сигналам. */
@@ -194,7 +194,7 @@ static void pg_query_cb(PgConn *conn, const char *sql, void *ud) {
     if (strcmp(norm, "show server_version") == 0) {
         PgColumn c[] = {{"server_version", PG_OID_TEXT, -1}};
         pgwire_send_row_description(conn, 1, c);
-        const char *row[] = {"16.0 (DataFlow OS)"};
+        const char *row[] = {"16.0 (NAPASTAK)"};
         pgwire_send_data_row(conn, 1, row);
         pgwire_send_command_complete(conn, "SHOW");
         return;
@@ -204,7 +204,7 @@ static void pg_query_cb(PgConn *conn, const char *sql, void *ud) {
     if (strcmp(norm, "select version()") == 0) {
         PgColumn c[] = {{"version", PG_OID_TEXT, -1}};
         pgwire_send_row_description(conn, 1, c);
-        const char *row[] = {"DataFlow OS 0.1 (PostgreSQL-compatible wire protocol)"};
+        const char *row[] = {"NAPASTAK 0.1 (PostgreSQL-compatible wire protocol)"};
         pgwire_send_data_row(conn, 1, row);
         pgwire_send_command_complete(conn, "SELECT 1");
         return;
@@ -376,7 +376,7 @@ void app_init(App *app, const char *config_json) {
         arena_destroy(lfa);
     }
     log_init(&g_log, stderr, LOG_INFO, json_mode);
-    LOG_INFO("DataFlow OS starting — data_dir=%s port=%d", app->data_dir, app->port);
+    LOG_INFO("NAPASTAK starting — data_dir=%s port=%d", app->data_dir, app->port);
 
     /* subsystems */
     app->catalog  = catalog_open(app->db_path);
@@ -587,7 +587,7 @@ void app_init(App *app, const char *config_json) {
 
 /* Блокирующий запуск: отдаёт управление циклу HTTP-сервера. */
 void app_run(App *app) {
-    LOG_INFO("DataFlow OS ready — http://localhost:%d", app->port);
+    LOG_INFO("NAPASTAK ready — http://localhost:%d", app->port);
     http_server_run(app->server);
 }
 
@@ -606,7 +606,7 @@ void app_stop(App *app) {
     audit_log_destroy(app->audit);
     rbac_store_destroy(app->rbac);
     catalog_close(app->catalog);
-    LOG_INFO("DataFlow OS stopped");
+    LOG_INFO("NAPASTAK stopped");
 }
 
 static volatile sig_atomic_t g_shutdown = 0;

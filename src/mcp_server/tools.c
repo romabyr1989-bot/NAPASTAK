@@ -417,7 +417,7 @@ void tool_get_metrics(JVal *args, char *out, size_t cap, int *is_err, Arena *a) 
     double    qlat    = json_dbl(json_get(m, "avg_query_latency_ms"), 0);
     double    plat    = json_dbl(json_get(m, "avg_pipeline_latency_ms"), 0);
     snprintf(out, cap,
-        "DataFlow OS metrics:\n"
+        "NAPASTAK metrics:\n"
         "- Uptime: %lldh %lldm\n"
         "- Total rows ingested: %lld\n"
         "- Queries run: %lld\n"

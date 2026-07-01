@@ -1,8 +1,8 @@
-# DataFlow OS — TLS/HTTPS Setup
+# NAPASTAK — TLS/HTTPS Setup
 
 ## Overview
 
-DataFlow OS now supports TLS/HTTPS encryption for secure client-server communication. TLS is implemented as a transparent wrapper over the existing TCP layer in `lib/net/http.c`, without modifying the core HTTP logic.
+NAPASTAK now supports TLS/HTTPS encryption for secure client-server communication. TLS is implemented as a transparent wrapper over the existing TCP layer in `lib/net/http.c`, without modifying the core HTTP logic.
 
 ## Quick Start
 

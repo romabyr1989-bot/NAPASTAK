@@ -1,5 +1,5 @@
 /*
- * connector.c — динамическая загрузка connector-плагинов DataFlow OS.
+ * connector.c — динамическая загрузка connector-плагинов NAPASTAK.
  * Открывает .so/.dylib через dlopen, валидирует ABI, создаёт и хранит
  * экземпляр коннектора (ConnectorInst) поверх таблицы функций DfoConnector.
  */

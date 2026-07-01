@@ -58,7 +58,7 @@ curl -sf -X POST "$GW/api/ingest/csv?table=cdi_id_doc" "${AUTH[@]}" -H 'Content-
   --data-binary $'source_id,person_source_id,category,src_number\nD1,S1,21,4500 123456\nD2,S2,21,4500 123456' >/dev/null
 
 PID=$(curl -sf "$GW/api/pipelines" "${AUTH[@]}" | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin) if p['name']=='mdc_pipeline']" | head -1)
-curl -sf -X POST "$GW/api/pipelines/$PID/run" "${AUTH[@]}" >/dev/null
+curl -sf -X POST "$GW/api/pipelines/$PID/run?wait=true" "${AUTH[@]}" >/dev/null
 
 # CLEAN
 check "clean: cio_last_name lowercased (S1 -> ivanov)" \

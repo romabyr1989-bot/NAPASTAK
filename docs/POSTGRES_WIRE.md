@@ -1,6 +1,6 @@
 # PostgreSQL wire-protocol server
 
-DataFlow OS speaks just enough of the [PostgreSQL v3 frontend/backend protocol](
+NAPASTAK speaks just enough of the [PostgreSQL v3 frontend/backend protocol](
 https://www.postgresql.org/docs/current/protocol.html) to let standard
 PostgreSQL clients connect — `psql`, JDBC, ODBC, psycopg2/3, asyncpg,
 dbt-postgres, DBeaver, Tableau, Power BI, Metabase, Superset.
@@ -82,7 +82,7 @@ Week 3 adds two things that make BI tools usable:
 | `SELECT COUNT(*), AVG(x) …`      | aggregates with optional GROUP BY                |
 | `INSERT / UPDATE / DELETE`       | DML; CommandComplete tag includes affected count |
 | `SELECT 1` / any constant        | works via the engine                             |
-| `SELECT version()`               | returns `DataFlow OS 0.1 (...)` (canned probe)   |
+| `SELECT version()`               | returns `NAPASTAK 0.1 (...)` (canned probe)   |
 | `SHOW server_version`            | same banner as `version()`                       |
 | `SELECT current_database()`      | returns the database from startup                |
 | `SELECT current_user` / `user`   | returns the username from startup                |

@@ -1,6 +1,6 @@
-# DataFlow OS — MCP Server
+# NAPASTAK — MCP Server
 
-DataFlow OS ships with `dfo_mcp_server`, a [Model Context Protocol](https://modelcontextprotocol.io)
+NAPASTAK ships with `dfo_mcp_server`, a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the platform's tables, queries, and pipelines to AI agents
 (Claude Desktop, Cursor, Continue, Cline, LangChain, …).
 
@@ -50,7 +50,7 @@ gateway's RBAC.
    }
    ```
 
-5. Restart Claude Desktop. Ask: *"What tables do I have in DataFlow OS?"* —
+5. Restart Claude Desktop. Ask: *"What tables do I have in NAPASTAK?"* —
    Claude should call `list_tables` and render a markdown table.
 
 ## Tools

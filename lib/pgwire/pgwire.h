@@ -2,7 +2,7 @@
  *
  * Implements just enough of https://www.postgresql.org/docs/current/protocol.html
  * to let standard PostgreSQL clients (psql, psycopg2, JDBC, ODBC, dbt, BI
- * tools) connect to DataFlow OS. The gateway runs the server in a
+ * tools) connect to NAPASTAK. The gateway runs the server in a
  * dedicated thread; per-connection sockets get their own threads.
  *
  * What's implemented in Week 1:

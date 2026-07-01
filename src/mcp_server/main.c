@@ -1,4 +1,4 @@
-/* dfo_mcp_server — Model Context Protocol server for DataFlow OS.
+/* dfo_mcp_server — Model Context Protocol server for NAPASTAK.
  *
  * Transport: JSON-RPC over stdio (one message per line, separator '\n').
  *   stdin  → requests from the MCP client (Claude Desktop, Cursor, …)
@@ -36,7 +36,7 @@ static void usage(const char *prog) {
         "Usage: %s [--gateway URL --api-key TOKEN] | [--data-dir DIR]\n"
         "\n"
         "Options:\n"
-        "  --gateway URL    DataFlow OS gateway URL (e.g. http://localhost:8080)\n"
+        "  --gateway URL    NAPASTAK gateway URL (e.g. http://localhost:8080)\n"
         "  --api-key TOKEN  JWT bearer token for the gateway\n"
         "  --data-dir DIR   Embedded mode (not implemented yet)\n",
         prog);

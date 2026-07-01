@@ -80,7 +80,7 @@ query() {
         -d "{\"sql\":\"$escaped\"}"
 }
 
-# DataFlow OS doesn't support `CREATE TABLE` / `INSERT INTO ... VALUES` —
+# NAPASTAK doesn't support `CREATE TABLE` / `INSERT INTO ... VALUES` —
 # tables are created via the CSV ingest endpoint instead. Bulk-load 3
 # rows in one shot. The table comes alive with the inferred schema.
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \

@@ -1,7 +1,7 @@
-# Airflow → DataFlow OS DAG Importer
+# Airflow → NAPASTAK DAG Importer
 
 `dfo-import-airflow` is a Python utility that converts existing Airflow DAG
-files into DataFlow OS pipeline JSON. The goal is **80% coverage of typical
+files into NAPASTAK pipeline JSON. The goal is **80% coverage of typical
 DAGs** without trying to be 100% semantically equivalent.
 
 It uses Python's stdlib `ast` module — **Airflow itself does NOT need to be
@@ -59,7 +59,7 @@ with DAG(dag_id='etl', schedule_interval='0 2 * * *') as dag:
 
 ### Schedule conversion
 
-| Airflow value                  | DataFlow OS cron |
+| Airflow value                  | NAPASTAK cron |
 |--------------------------------|------------------|
 | `'@daily'`                     | `0 0 * * *`      |
 | `'@hourly'`                    | `0 * * * *`      |
@@ -72,7 +72,7 @@ with DAG(dag_id='etl', schedule_interval='0 2 * * *') as dag:
 
 ### Operators
 
-| Airflow operator              | DataFlow OS step type   |
+| Airflow operator              | NAPASTAK step type   |
 |-------------------------------|-------------------------|
 | `BashOperator`                | `bash`                  |
 | `EmptyOperator` / `DummyOperator` | `bash` (`true`)     |
@@ -126,7 +126,7 @@ The resulting pipeline JSON expresses dependencies via `depends_on`:
 - **Execute Python code.** `PythonOperator` callables are emitted as bash
   TODO steps that fail loudly. You must rewrite them.
 - **Resolve Jinja templating.** `'{{ ds }}'` is preserved as a string. Most
-  DataFlow OS steps don't interpret Jinja today.
+  NAPASTAK steps don't interpret Jinja today.
 - **Parse `default_args` / `params`.** The DAG-level dict isn't propagated
   into individual steps. Set values per task.
 - **Handle `TaskGroup` / `SubDAG`** — flattened into a single linear list of

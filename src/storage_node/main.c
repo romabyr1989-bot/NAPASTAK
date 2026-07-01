@@ -1,5 +1,5 @@
 /*
- * storage_node — реплика-standby узла хранения DataFlow OS.
+ * storage_node — реплика-standby узла хранения NAPASTAK.
  *
  * Слушает TCP-порт, принимает от primary потоки репликации (MSG_REPLICATE)
  * и применяет WAL-байты к локальным таблицам, поддерживая каталог в актуальном

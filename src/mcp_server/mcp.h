@@ -1,7 +1,7 @@
 /* mcp.h — shared types/decls for dfo_mcp_server.
  *
  * Implements the Model Context Protocol (https://modelcontextprotocol.io)
- * over JSON-RPC on stdio. Exposes DataFlow OS as a tool provider for AI
+ * over JSON-RPC on stdio. Exposes NAPASTAK as a tool provider for AI
  * agents (Claude Desktop, Cursor, Continue, Cline, …).
  */
 #pragma once

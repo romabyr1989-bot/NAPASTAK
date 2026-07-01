@@ -1,5 +1,5 @@
 #pragma once
-/* storage.h — публичный интерфейс слоя хранения DataFlow OS:
+/* storage.h — публичный интерфейс слоя хранения NAPASTAK:
  * колоночные батчи (ColBatch), журнал упреждающей записи (WAL),
  * таблицы с B-tree индексами и каталог метаданных на SQLite
  * (схемы таблиц, пайплайны, история запусков, сохранённые результаты). */
@@ -10,7 +10,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* ── NULL sentinel (shared NULL contract across DataFlow OS) ──
+/* ── NULL sentinel (shared NULL contract across NAPASTAK) ──
  * A textual cell equal to this exact byte string represents a SQL NULL that
  * has been carried through the row/string layer (sources, materialization,
  * sinks, query engine, JSON output). The leading \x01\x02 bytes make it

@@ -1,7 +1,7 @@
 {
   "name": "dataflow-os",
   "version": "0.1.0",
-  "description": "JavaScript/TypeScript client for DataFlow OS",
+  "description": "JavaScript/TypeScript client for NAPASTAK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

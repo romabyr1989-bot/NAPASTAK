@@ -1,5 +1,5 @@
 /*
- * Integration test framework for DataFlow OS.
+ * Integration test framework for NAPASTAK.
  * Provides: server lifecycle, HTTP client (libcurl), TAP helpers, JSON assertions.
  */
 #pragma once

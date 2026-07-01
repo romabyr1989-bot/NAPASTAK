@@ -1,9 +1,9 @@
 # Apache Arrow Flight bridge
 
-`dfo_flight_server` is a small C++ binary that exposes DataFlow OS over the
+`dfo_flight_server` is a small C++ binary that exposes NAPASTAK over the
 [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)
 gRPC protocol. Arrow Flight clients (PyArrow, pandas, polars, Spark,
-DuckDB, BigQuery, Snowflake, R Arrow) can then read DataFlow OS tables
+DuckDB, BigQuery, Snowflake, R Arrow) can then read NAPASTAK tables
 **without JSON serialization overhead** — the bridge converts query
 results to Arrow record batches and streams them as native Arrow IPC.
 
@@ -82,7 +82,7 @@ doesn't ship that yet, so the Makefile transparently uses
 `DYLD_LIBRARY_PATH=` prefix. The Makefile prints a HINT line after
 build with the right value.
 
-Get the JWT token like any DataFlow OS client:
+Get the JWT token like any NAPASTAK client:
 
 ```sh
 TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/token \
@@ -134,7 +134,7 @@ print(cursor.fetchone())
 
 ## Ticket format
 
-DataFlow OS Flight accepts these `Ticket` payload formats:
+NAPASTAK Flight accepts these `Ticket` payload formats:
 
 | Ticket bytes              | Meaning                              |
 |---------------------------|--------------------------------------|

@@ -53,8 +53,8 @@ check "named: numeric param returns rows (alice30,bob42 > 25)" "[[ \"\$(echo '$R
 # ── 3: NULL parameter → NULL literal ─────────────────────────────────────────
 R3=$(curl -sf -X POST "$GW/api/query/named" "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT :v AS maybe FROM scores WHERE name = :n","params":{"v":null,"n":"bob"}}')
-check "named: NULL param yields empty/null cell" \
-  "[[ \"\$(echo '$R3' | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"rows\"][0][0] if d[\"rows\"] else \"X\")')\" == '' ]]"
+check "named: NULL param yields SQL NULL (json null)" \
+  "[[ \"\$(echo '$R3' | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d[\"rows\"][0][0] if d[\"rows\"] else \"X\"); print(\"NULL\" if v is None or v==\"\" else v)')\" == 'NULL' ]]"
 
 # ── 4: unknown parameter → 400 ───────────────────────────────────────────────
 C4=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/api/query/named" "${AUTH[@]}" \

@@ -326,20 +326,127 @@ static const char *val_cell(Val v, Arena *a) {
     return val_str(v, a);
 }
 
+/* ── Exact integer / decimal helpers (avoid binary-float precision loss) ──
+ * A bank's account numbers are 20 digits — larger than 2^53 — so comparing them
+ * through a double (the old pnum path) made DISTINCT accounts compare equal
+ * (…001 == …002) and returned another customer's rows. And binary float makes
+ * 8.20 - 8.10 == 0.0999999999999996, which breaks kopeck reconciliation. These
+ * helpers keep integer comparisons and simple decimal add/sub/mul exact,
+ * falling back to double only for exponents / oversized values. */
+
+/* optional sign then ≥1 digits, nothing else */
+static bool is_int_str(const char *s) {
+    if (!s || !*s) return false;
+    const char *p = s;
+    if (*p == '+' || *p == '-') p++;
+    if (!*p) return false;
+    for (; *p; p++) if (*p < '0' || *p > '9') return false;
+    return true;
+}
+
+/* Exact sign/leading-zero-aware compare of two integer strings, any length.
+ * Returns <0 / 0 / >0. Assumes is_int_str(a) && is_int_str(b). */
+static int int_str_cmp(const char *a, const char *b) {
+    int sa = 1, sb = 1;
+    if (*a == '+') a++; else if (*a == '-') { sa = -1; a++; }
+    if (*b == '+') b++; else if (*b == '-') { sb = -1; b++; }
+    while (a[0] == '0' && a[1]) a++;   /* strip leading zeros, keep last digit */
+    while (b[0] == '0' && b[1]) b++;
+    bool za = (a[0] == '0' && !a[1]);
+    bool zb = (b[0] == '0' && !b[1]);
+    if (za && zb) return 0;            /* +0 == -0 */
+    if (za) return sb > 0 ? -1 : 1;    /* 0 vs ±nonzero */
+    if (zb) return sa > 0 ?  1 : -1;
+    if (sa != sb) return sa < sb ? -1 : 1;
+    size_t la = strlen(a), lb = strlen(b);
+    int mag = (la != lb) ? (la < lb ? -1 : 1) : strcmp(a, b);
+    return sa > 0 ? mag : -mag;
+}
+
+/* Fixed-point decimal: value = mant / 10^scale. */
+typedef struct { __int128 mant; int scale; bool ok; } Dec;
+
+static Dec dec_parse(const char *s) {
+    Dec d = { 0, 0, false };
+    if (!s || !*s) return d;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    int sign = 1;
+    if (*p == '+') p++; else if (*p == '-') { sign = -1; p++; }
+    __int128 m = 0; int scale = 0, ndig = 0; bool dot = false;
+    for (; *p; p++) {
+        if (*p == '.') { if (dot) return d; dot = true; continue; }
+        if (*p < '0' || *p > '9') return d;   /* exponent / junk → not exact */
+        if (++ndig > 30) return d;            /* keep within __int128 range */
+        m = m * 10 + (*p - '0');
+        if (dot) scale++;
+    }
+    if (!ndig) return d;
+    d.mant = sign * m; d.scale = scale; d.ok = true;
+    return d;
+}
+
+/* op: '+', '-', '*'. Returns false → caller falls back to double. */
+static bool dec_arith(Dec a, Dec b, char op, Dec *out) {
+    if (op == '*') {
+        if (a.scale + b.scale > 30) return false;
+        out->mant = a.mant * b.mant; out->scale = a.scale + b.scale; out->ok = true;
+        return true;
+    }
+    int s = a.scale > b.scale ? a.scale : b.scale;
+    if (s > 30) return false;
+    __int128 ma = a.mant, mb = b.mant;
+    for (int i = a.scale; i < s; i++) ma *= 10;
+    for (int i = b.scale; i < s; i++) mb *= 10;
+    out->mant = (op == '+') ? ma + mb : ma - mb;
+    out->scale = s; out->ok = true;
+    return true;
+}
+
+/* Render a Dec as the shortest exact decimal string (trailing zeros trimmed). */
+static const char *dec_str(Arena *a, Dec d) {
+    __int128 m = d.mant; int scale = d.scale;
+    bool neg = m < 0; if (neg) m = -m;
+    char digits[48]; int n = 0;                    /* least-significant first */
+    if (m == 0) digits[n++] = '0';
+    while (m > 0) { digits[n++] = (char)('0' + (int)(m % 10)); m /= 10; }
+    while (n <= scale) digits[n++] = '0';          /* guarantee an integer part */
+    char buf[64]; int o = 0;
+    if (neg) buf[o++] = '-';
+    int intdigits = n - scale;
+    for (int i = 0; i < intdigits; i++) buf[o++] = digits[n - 1 - i];
+    if (scale > 0) {
+        int fracend = 0;                           /* trim trailing (low-order) zeros */
+        while (fracend < scale && digits[fracend] == '0') fracend++;
+        if (fracend < scale) {
+            buf[o++] = '.';
+            for (int i = scale - 1; i >= fracend; i--) buf[o++] = digits[i];
+        }
+    }
+    buf[o] = '\0';
+    if (buf[0] == '-' && buf[1] == '0' && buf[2] == '\0') return "0";  /* -0 → 0 */
+    return arena_strdup(a, buf);
+}
+
 static int vcmp(Val a, Val b) {
     if (a.is_null && b.is_null) return 0;
     if (a.is_null) return -1;
     if (b.is_null) return  1;
+    /* Exact path first: when both carry a source string, compare without a
+     * lossy double round-trip (fixes ordering/joins on 20-digit account ids). */
+    if (a.str && b.str) {
+        if (is_int_str(a.str) && is_int_str(b.str)) return int_str_cmp(a.str, b.str);
+        double na, nb;
+        if (pnum(a.str, &na) && pnum(b.str, &nb)) {
+            if (na < nb) return -1;
+            if (na > nb) return  1;
+            return 0;
+        }
+        return strcmp(a.str, b.str);
+    }
     if (a.is_num && b.is_num) {
         if (a.num < b.num) return -1;
         if (a.num > b.num) return  1;
-        return 0;
-    }
-    /* try numeric comparison if both look like numbers */
-    double na, nb;
-    if (pnum(a.str, &na) && pnum(b.str, &nb)) {
-        if (na < nb) return -1;
-        if (na > nb) return  1;
         return 0;
     }
     const char *sa = a.str ? a.str : (a.is_bool ? (a.b?"true":"false") : "");
@@ -349,13 +456,15 @@ static int vcmp(Val a, Val b) {
 
 static bool veq(Val a, Val b) {
     if (a.is_null || b.is_null) return false;
-    if (a.is_num && b.is_num)   return a.num == b.num;
-    double na, nb;
+    /* Exact path first: distinct large integer ids must not collide via double. */
     if (a.str && b.str) {
         if (!strcmp(a.str, b.str)) return true;
-        if (pnum(a.str,&na) && pnum(b.str,&nb)) return na == nb;
+        if (is_int_str(a.str) && is_int_str(b.str)) return int_str_cmp(a.str, b.str) == 0;
+        double na, nb;
+        if (pnum(a.str, &na) && pnum(b.str, &nb)) return na == nb;
         return false;
     }
+    if (a.is_num && b.is_num)   return a.num == b.num;
     if (a.is_bool && b.is_bool) return a.b == b.b;
     return false;
 }
@@ -1007,7 +1116,7 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
 static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
     if (!e) return vnull();
     switch (e->type) {
-    case EXPR_LITERAL_INT:   return vnum((double)e->ival);
+    case EXPR_LITERAL_INT:   { Val v = vnum((double)e->ival); if (e->litstr) v.str = e->litstr; return v; }  /* carry exact digits so veq/vcmp compare big ints losslessly */
     case EXPR_LITERAL_FLOAT: return vnum(e->fval);
     case EXPR_LITERAL_STR:   return vstr_s(e->sval);
     case EXPR_LITERAL_BOOL:  return vbool(e->bval);
@@ -1153,6 +1262,24 @@ static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
         if (L.is_num) lv = L.num;
         if (R.is_num) rv = R.num;
         bool num_ok = ln && rn;
+
+        /* Exact decimal arithmetic for money/large ids: computes 8.20-8.10 as
+         * 0.10 (not 0.0999999999999996) and keeps 20-digit sums exact. Falls
+         * back to the double paths below for exponents / oversized values or a
+         * string-concat OP_ADD (num_ok == false). Integer results stay numeric
+         * so 0 remains falsy and further arithmetic chains cleanly. */
+        if (num_ok && (e->op == OP_ADD || e->op == OP_SUB || e->op == OP_MUL)) {
+            Dec dl = dec_parse(val_str(L, a)), drr = dec_parse(val_str(R, a)), res;
+            char dop = e->op == OP_ADD ? '+' : e->op == OP_SUB ? '-' : '*';
+            if (dl.ok && drr.ok && dec_arith(dl, drr, dop, &res)) {
+                const char *rs = dec_str(a, res);
+                if (is_int_str(rs)) {
+                    const char *q = rs + (rs[0] == '-' || rs[0] == '+' ? 1 : 0);
+                    if (strlen(q) <= 15) return vnum((double)strtoll(rs, NULL, 10));
+                }
+                return vstr_s(rs);
+            }
+        }
 
         switch (e->op) {
         case OP_EQ:  return vbool(veq(L,R));
@@ -3492,6 +3619,13 @@ void api_pg_execute(PgConn *conn, const char *sql) {
         const char **vals = arena_alloc(a, (size_t)rs->ncols * sizeof(char *));
         for (int c = 0; c < rs->ncols; c++) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : NULL;
+            /* NULL-contract parity with the JSON path (h_query): a SQL NULL is
+             * carried as the DFO_NULL_SENTINEL string (or a corrupt sub-page
+             * pointer), never a NULL pointer. Collapse both to a real NULL so
+             * pgwire_send_data_row emits a wire NULL (-1) instead of the raw
+             * sentinel bytes; an empty string "" stays a real empty string.
+             * The sub-page check is first so strcmp never derefs a bad pointer. */
+            if (v && ((uintptr_t)v < 0x1000 || !strcmp(v, DFO_NULL_SENTINEL))) v = NULL;
             vals[c] = v;
         }
         pgwire_send_data_row(conn, rs->ncols, vals);
@@ -5923,6 +6057,12 @@ static int run_scd2_step(App *app, Arena *a, Pipeline *p, PipelineStep *st, char
     }
 
     /* 4b. Append a new version for every NEW/CHANGED source row. */
+    /* When scd2_transaction_time names a real source column, valid_from is
+     * sourced from that business time; otherwise it stays wall-clock. tt
+     * defaults to vf (a target-only metadata col usually absent from the
+     * source), so the default path resolves to -1 and keeps the now_str
+     * behaviour, preserving back-compat for pipelines without transaction_time. */
+    int tt_src_idx = scd2_rs_col_index(src, tt);
     for (int i = 0; i < n_new; i++) {
         char **scells = src->rows[new_rows[i]].cells;
         char **cells = arena_alloc(a, (size_t)tncols * sizeof(char *));
@@ -5939,7 +6079,14 @@ static int run_scd2_step(App *app, Arena *a, Pipeline *p, PipelineStep *st, char
             if (j == t_vt_idx)              cells[j] = (char *)DFO_NULL_SENTINEL; /* open: SQL NULL */
             else if (j == t_cf_idx)         cells[j] = (char *)"1";              /* current */
             else if (j == t_vc_idx)         cells[j] = vbuf ? vbuf : (char *)"1";
-            else if (!strcasecmp(name, vf)) cells[j] = now_str;
+            else if (!strcasecmp(name, vf)) {
+                /* Prefer the configured transaction-time source value (business
+                 * time); fall back to wall-clock when absent/empty/NULL so the
+                 * non-empty valid_from guarantee (relied on by cdi/mdc tests) holds. */
+                const char *ttv = (tt_src_idx >= 0) ? scells[tt_src_idx] : NULL;
+                cells[j] = (ttv && ttv[0] && strcmp(ttv, DFO_NULL_SENTINEL) != 0)
+                           ? (char *)ttv : now_str;
+            }
             else if (!strcasecmp(name, vt)) cells[j] = (char *)DFO_NULL_SENTINEL;
             else {
                 int si = scd2_rs_col_index(src, name);
@@ -6518,6 +6665,19 @@ static void h_pipeline_run(HttpReq *req, HttpResp *resp) {
     Arena *ba=arena_create(256);
     app_ws_broadcast(&g_app,arena_sprintf(ba,"{\"event\":\"pipeline_run_started\",\"id\":\"%s\"}",id));
     arena_destroy(ba);
+    /* Optional synchronous run: ?wait=true|1 or ?sync=1 runs the pipeline inline
+     * on the HTTP thread and returns only after it finishes, with the terminal
+     * status. Lets callers reliably run-then-read (orchestration / tests). The
+     * default (no flag) keeps the async worker-pool path below byte-for-byte. */
+    if (req->query && (strstr(req->query,"wait=true") || strstr(req->query,"wait=1") ||
+                       strstr(req->query,"sync=1")    || strstr(req->query,"sync=true"))) {
+        pipeline_execute_steps(p, &g_app);   /* inline on live pipeline: sets run_status + logs the run */
+        scheduler_finish_run(g_app.scheduler, p->id, p->run_status,
+                             p->run_status == RUN_SUCCESS ? 0 : 1, p->error_msg);
+        http_resp_json(resp, 200, p->run_status == RUN_SUCCESS
+                       ? "{\"status\":\"success\"}" : "{\"status\":\"failed\"}");
+        return;
+    }
     /* Hand the run to the worker pool so the HTTP thread returns at once. */
     RunTask *t = malloc(sizeof(RunTask));
     if (!t) {                                  /* OOM: degrade to a synchronous run */
@@ -6626,12 +6786,27 @@ static void h_webhook_trigger(HttpReq *req, HttpResp *resp) {
     if (!token || !*token) { http_resp_error(resp, 400, "missing token"); return; }
     Pipeline *p = scheduler_find_by_webhook_token(g_app.scheduler, token);
     if (!p) { http_resp_error(resp, 404, "unknown trigger"); return; }
+
+    /* Enforce the trigger's configured HTTP method: locate the matching webhook
+     * trigger (by token) and compare its webhook_method to the request verb.
+     * Empty/unset method defaults to POST (mirrors the scheduler load default). */
+    const char *want_method = "POST";
+    for (int i = 0; i < p->ntriggers; i++) {
+        if (p->triggers[i].type == TRIGGER_WEBHOOK &&
+            strcmp(p->triggers[i].webhook_token, token) == 0) {
+            if (p->triggers[i].webhook_method[0]) want_method = p->triggers[i].webhook_method;
+            break;
+        }
+    }
+    if (req->method && strcasecmp(req->method, want_method) != 0) {
+        http_resp_error(resp, 405, "method not allowed"); return;
+    }
+
     if (p->run_status == RUN_RUNNING) {
         http_resp_error(resp, 409, "pipeline already running"); return;
     }
 
-    /* The webhook fires on any HTTP method (both GET and POST routes registered);
-       the token is the auth, the verb is irrelevant. */
+    /* Method validated above against the trigger's webhook_method; token is the auth. */
     g_app.metrics->total_pipelines_run++;
     Arena *ba = arena_create(256);
     app_ws_broadcast(&g_app, arena_sprintf(ba,
@@ -7215,7 +7390,19 @@ static void h_auth_token(HttpReq *req, HttpResp *resp) {
         http_resp_error(resp, 400, "missing username or password");
         return;
     }
-    if (strcmp(username, "admin") != 0 || strcmp(password, g_app.admin_password) != 0) {
+    /* Вход: встроенный admin (пароль из конфига) ИЛИ учётка из таблицы users. */
+    AuthClaims claims;
+    memset(&claims, 0, sizeof(claims));
+    int authed = 0;
+    if (strcmp(username, "admin") == 0 && strcmp(password, g_app.admin_password) == 0) {
+        strncpy(claims.user_id, username, sizeof(claims.user_id) - 1);
+        claims.role = ROLE_ADMIN;
+        authed = 1;
+    } else if (g_app.auth_store &&
+               auth_user_verify(g_app.auth_store, username, password, &claims) == 0) {
+        authed = 1;   /* claims заполнены (user_id, role) */
+    }
+    if (!authed) {
         if (g_app.audit) {
             AuditEvent aev = {
                 .type           = AUDIT_AUTH_FAIL,
@@ -7233,9 +7420,6 @@ static void h_auth_token(HttpReq *req, HttpResp *resp) {
         http_resp_error(resp, 401, "invalid credentials");
         return;
     }
-    AuthClaims claims;
-    strncpy(claims.user_id, username, sizeof(claims.user_id) - 1);
-    claims.role = ROLE_ADMIN;
     claims.exp = (int64_t)time(NULL) + 86400;  // 1 day
     char token[1024];
     if (auth_jwt_sign(g_app.jwt_secret, &claims, token, sizeof(token)) != 0) {
@@ -7347,6 +7531,93 @@ static void h_auth_me(HttpReq *req, HttpResp *resp) {
     char *json_resp = arena_sprintf(req->arena, "{\"user_id\":\"%s\",\"role\":\"%s\"}",
                                     req->auth.user_id, role_str);
     http_resp_json(resp, 200, json_resp);
+}
+
+/* ── User account handlers (учётки для входа) ── */
+
+/* POST /api/auth/users — заводит нового пользователя (логин+пароль+роль). */
+static void h_auth_user_create(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    if (!req->body || req->body_len == 0) { http_resp_error(resp, 400, "missing body"); return; }
+    Arena *a = req->arena;
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) { http_resp_error(resp, 400, "invalid json"); return; }
+    const char *username = json_str(json_get(body, "username"), NULL);
+    const char *password = json_str(json_get(body, "password"), NULL);
+    const char *role_str = json_str(json_get(body, "role"), NULL);
+    if (!username || !password || !role_str) {
+        http_resp_error(resp, 400, "missing username, password or role"); return;
+    }
+    if (strcmp(username, "admin") == 0) { http_resp_error(resp, 400, "reserved username"); return; }
+    /* Второго администратора завести нельзя: единственный админ — встроенный 'admin'. */
+    AuthRole role;
+    if (strcmp(role_str, "analyst") == 0) role = ROLE_ANALYST;
+    else if (strcmp(role_str, "viewer") == 0) role = ROLE_VIEWER;
+    else if (strcmp(role_str, "admin") == 0) {
+        http_resp_error(resp, 403, "cannot create admin users (only built-in 'admin' allowed)"); return;
+    }
+    else { http_resp_error(resp, 400, "invalid role"); return; }
+    int rc = auth_user_create(g_app.auth_store, username, password, role);
+    if (rc == -2) { http_resp_error(resp, 409, "username already exists"); return; }
+    if (rc != 0)  { http_resp_error(resp, 500, "user creation failed"); return; }
+    if (g_app.audit) {
+        AuditEvent aev = {
+            .type = AUDIT_POLICY_CHANGE, .user_id = req->auth.user_id, .role = req->auth.role,
+            .resource = username, .action_detail = "user created",
+            .correlation_id = req->correlation_id, .client_ip = "", .result_code = 200, .duration_ms = 0,
+        };
+        audit_log_event(g_app.audit, &aev);
+    }
+    char *json_resp = arena_sprintf(a, "{\"username\":\"%s\",\"role\":\"%s\"}", username, role_str);
+    http_resp_json(resp, 200, json_resp);
+}
+
+/* GET /api/auth/users — список учёток (без паролей). */
+static void h_auth_user_list(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT username, role, created_at, enabled FROM users ORDER BY created_at DESC;";
+    if (sqlite3_prepare_v2(g_app.auth_store->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        http_resp_error(resp, 500, "db error"); return;
+    }
+    Arena *a = req->arena;
+    JBuf jb; jb_init(&jb, a, 4096);
+    jb_arr_begin(&jb);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *username = (const char *)sqlite3_column_text(stmt, 0);
+        int role = sqlite3_column_int(stmt, 1);
+        int64_t created_at = sqlite3_column_int64(stmt, 2);
+        int enabled = sqlite3_column_int(stmt, 3);
+        jb_obj_begin(&jb);
+        jb_key(&jb, "username"); jb_str(&jb, username);
+        jb_key(&jb, "role"); jb_str(&jb, role == ROLE_ADMIN ? "admin" : role == ROLE_ANALYST ? "analyst" : "viewer");
+        jb_key(&jb, "created_at"); jb_int(&jb, created_at);
+        jb_key(&jb, "enabled"); jb_int(&jb, enabled);
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb);
+    sqlite3_finalize(stmt);
+    http_resp_json(resp, 200, jb_done(&jb));
+}
+
+/* DELETE /api/auth/users/:username — удаляет учётку. */
+static void h_auth_user_delete(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    const char *username = hm_get(&req->params, "username");
+    if (!username) { http_resp_error(resp, 400, "missing username"); return; }
+    if (strcmp(username, "admin") == 0) { http_resp_error(resp, 400, "cannot delete admin"); return; }
+    if (auth_user_delete(g_app.auth_store, username) != 0) {
+        http_resp_error(resp, 404, "user not found"); return;
+    }
+    if (g_app.audit) {
+        AuditEvent aev = {
+            .type = AUDIT_POLICY_CHANGE, .user_id = req->auth.user_id, .role = req->auth.role,
+            .resource = username, .action_detail = "user deleted",
+            .correlation_id = req->correlation_id, .client_ip = "", .result_code = 200, .duration_ms = 0,
+        };
+        audit_log_event(g_app.audit, &aev);
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
 }
 
 /* ── RBAC handlers ── */
@@ -7593,6 +7864,10 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",  "/api/auth/apikeys",  h_auth_apikey_list);
     router_add(r,"DELETE","/api/auth/apikeys/:key", h_auth_apikey_delete);
     router_add(r,"GET",  "/api/auth/me",       h_auth_me);
+    // User accounts (учётки для входа)
+    router_add(r,"POST",  "/api/auth/users",           h_auth_user_create);
+    router_add(r,"GET",   "/api/auth/users",           h_auth_user_list);
+    router_add(r,"DELETE","/api/auth/users/:username", h_auth_user_delete);
     // RBAC endpoints
     router_add(r,"GET",   "/api/rbac/policies",      h_rbac_policies_list);
     router_add(r,"POST",  "/api/rbac/policies",      h_rbac_policy_set);

@@ -1,7 +1,7 @@
 # TSMDM Proxy
 
 Thin protocol-translation service between bank systems (Siebel CRM, CDI/Joker
-Kafka consumers, internal REST clients) and DataFlow OS. It holds **no business
+Kafka consumers, internal REST clients) and NAPASTAK. It holds **no business
 logic of its own** — every request becomes a SQL query against DFO via the REST
 API (`POST /api/query/named`) or PgWire (`:5432`), and the result is returned in
 the protocol the caller expects.

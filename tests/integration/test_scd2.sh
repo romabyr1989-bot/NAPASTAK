@@ -56,9 +56,9 @@ d = json.load(sys.stdin)
 ci = {c: i for i, c in enumerate(d["columns"])}
 rows = d["rows"]
 vt, bk = ci["valid_to"], ci["customer_id"]
-open_ = sum(1 for r in rows if r[vt] == "")
+open_ = sum(1 for r in rows if r[vt] in ("", None))   # open = SQL NULL (json null) or legacy empty string
 cnt = Counter(r[bk] for r in rows)
-ocnt = Counter(r[bk] for r in rows if r[vt] == "")
+ocnt = Counter(r[bk] for r in rows if r[vt] in ("", None))   # open = SQL NULL (json null) or legacy empty string
 print(f"total={len(rows)}")
 print(f"open={open_}")
 print(f"closed={len(rows)-open_}")
@@ -77,7 +77,7 @@ dim() {  # full dim_customer result as JSON
     -H 'Content-Type: application/json' \
     -d '{"sql":"SELECT customer_id, city, valid_from, valid_to FROM dim_customer"}'
 }
-run() { curl -sf -X POST "http://localhost:$PORT/api/pipelines/$PID/run" "${AUTH[@]}" >/dev/null; }
+run() { curl -sf -X POST "http://localhost:$PORT/api/pipelines/$PID/run?wait=true" "${AUTH[@]}" >/dev/null; }
 
 # ── Create the SCD2 pipeline (source = cust_src, target = dim_customer) ───────
 PIPELINE=$(cat <<'JSON'

@@ -72,7 +72,7 @@ check "token is non-empty" "$([ -n "$TOKEN" ] && echo 1 || echo 0)"
 
 AUTH="Authorization: Bearer $TOKEN"
 
-# DataFlow OS doesn't support CREATE TABLE / INSERT INTO via SQL — tables
+# NAPASTAK doesn't support CREATE TABLE / INSERT INTO via SQL — tables
 # are created by the CSV ingest endpoint. Bulk-load 3 rows in one shot.
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     "$BASE/api/ingest/csv?table=events" \

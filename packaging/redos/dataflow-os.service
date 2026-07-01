@@ -1,5 +1,5 @@
 [Unit]
-Description=DataFlow OS gateway (MDM/CDI)
+Description=NAPASTAK gateway (MDM/CDI)
 Documentation=https://github.com/romabyr1989-bot/DataFlow-OS
 After=network-online.target
 Wants=network-online.target

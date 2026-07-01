@@ -2,7 +2,7 @@
 
 ## Overview
 
-DataFlow OS provides lightweight **optimistic transactions** scoped to a single
+NAPASTAK provides lightweight **optimistic transactions** scoped to a single
 connection. Transactions are tracked via a thread-local `TxnId`. There is no
 MVCC and no cross-table atomicity.
 

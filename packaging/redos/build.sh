@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Собрать Linux-дистрибутив DataFlow OS под RedOS 8 в Docker и положить tar.gz в ./dist.
+# Собрать Linux-дистрибутив NAPASTAK под RedOS 8 в Docker и положить tar.gz в ./dist.
 #
 #   ./packaging/redos/build.sh [BASE_IMAGE]
 #

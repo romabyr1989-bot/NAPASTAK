@@ -1,5 +1,5 @@
 #pragma once
-/* auth.h — аутентификация и авторизация DataFlow OS:
+/* auth.h — аутентификация и авторизация NAPASTAK:
  * API-ключи и JWT (HS256), роли пользователей, проверка HTTP-запросов.
  * Хранилище учётных записей — таблица users в SQLite-каталоге. */
 #include "../core/arena.h"
@@ -35,6 +35,14 @@ int  auth_apikey_create(AuthStore *s, const char *user_id, AuthRole role,
 int  auth_apikey_verify(AuthStore *s, const char *key,
                         AuthClaims *claims_out);         /* 0=ok, -1=invalid */
 int  auth_apikey_revoke(AuthStore *s, const char *key);
+
+/* Учётные записи для входа (логин+пароль+роль), таблица users.
+ * Пароли хранятся как PBKDF2-HMAC-SHA256 (соль на пользователя). */
+int  auth_user_create(AuthStore *s, const char *username, const char *password,
+                      AuthRole role);                     /* 0=ok, -1=error, -2=exists */
+int  auth_user_verify(AuthStore *s, const char *username, const char *password,
+                      AuthClaims *claims_out);            /* 0=ok, -1=нет/пароль/выключен */
+int  auth_user_delete(AuthStore *s, const char *username);/* 0=ok, -1=не найден/ошибка */
 
 /* JWT: HS256, payload: {"sub":"user_id","role":N,"exp":ts} */
 int  auth_jwt_sign(const char *secret, const AuthClaims *claims,

@@ -1,6 +1,6 @@
-# DataFlow OS — Python SDK
+# NAPASTAK — Python SDK
 
-Python client for the [DataFlow OS](https://github.com/your-org/dfo) data platform.
+Python client for the [NAPASTAK](https://github.com/your-org/dfo) data platform.
 
 ## Installation
 

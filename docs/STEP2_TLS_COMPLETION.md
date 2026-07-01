@@ -2,7 +2,7 @@
 
 ## Status: ✅ COMPLETE
 
-All acceptance criteria met with full TLS/HTTPS encryption for DataFlow OS API.
+All acceptance criteria met with full TLS/HTTPS encryption for NAPASTAK API.
 
 ## Files Created
 

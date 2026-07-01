@@ -1,4 +1,4 @@
-# Сборка и развёртывание DataFlow OS на RedOS 8.02
+# Сборка и развёртывание NAPASTAK на RedOS 8.02
 
 RedOS 8 — RHEL-9-совместимый дистрибутив (glibc 2.34, OpenSSL 3, RPM/dnf).
 Сборка работает «из коробки»: Makefile линкует gateway с `-rdynamic` (плагины

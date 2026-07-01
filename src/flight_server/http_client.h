@@ -1,5 +1,5 @@
 /* http_client.h — thin libcurl wrapper used by the Flight server to talk to
- * the DataFlow OS gateway. Synchronous; one client instance is fine to
+ * the NAPASTAK gateway. Synchronous; one client instance is fine to
  * share across requests since libcurl handles are per-call. */
 #pragma once
 #include <string>

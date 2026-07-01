@@ -1,6 +1,6 @@
 /* yaml_loader.h — minimal pure-C YAML → JSON converter.
  *
- * Targets the constrained subset of YAML that DataFlow OS pipeline files
+ * Targets the constrained subset of YAML that NAPASTAK pipeline files
  * need; not a general-purpose YAML library. Returns a JSON string in the
  * supplied arena; the caller passes that to pipeline_from_json (or
  * json_parse) for further processing.

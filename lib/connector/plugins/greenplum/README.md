@@ -1,6 +1,6 @@
 # Greenplum connector (`gp_connector.so`)
 
-Reads data from **Greenplum** (MPP PostgreSQL) into DataFlow OS via libpq.
+Reads data from **Greenplum** (MPP PostgreSQL) into NAPASTAK via libpq.
 Greenplum speaks the PostgreSQL wire protocol, so the transport is the same
 libpq used by the [pg connector](../pg/) — but discovery, version handling and
 pagination are GP-specific, hence a separate plugin.

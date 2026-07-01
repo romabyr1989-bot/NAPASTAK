@@ -48,9 +48,9 @@ d = json.load(sys.stdin)
 ci = {c: i for i, c in enumerate(d["columns"])}
 rows = d["rows"]
 vt, bk = ci["valid_to"], ci["customer_id"]
-open_ = sum(1 for r in rows if r[vt] == "")
+open_ = sum(1 for r in rows if r[vt] in ("", None))   # open = SQL NULL (json null) or legacy empty string
 cnt  = Counter(r[bk] for r in rows)
-ocnt = Counter(r[bk] for r in rows if r[vt] == "")
+ocnt = Counter(r[bk] for r in rows if r[vt] in ("", None))   # open = SQL NULL (json null) or legacy empty string
 print(f"total={len(rows)}")
 print(f"open={open_}")
 print(f"closed={len(rows)-open_}")
@@ -80,11 +80,11 @@ hash_of() {  # echo the _dfo_row_hash of the open version of business key $1
 import sys,json
 d=json.load(sys.stdin); ci={c:i for i,c in enumerate(d['columns'])}
 for r in d['rows']:
-    if r[ci['customer_id']]=='$1' and r[ci['valid_to']]=='':
+    if r[ci['customer_id']]=='$1' and r[ci['valid_to']] in ('', None):
         print(r[ci['_dfo_row_hash']]); break
 "
 }
-run() { curl -sf -X POST "http://localhost:$PORT/api/pipelines/$PID/run" "${AUTH[@]}" >/dev/null; }
+run() { curl -sf -X POST "http://localhost:$PORT/api/pipelines/$PID/run?wait=true" "${AUTH[@]}" >/dev/null; }
 
 # SCD2 pipeline WITH scd2_hash_col; compare only name,city (notes excluded).
 # scd2_transaction_time=updated_at (monotonic) makes current-version detection

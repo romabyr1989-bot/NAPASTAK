@@ -1,6 +1,6 @@
 #pragma once
 /*
- * sql.h — публичный интерфейс SQL-движка DataFlow OS.
+ * sql.h — публичный интерфейс SQL-движка NAPASTAK.
  * Описывает узлы AST (Expr/Stmt), спецификацию оконных функций,
  * узлы плана выполнения (PlanNode) и API парсера/планировщика.
  * Вся память узлов выделяется в Arena (см. arena.h).
@@ -38,6 +38,7 @@ struct Expr {
     ExprType    type;
     WindowSpec *win_spec;   /* non-NULL for EXPR_WINDOW */
     bool        func_distinct; /* EXPR_FUNC: true for aggregate DISTINCT, e.g. COUNT(DISTINCT col) */
+    const char *litstr;     /* EXPR_LITERAL_INT: exact source digits, for lossless big-integer compare (NULL otherwise) */
     union {
         struct { const char *table; const char *name; };    /* EXPR_COL */
         int64_t     ival;                                   /* LITERAL_INT */

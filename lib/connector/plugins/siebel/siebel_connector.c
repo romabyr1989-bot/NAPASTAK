@@ -1,4 +1,4 @@
-/* siebel_connector.c — Siebel/EIM коннектор DataFlow OS (CDI ↔ Siebel).
+/* siebel_connector.c — Siebel/EIM коннектор NAPASTAK (CDI ↔ Siebel).
  *
  * Двунаправленный коннектор поверх Siebel EAI / REST Inbound Web Service:
  *
