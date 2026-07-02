@@ -244,7 +244,7 @@ static void *ora_create(const char *cfg, Arena *a) {
         return ctx;   /* conn == NULL */
     }
 
-    /* Easy Connect: host:port/service_name */
+    /* Easy Connect: host:port/service_name (без tnsnames.ora / TNS-алиасов). */
     char connstr[300];
     snprintf(connstr, sizeof(connstr), "%s:%s/%s", host, port, service);
 
@@ -398,6 +398,7 @@ static int ora_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     if (dpiConn_prepareStmt(ctx->conn, 0, sql, (uint32_t)strlen(sql), NULL, 0, &st) != DPI_SUCCESS) {
         ora_capture_err(ctx, "list_entities prepare"); return -1;
     }
+    /* :1 в обоих UNION-ветвях — OWNER (UPPER) из конфига. */
     dpiData bind; dpiData_setBytes(&bind, ctx->schema, (uint32_t)strlen(ctx->schema));
     dpiStmt_bindValueByPos(st, 1, DPI_NATIVE_TYPE_BYTES, &bind);
     if (dpiStmt_execute(st, DPI_MODE_EXEC_DEFAULT, &ncols) != DPI_SUCCESS) {
@@ -761,6 +762,7 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
         ora_exec_chk(ctx->conn, trunc);
     }
 
+    /* Список колонок "(\"c1\", \"c2\", ...)" — общий для всех чанков INSERT ALL. */
     char collist[4096]; size_t co = 0;
     co += (size_t)snprintf(collist+co, sizeof(collist)-co, "(");
     for (int c = 0; c < ncols; c++)

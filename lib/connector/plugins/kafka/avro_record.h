@@ -1,5 +1,9 @@
 #pragma once
-/* Avro record schema model + flat-record decoder.
+/* avro_record.h — модель Avro-схемы записи + декодер плоской записи.
+ * Схема-JSON (из Confluent Schema Registry) → список полей → типизированные
+ * строковые значения. Двоичный слой (varint/float/…) — в avro_decode.h.
+ *
+ * Avro record schema model + flat-record decoder.
  *
  * Header-only (static inline) so it can be unit-tested with just json.o/arena.o/
  * log.o — no librdkafka, no libcurl. The Schema Registry client, the schema
@@ -138,6 +142,8 @@ static inline int avro_decode_record(Arena *a, const AvroField *fields, int nfie
         }
 
         if (field->type == AVRO_UNION_NULL_T) {
+            /* Union кодируется индексом выбранной ветки (long-varint), затем —
+             * значением этой ветки. Сравниваем индекс с позицией "null" в схеме. */
             int64_t branch = 0;
             pos += avro_decode_long(payload + pos, plen - pos, &branch);
             if (pos > plen) return -1;

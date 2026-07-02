@@ -25,10 +25,15 @@
 #define MSG_NOSIGNAL 0
 #endif
 
+/* Магические 4-байтовые коды в первом поле StartupMessage. Реальная версия
+ * протокола (v3) отличается от «псевдо-версий» SSLRequest/CancelRequest,
+ * которые клиент шлёт вместо обычного StartupMessage. */
 #define PG_PROTOCOL_V3   196608        /* 0x00030000 */
 #define PG_SSL_REQUEST   80877103      /* 0x04D2162F */
 #define PG_CANCEL_REQUEST 80877102
 
+/* Верхняя граница длины одного сообщения — защита от заведомо битого/
+ * враждебного поля длины, пришедшего из сети (иначе malloc по длине из сети). */
 #define PG_BUF_MAX (1024 * 1024)       /* per-message ceiling */
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -81,6 +86,8 @@ struct PgConn {
 };
 
 /* ── I/O helpers ──────────────────────────────────────────────── */
+/* Читает ровно n байт, дочитывая частичные read(); EINTR игнорируется.
+ * Возвращает 0 при успехе, -1 при EOF/ошибке. */
 static int read_full(int fd, void *buf, size_t n) {
     char *p = buf;
     size_t got = 0;
@@ -93,6 +100,8 @@ static int read_full(int fd, void *buf, size_t n) {
     return 0;
 }
 
+/* Пишет ровно n байт, дописывая частичные send(); MSG_NOSIGNAL подавляет
+ * SIGPIPE на разорванном соединении. Возвращает 0 при успехе, -1 при ошибке. */
 static int write_full(int fd, const void *buf, size_t n) {
     const char *p = buf;
     size_t sent = 0;
@@ -105,6 +114,8 @@ static int write_full(int fd, const void *buf, size_t n) {
     return 0;
 }
 
+/* Протокол PostgreSQL — big-endian; be32/put_be32/put_be16 читают/пишут
+ * целые в сетевом порядке байт независимо от порядка байт хоста. */
 static uint32_t be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
@@ -120,6 +131,9 @@ static void put_be16(uint8_t *p, uint16_t v) {
 }
 
 /* ── Message construction ─────────────────────────────────────── */
+/* Растущий буфер для сборки одного исходящего сообщения. Заголовок пакета
+ * (1 байт типа + 4 байта длины) резервируется в начале и заполняется
+ * позже в mb_send, поэтому тело добавляется, начиная со смещения 5. */
 typedef struct { uint8_t *buf; size_t len, cap; } MsgBuf;
 
 static void mb_init(MsgBuf *m) {
@@ -144,6 +158,10 @@ static void mb_cstr(MsgBuf *m, const char *s) {
     size_t n = strlen(s) + 1; mb_bytes(m, s, n);
 }
 
+/* Проставляет заголовок и отправляет сообщение, затем освобождает буфер.
+ * Поле длины в протоколе включает сами 4 байта длины, но НЕ байт типа.
+ * type==0 — бестиповое сообщение (стиль StartupMessage): байт типа
+ * пропускается, длина покрывает всё тело вместе с полем длины. */
 /* Finalize and write to fd. type==0 means typeless (StartupMessage style). */
 static int mb_send(int fd, MsgBuf *m, uint8_t type) {
     int rc;
@@ -191,6 +209,9 @@ static int send_ready_for_query(int fd, char status) {
 }
 
 /* ── Public helpers — emit query results ──────────────────────── */
+/* RowDescription ('T'): для каждой колонки — имя, OID таблицы (0=неизвестна),
+ * номер атрибута (0), OID типа, размер типа, модификатор типа (-1) и код
+ * формата. Формат всегда 0 (текст) — значения строк тоже шлём текстом. */
 void pgwire_send_row_description(PgConn *c, int ncols, const PgColumn *cols) {
     MsgBuf m; mb_init(&m);
     mb_u16(&m, (uint16_t)ncols);
@@ -206,6 +227,8 @@ void pgwire_send_row_description(PgConn *c, int ncols, const PgColumn *cols) {
     mb_send(c->fd, &m, 'T');
 }
 
+/* DataRow ('D'): по каждому значению — длина (int32) и байты. Длина -1
+ * (0xFFFFFFFF) обозначает SQL NULL и не сопровождается данными. */
 void pgwire_send_data_row(PgConn *c, int ncols, const char *const *values) {
     MsgBuf m; mb_init(&m);
     mb_u16(&m, (uint16_t)ncols);
@@ -226,6 +249,8 @@ void pgwire_send_command_complete(PgConn *c, const char *tag) {
     mb_send(c->fd, &m, 'C');
 }
 
+/* ErrorResponse ('E'): последовательность полей «код+cstring», завершаемая
+ * нулевым байтом. Поля: S=severity, C=SQLSTATE, M=человекочитаемое сообщение. */
 void pgwire_send_error(PgConn *c, const char *sqlstate, const char *msg) {
     MsgBuf m; mb_init(&m);
     mb_u8(&m, 'S'); mb_cstr(&m, "ERROR");
@@ -268,6 +293,9 @@ static int read_startup(PgConn *c, uint8_t *body, uint32_t *body_len_out) {
     return 0;
 }
 
+/* Разбирает пары ключ/значение из StartupMessage (user, database, …);
+ * пробегает по границам body, не выходя за пределы буфера. Если database
+ * не задана, по умолчанию берётся равной user (как в libpq). */
 static void parse_startup_kv(PgConn *c, const uint8_t *body, uint32_t body_len) {
     /* body = 4-byte version (already validated) + key/value cstrings + null */
     const char *p   = (const char *)body + 4;
@@ -288,6 +316,9 @@ static void parse_startup_kv(PgConn *c, const uint8_t *body, uint32_t body_len) 
 }
 
 /* ── Main per-connection loop ─────────────────────────────────── */
+/* Читает PasswordMessage ('p') и вызывает колбэк authenticate. Пароль
+ * приходит открытым текстом (cleartext); буфер обнуляется сразу после
+ * проверки. Возвращает результат authenticate (0 = успех) или -1. */
 static int handle_password(PgConn *c) {
     uint8_t  hdr[5];
     if (read_full(c->fd, hdr, 5) != 0) return -1;
@@ -320,6 +351,10 @@ static int send_simple_tag(int fd, uint8_t type) {
 
 /* ── Extended Query — body parsing helpers ───────────────────── */
 
+/* Хелперы xq_* читают поля из тела сообщения с проверкой границ по len —
+ * тело пришло из сети, поэтому смещение off всегда сверяется с len до
+ * чтения, чтобы не выйти за буфер на усечённом/битом пакете. */
+
 /* Read a NUL-terminated cstring from `buf`. *off advanced past the NUL.
  * Returns NULL on overflow. */
 static const char *xq_cstr(const uint8_t *buf, size_t len, size_t *off) {
@@ -346,6 +381,9 @@ static int xq_int32(const uint8_t *buf, size_t len, size_t *off, int32_t *out) {
 }
 
 /* ── Extended Query — slot helpers ───────────────────────────── */
+/* Подготовленные операторы и порталы хранятся в фиксированных массивах на
+ * соединение; поиск/выделение — линейный по имени (безымянные — пустая
+ * строка). *_release освобождает heap-поля и помечает слот свободным. */
 
 static PgPrepared *xq_find_or_alloc_prepared(PgConn *c, const char *name) {
     /* Replace existing slot with same name OR find first empty one. */
@@ -458,6 +496,9 @@ static void xq_append_value(char *out, size_t cap, size_t *off,
 /* Substitute $1..$N in `sql` with the bound values. Numbers are
  * inlined raw, strings get single-quoted with '' escape, NULLs are
  * emitted as the keyword NULL. Heap-allocates the result. */
+/* Понижает Extended Query до Simple Query: плейсхолдеры $N заменяются
+ * значениями. cap рассчитан с запасом (длина строки * 2 на удвоение кавычек
+ * + служебные символы), поэтому append-хелперы не переполняют буфер. */
 static char *xq_substitute_params(const char *sql, char **values, int n_params) {
     size_t sql_len = strlen(sql);
     size_t cap = sql_len + 64;
@@ -489,7 +530,12 @@ static char *xq_substitute_params(const char *sql, char **values, int n_params) 
 }
 
 /* ── Extended Query — message handlers ───────────────────────── */
+/* Каждый handle_* при ошибке шлёт ErrorResponse и выставляет c->batch_error,
+ * из-за чего run_query_loop пропускает остальные P/B/D/E/C текущего пакета
+ * вплоть до Sync — как требует протокол (ошибка отменяет весь батч). */
 
+/* Parse ('P'): имя оператора + SQL + список OID типов параметров. OID типов
+ * игнорируются (подстановка идёт в текстовом режиме); SQL копируется в слот. */
 static void handle_parse(PgConn *c, const uint8_t *body, size_t len) {
     size_t off = 0;
     const char *name = xq_cstr(body, len, &off);
@@ -519,6 +565,9 @@ static void handle_parse(PgConn *c, const uint8_t *body, size_t len) {
     send_simple_tag(c->fd, '1');                     /* ParseComplete */
 }
 
+/* Bind ('B'): портал + оператор + коды форматов параметров + сами значения
+ * + коды форматов результата. Значения копируются в новый портал. Двоичный
+ * формат не поддерживается — любой ненулевой код формата отвергается. */
 static void handle_bind(PgConn *c, const uint8_t *body, size_t len) {
     size_t off = 0;
     const char *portal_name = xq_cstr(body, len, &off);
@@ -560,8 +609,8 @@ static void handle_bind(PgConn *c, const uint8_t *body, size_t len) {
         for (int i = 0; i < n_params; i++) {
             int32_t L = 0;
             if (xq_int32(body, len, &off, &L) < 0) { goto values_bad; }
-            if (L < 0) { values[i] = NULL; continue; }
-            if ((size_t)off + (size_t)L > len) goto values_bad;
+            if (L < 0) { values[i] = NULL; continue; } /* -1 = SQL NULL, данных нет */
+            if ((size_t)off + (size_t)L > len) goto values_bad; /* длина не должна вылезать за тело */
             int fmt = all_text ? 0
                     : (n_fmt == 1 ? default_fmt
                                   : (i < n_fmt ? param_fmts[i] : 0));
@@ -633,6 +682,10 @@ static void handle_describe(PgConn *c, const uint8_t *body, size_t len) {
     send_simple_tag(c->fd, 'n');                     /* NoData */
 }
 
+/* Execute ('E'): подставляет связанные значения в SQL портала и передаёт
+ * итоговый текст в тот же колбэк query, что и Simple Query. Лимит max_rows
+ * игнорируется (пагинация не реализована). RowDescription/DataRow/… шлёт
+ * сам колбэк; ReadyForQuery отправляется позже по Sync. */
 static void handle_execute(PgConn *c, const uint8_t *body, size_t len) {
     size_t off = 0;
     const char *portal_name = xq_cstr(body, len, &off);
@@ -664,6 +717,8 @@ static void handle_execute(PgConn *c, const uint8_t *body, size_t len) {
     free(final_sql);
 }
 
+/* Close ('C'): body[0] = 'S' (prepared statement) или 'P' (portal), далее имя.
+ * Освобождает соответствующий слот и отвечает CloseComplete ('3'). */
 static void handle_close(PgConn *c, const uint8_t *body, size_t len) {
     if (len < 1) { send_simple_tag(c->fd, '3'); return; }
     char kind = (char)body[0];
@@ -830,6 +885,8 @@ static void *accept_thread_fn(void *arg) {
 }
 
 /* ── Public lifecycle ─────────────────────────────────────────── */
+/* Выделяет сервер и запоминает порт/колбэки/пользовательский контекст.
+ * Сокет ещё не открыт — это делает pgwire_start. Возвращает NULL при OOM. */
 PgWireServer *pgwire_create(int port, PgWireCallbacks cbs, void *ud) {
     PgWireServer *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -840,6 +897,8 @@ PgWireServer *pgwire_create(int port, PgWireCallbacks cbs, void *ud) {
     return s;
 }
 
+/* Открывает слушающий сокет (SO_REUSEADDR) и порождает accept-поток.
+ * Не блокирует. Возвращает 0 при успехе, -1 при ошибке bind/listen/create. */
 int pgwire_start(PgWireServer *s) {
     if (!s) return -1;
     s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -869,6 +928,9 @@ int pgwire_start(PgWireServer *s) {
     return 0;
 }
 
+/* Останавливает сервер: сбрасывает флаг running, разблокирует accept()
+ * через shutdown()+close() и дожидается завершения accept-потока (join).
+ * Уже принятые connection-потоки — detached и завершаются самостоятельно. */
 void pgwire_stop(PgWireServer *s) {
     if (!s || !s->running) return;
     s->running = 0;

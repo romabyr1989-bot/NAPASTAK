@@ -460,6 +460,8 @@ void mvs_invalidate(MatViewStore *s, const char *table_name) {
         const char *name = (const char *)sqlite3_column_text(stmt, 0);
         const char *srcs = (const char *)sqlite3_column_text(stmt, 1);
         if (!name || !srcs) continue;
+        /* Совпадение по подстроке в JSON-массиве source_tables (не по целому
+         * идентификатору, как в mv_sql_refs): "orders" зацепит и "orders_x". */
         if (strstr(srcs, table_name)) {
             strncpy(to_invalidate[ninv], name, 127);
             ninv++;

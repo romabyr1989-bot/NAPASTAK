@@ -1,4 +1,9 @@
 /* CSV connector — reads delimited text files */
+/* Коннектор CSV: источник И приёмник для локальных файлов с разделителями
+ * (CSV/TSV). Транспорт — прямой файловый ввод-вывод stdio (fopen/fgets),
+ * внешних библиотек нет. Парсинг полей — по RFC-4180 (кавычки, экранирование
+ * "" -> "). Значения хранятся как TEXT (см. csv_create). Реализует DfoConnector
+ * ABI; CDC не поддерживается (cdc_start/cdc_stop = NULL). */
 #include "../../connector.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +27,9 @@ typedef struct {
 } CsvCtx;
 
 /* ── Schema inference ── */
-/* Угадывает тип столбца по строковому значению (NULL/bool/int/double/text). */
+/* Угадывает тип столбца по строковому значению (NULL/bool/int/double/text).
+ * Оставлен как утилита: csv_create принудительно назначает всем столбцам TEXT
+ * (причина — в комментарии внутри csv_create), поэтому здесь тип не используется. */
 static ColType infer_type(const char *s) {
     if (!s || !*s || strcasecmp(s,"null")==0 || strcasecmp(s,"na")==0) return COL_NULL;
     if (strcasecmp(s,"true")==0||strcasecmp(s,"false")==0) return COL_BOOL;
@@ -84,6 +91,9 @@ static void *csv_create(const char *cfg, Arena *a) {
     CsvCtx *ctx = arena_calloc(a, sizeof(CsvCtx));
     ctx->arena = a;
     ctx->delimiter = ','; ctx->has_header = 1;
+    /* Минимальный ручной разбор JSON-конфига (без парсера): ищем ключи
+     * "path"/"delimiter"/"header" по подстроке и вытаскиваем значение вручную.
+     * delimiter берётся как первый символ строкового значения. */
     /* parse minimal JSON config */
     if (cfg) {
         const char *p = strstr(cfg, "\"path\"");
@@ -129,6 +139,7 @@ static void *csv_create(const char *cfg, Arena *a) {
     return ctx;
 }
 
+/* Освобождать нечего: всё состояние в арене — её чистит вызывающий. */
 static void csv_destroy(void *ctx) { (void)ctx; /* arena owned */ }
 
 /* Проверка доступности: пытается открыть файл на чтение. 0 — ок, -1 — ошибка. */
@@ -162,7 +173,9 @@ static int csv_describe(void *vctx, Arena *a, const char *entity, Schema **out) 
 }
 
 /* Читает до BATCH_SIZE строк в колоночный батч, парся ячейки по типам схемы;
- * пустые/null/na помечаются в null_bitmap. Заголовок пропускается при наличии. */
+ * пустые/null/na помечаются в null_bitmap. Заголовок пропускается при наличии.
+ * ВНИМАНИЕ: req (cursor/limit/filter) игнорируется — файл читается с начала,
+ * пагинации между вызовами нет; отдаётся только первый батч файла. */
 static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                            const char *entity, ColBatch **out_batch) {
     (void)entity; (void)req;

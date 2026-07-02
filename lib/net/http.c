@@ -388,6 +388,8 @@ static void ws_handshake(int fd, TlsConn *tls, const char *key) {
 }
 
 /* ── HTTP→HTTPS redirect handler ── */
+/* Отвечает 301 на plain-HTTP соединение, сохраняя путь запроса и подменяя
+ * схему на https://localhost:<https_port>. Закрывает fd после ответа. */
 static void handle_redirect(int fd, int https_port) {
     char buf[2048]; ssize_t n = recv(fd, buf, sizeof(buf)-1, 0);
     char path[1024] = "/";
@@ -479,6 +481,7 @@ static void handle_conn(HttpServer *srv, int fd) {
                 }
                 /* заголовок в самой первой строке: p+16 ниже укажет на значение */
                 if (!p && strncasecmp(buf, "content-length:", 15) == 0) p = buf - 1;
+                /* p указывает на '\n' перед заголовком; +16 = длина "\ncontent-length:" */
                 if (p) cl = (size_t)strtoull(p + 16, NULL, 10);
                 want_total = header_len + cl;
                 if (want_total > MAX_REQ_SIZE) { 

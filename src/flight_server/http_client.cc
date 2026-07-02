@@ -8,12 +8,16 @@ namespace dfo {
 
 namespace {
 
+/* libcurl-колбэк записи: дописывает порцию тела ответа в std::string. */
 size_t write_cb(char* ptr, size_t sz, size_t nm, void* ud) {
     auto* out = static_cast<std::string*>(ud);
     out->append(ptr, sz * nm);
     return sz * nm;
 }
 
+/* Выполняет один синхронный HTTP-запрос: ставит заголовки Authorization
+ * (если задан bearer) и Content-Type, шлёт body при непустом теле и
+ * заполняет HttpResponse. status = -1 при транспортной ошибке curl. */
 HttpResponse perform(const std::string& method,
                      const std::string& url,
                      const std::string& body,

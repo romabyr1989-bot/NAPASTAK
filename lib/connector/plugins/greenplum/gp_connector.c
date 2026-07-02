@@ -121,6 +121,7 @@ static void *gp_create(const char *cfg, Arena *a) {
     ctx->arena      = a;
     ctx->batch_size = GP_DEFAULT_BATCH;
 
+    /* Читаем поля конфига по одному через cfg_get (2-й аргумент — дефолт). */
     char host[128]="localhost", port[16]="5432", dbname[128]="postgres";
     char user[128]="", pass[128]="", sslmode[32]="disable", ctimeout[16]="10";
     char bsz[16]="8192", gpver[16]="";
@@ -142,6 +143,8 @@ static void *gp_create(const char *cfg, Arena *a) {
         ctx->batch_size = GP_DEFAULT_BATCH;
     ctx->gp_major = gpver[0] ? atoi(gpver) : 0;   /* explicit overrides autodetect */
 
+    /* DSN в keyword/value-формате libpq. user/password добавляем отдельно,
+     * только если заданы (пустые ключи ломали бы аутентификацию). */
     int n = snprintf(ctx->dsn, sizeof(ctx->dsn),
         "host=%s port=%s dbname=%s connect_timeout=%s sslmode=%s",
         host, port, dbname, ctimeout, sslmode);
@@ -152,6 +155,10 @@ static void *gp_create(const char *cfg, Arena *a) {
 
     ctx->conn = PQconnectdb(ctx->dsn);
     if (PQstatus(ctx->conn) != CONNECTION_OK) {
+        /* Реальный текст libpq (напр. про недоступный хост / отказ аутентификации)
+         * → last_err для last_error(); хвостовые CR/LF обрезаем, чтобы UI-проба
+         * показала однострочную причину. Соединение закрываем, ctx возвращаем
+         * (conn==NULL → все ABI-вызовы вернут -1). */
         const char *em = PQerrorMessage(ctx->conn);
         LOG_ERROR("gp_connector: connect failed: %s", em);
         snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", em ? em : "connection failed");
@@ -358,6 +365,10 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     PGresult *res;
 
     if (incremental) {
+        /* Разрешение источника в FROM-выражение base:
+         *   • src начинается с SELECT → оборачиваем в подзапрос "(...) _dfo_q";
+         *   • содержит точку → уже квалифицирован (schema.table) — как есть;
+         *   • иначе → "schema"."table" из ctx->schema (регистрозависимо). */
         const char *cc = ctx->cursor_column;
         char base[GP_MAX_SQL];
         if (strncasecmp(src, "SELECT", 6) == 0)
@@ -432,6 +443,8 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->ncols  = ncols;
     batch->nrows  = nrows;
 
+    /* Колоночное хранение: на каждую колонку — битмап NULL-ов и массив char*
+     * (text-always). Материализуем значения strdup-ом в арену (res очистим). */
     for (int c = 0; c < ncols; c++) {
         batch->null_bitmap[c] = arena_calloc(a, ((size_t)nrows + 7) / 8);
         batch->values[c]      = arena_alloc(a, (size_t)nrows * sizeof(char *));
@@ -501,6 +514,8 @@ static int gp_write_batch(void *vctx, Arena *a, const char *entity,
         if (gp_exec_ok(ctx->conn, trunc) < 0) { PQfreemem(eident); return -1; }
     }
 
+    /* Список колонок "(c1, c2, ...)" (имена экранированы) — общий для всех
+     * чанков INSERT ниже, собираем один раз. */
     char collist[4096]; size_t co = 0; collist[0] = '\0';
     co += (size_t)snprintf(collist+co, sizeof(collist)-co, "(");
     for (int c = 0; c < ncols; c++) {

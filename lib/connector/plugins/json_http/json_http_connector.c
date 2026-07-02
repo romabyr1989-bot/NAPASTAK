@@ -1,6 +1,10 @@
-/* json_http_connector.c — HTTP/REST → DFO через libcurl.
- * Загружает JSON с произвольного URL, навигирует к массиву через data_path,
- * выводит схему из первого элемента, поддерживает offset- и cursor-пагинацию. */
+/* json_http_connector.c — коннектор JSON-over-HTTP/REST для DFO.
+ * Зависимость: libcurl (транспорт HTTP/HTTPS). Реализует ABI DfoConnector
+ * (connector.h), экспорт — символ dfo_connector_entry.
+ * Source: GET/POST на URL, навигация к массиву объектов через data_path,
+ *   вывод схемы из первого элемента, offset-/cursor-пагинация.
+ * Sink (write_batch): POST батча как JSON-массива объектов на entity/url.
+ * Модель text-always: все ячейки хранятся как char*, схема отдаётся COL_TEXT. */
 #include "../../connector.h"
 #include "../../../core/log.h"
 #include "../../../core/json.h"
@@ -122,7 +126,9 @@ static char *jh_fetch(JHCtx *ctx, const char *cursor_or_offset, Arena *a) {
 }
 
 /* ── Навигация по data_path ── */
-/* data_path = "key1.key2.key3" → последовательно get по ключам */
+/* data_path = "key1.key2.key3" → последовательно get по ключам.
+ * Пустой path возвращает root (сам ответ — массив). NULL, если по пути
+ * встречается не-объект. strtok режет локальную копию buf, не сам path. */
 static JVal *jh_navigate(JVal *root, const char *path) {
     if (!path||!path[0]) return root;
     char buf[256]; strncpy(buf,path,sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
@@ -369,6 +375,9 @@ static int jh_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->nrows=jh_fill_batch(arr,sc,batch,0,nrows,a);
     *out_batch=batch;
 
+    /* Возврат 0 = есть ещё данные, 1 = конец. Сам курсор/оффсет следующей
+     * страницы вычисляет вызывающий (в req->cursor); здесь лишь по числу
+     * пришедших элементов решаем, была ли страница последней. */
     /* Сигнализируем конец данных если получили меньше page_size элементов */
     return ((int)arr->nitems<ctx->page_size)?1:0;
 }
@@ -405,6 +414,8 @@ static const char *bit_isnull(const ColBatch *b, int c, int r) {
     const uint8_t *bm = b->null_bitmap[c];
     return (bm && ((bm[r/8] >> (r%8)) & 1u)) ? "" : NULL; /* "" sentinel = null */
 }
+/* write_batch (ABI-sink): сериализует весь batch в JSON-массив и POST-ит одним
+ * запросом (см. подробное описание контракта в блоке выше). */
 static int jh_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode) {
     (void)a; (void)mode;

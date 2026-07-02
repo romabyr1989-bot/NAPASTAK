@@ -3,7 +3,10 @@
  * а также инкрементальный («лёгкий CDC») забор по высокой отметке — задаётся
  * полем cursor_column в connector_config (см. pg_read_batch).
  * Полноценный потоковый CDC (logical replication) — cdc_start/cdc_stop = NULL,
- * зарезервировано для фазы 3 (план — у объявления dfo_connector_entry ниже). */
+ * зарезервировано для фазы 3 (план — у объявления dfo_connector_entry ниже).
+ * Как приёмник (write_batch): создаёт таблицу при отсутствии, льёт строки
+ * многострочными INSERT; при заданном primary_key делает идемпотентный UPSERT
+ * (ON CONFLICT). Зависимость — libpq (libpq-fe.h). */
 #include "../../connector.h"
 #include "../../../core/log.h"
 #include <libpq-fe.h>

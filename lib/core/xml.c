@@ -28,10 +28,12 @@ static void pv_push(PtrVec *v, void *p) {
 /* ── Состояние парсера ── */
 typedef struct { const char *p, *end; Arena *a; } PS;
 
+/* Первое вхождение символа c в [s, end); NULL если нет. */
 static const char *find_char(const char *s, const char *end, char c) {
     for (; s < end; s++) if (*s == c) return s;
     return NULL;
 }
+/* Первое вхождение подстроки needle в [s, end); NULL если нет. */
 static const char *find_str(const char *s, const char *end, const char *needle) {
     size_t nl = strlen(needle);
     if (nl == 0) return s;
@@ -81,7 +83,8 @@ static void decode_entity(PS *p, Buf *out) {
     } else { buf_put(out,'&'); buf_putn(out,e,n); buf_put(out,';'); }   /* неизвестная — как есть */
     p->p = semi+1;
 }
-/* Прочитать значение в кавычках q, раскодировать сущности → строка на арене. */
+/* Прочитать значение в кавычках q, раскодировать сущности → строка на арене.
+ * tmp — общий переиспользуемый буфер: сбрасываем его длину перед накоплением. */
 static char *read_quoted(PS *p, char q, Buf *tmp) {
     tmp->n = 0;
     while (p->p < p->end && *p->p != q) {
@@ -92,6 +95,8 @@ static char *read_quoted(PS *p, char q, Buf *tmp) {
     return arena_strndup(p->a, tmp->d ? tmp->d : "", tmp->n);
 }
 
+/* Копирует накопленные атрибуты из временного вектора av в массив на арене
+ * node->attrs и освобождает malloc-буфер вектора. */
 static void finalize_attrs(XmlNode *node, PtrVec *av, Arena *a) {
     if (av->n) {
         node->attrs = arena_alloc(a, av->n * sizeof(XmlAttr));
@@ -101,7 +106,9 @@ static void finalize_attrs(XmlNode *node, PtrVec *av, Arena *a) {
     free(av->items);
 }
 
-/* Разбор одного элемента начиная с '<'. */
+/* Разбор одного элемента начиная с '<' (рекурсивно для вложенных).
+ * Две фазы: сначала имя+атрибуты до '>' или '/>', затем содержимое до </tag>.
+ * tmp переиспользуется для значений атрибутов; текст и kids копятся в свои буферы. */
 static XmlNode *parse_element(PS *p, XmlNode *parent, Buf *tmp) {
     if (p->p >= p->end || *p->p != '<') return NULL;
     p->p++;                                   /* '<' */
@@ -198,6 +205,7 @@ const char *xml_local(const char *name) {
     const char *c = strrchr(name, ':');
     return c ? c+1 : name;
 }
+/* Сравнение имён по local-name — namespace-префикс игнорируется. */
 static int name_eq(const char *a, const char *b) {
     return strcmp(xml_local(a), xml_local(b)) == 0;
 }
@@ -207,6 +215,8 @@ XmlNode *xml_child(const XmlNode *node, const char *name) {
         if (name_eq(node->kids[i]->name, name)) return node->kids[i];
     return NULL;
 }
+/* Обход поддерева в глубину: cnt — сквозной счётчик совпадений (в т.ч. сверх max,
+ * тогда в out записываются только первые max). Возвращает обновлённый счётчик. */
 static size_t find_all_rec(const XmlNode *n, const char *name, XmlNode **out, size_t max, size_t cnt) {
     for (size_t i=0;i<n->nkids;i++) {
         XmlNode *k = n->kids[i];

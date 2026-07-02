@@ -428,6 +428,8 @@ static const char *dec_str(Arena *a, Dec d) {
     return arena_strdup(a, buf);
 }
 
+/* Трёхстороннее сравнение двух Val для ORDER BY / <,>,BETWEEN и join-условий.
+ * NULL меньше любого не-NULL. Возвращает <0 / 0 / >0. */
 static int vcmp(Val a, Val b) {
     if (a.is_null && b.is_null) return 0;
     if (a.is_null) return -1;
@@ -454,6 +456,9 @@ static int vcmp(Val a, Val b) {
     return strcmp(sa, sb);
 }
 
+/* Равенство для =, IN, CASE, JOIN ON. NULL никогда не равен ничему (в т.ч.
+ * NULL=NULL → false, как в SQL). Точный путь для строк — до сравнения через
+ * double, чтобы длинные целые id не «слипались». */
 static bool veq(Val a, Val b) {
     if (a.is_null || b.is_null) return false;
     /* Exact path first: distinct large integer ids must not collide via double. */
@@ -503,6 +508,9 @@ typedef struct {
     const char *aliases[MAX_JOIN_TABLES];
 } JoinCtx;
 
+/* Разрешает ссылку на столбец col (опц. с квалификатором tbl — имя или алиас
+ * таблицы) в текущей строке join-контекста. Возвращает значение ячейки или NULL
+ * (столбец не найден / строка таблицы — outer-join NULL). */
 static const char *jctx_col(JoinCtx *ctx, const char *tbl, const char *col) {
     if (!ctx || !col) return NULL;
     for (int t = 0; t < ctx->n; t++) {
@@ -783,6 +791,11 @@ static char *u8_substr(Arena *a, const char *s, int start1, long len, bool have_
     return arena_strndup(a, s + bstart, bend - bstart);
 }
 
+/* Вычисляет вызов встроенной SQL-функции fn(args...) в контексте строки ctx.
+ * Диспетчеризует по имени: скалярные (coalesce/nullif/round/upper/substr/...),
+ * строковые/UTF-8, фаззи-скоринг для Match-шага (levenshtein/jaro_winkler/
+ * word_similarity) и агрегаты (COUNT/SUM/AVG/MIN/MAX) — последние при активном
+ * tl_grp читаются из аккумулятора группы. Неизвестная функция → NULL. */
 static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena *a) {
     /* scalar functions */
     if (!strcasecmp(fn,"coalesce") || !strcasecmp(fn,"ifnull") || !strcasecmp(fn,"nvl")) {
@@ -1113,6 +1126,11 @@ static Val eval_func(const char *fn, Expr **args, int nargs, JoinCtx *ctx, Arena
     return vnull();
 }
 
+/* Рекурсивно вычисляет выражение AST e в контексте строки ctx → Val.
+ * Ядро исполнителя: литералы, ссылки на столбцы (с NULL-контрактом и падением
+ * в tl_outer_ctx для коррелированных подзапросов), функции (eval_func), CASE,
+ * подзапросы (скалярные и IN), оконные плейсхолдеры, унарные/бинарные операции
+ * (с точной decimal-арифметикой, LIKE/BETWEEN/IN, коротким замыканием AND/OR). */
 static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
     if (!e) return vnull();
     switch (e->type) {
@@ -1424,6 +1442,13 @@ static char **parse_wal_row(Arena *a, FILE *wf, int ncols) {
 }
 
 /* ── Load table rows ── */
+/* Материализует все живые строки таблицы tname в out (TblData).
+ * Источник по приоритету: виртуальный реестр (CTE/derived) → catalog schema.
+ * Читает WAL: при годном IdxHint и B-tree по INT64-столбцу — точечный доступ
+ * по offset'ам (btree_range), иначе полный скан в два прохода (сбор tombstone'ов
+ * DELETE/UPDATE, затем выдача выживших с применением UPDATE). Поддерживает
+ * сжатые батчи (version-байт 0x01). Возвращает 0, либо -1 если схемы нет
+ * (несуществующая таблица — вызывающий помечает tl_exec_error). */
 static int load_tbl(Arena *a, const char *tname, const char *alias,
                     VTReg *vt_reg, TblData *out, const IdxHint *ih) {
     memset(out, 0, sizeof(*out));
@@ -1649,6 +1674,8 @@ typedef struct {
 } ExecState;
 
 
+/* Находит группу по её key (значения GROUP BY, склеенные через \x1F) либо
+ * создаёт новую с обнулёнными аккумуляторами на nselect+nxagg слотов. */
 static GrpAcc *find_or_create_grp(ExecState *st, const char *key) {
     for (int i=0;i<st->ngrps;i++) if(!strcmp(st->grps[i].key,key)) return &st->grps[i];
     if (st->ngrps==st->cap_grps) {
@@ -1729,6 +1756,9 @@ static void agg_accumulate(ExecState *st, GrpAcc *g, int s, Expr *agg_e, JoinCtx
     }
 }
 
+/* Обрабатывает одну входную строку в группе g: по каждому select-выражению
+ * либо накапливает агрегат, либо (для не-агрегатных) запоминает первое значение;
+ * плюс агрегаты из HAVING/ORDER BY в добавочных слотах. */
 static void agg_row(ExecState *st, GrpAcc *g, JoinCtx *ctx) {
     g->total_cnt++;
     for (int s=0;s<st->sel->nselect;s++) {
@@ -1747,6 +1777,10 @@ static void agg_row(ExecState *st, GrpAcc *g, JoinCtx *ctx) {
         agg_accumulate(st, g, st->sel->nselect + e, st->xagg[e], ctx);
 }
 
+/* Финализирует агрегацию: по каждой накопленной группе формирует выходную
+ * строку (агрегаты из аккумулятора, обёрнутые выражения — через eval_val с
+ * активным tl_grp), применяет HAVING-фильтр и вычисляет sort-ключи ORDER BY,
+ * после чего добавляет строку в результат. */
 static void emit_groups(ExecState *st) {
     /* Build a synthetic schema for HAVING evaluation */
     int nc=st->sel->nselect;
@@ -1816,6 +1850,10 @@ static void emit_groups(ExecState *st) {
     }
 }
 
+/* Колбэк на каждую полную комбинацию строк join'а (вызывается из join_recurse):
+ * применяет WHERE и либо роутит строку в группу (агрегация), либо проецирует
+ * SELECT-список (с разворотом *) прямо в результат, попутно вычисляя ORDER BY-
+ * ключи (с разрешением алиасов и позиционных ORDER BY). */
 static void collect_row(ExecState *st, JoinCtx *ctx) {
     /* WHERE filter */
     if (st->sel->where) {
@@ -1897,6 +1935,11 @@ static void collect_row(ExecState *st, JoinCtx *ctx) {
     rs_add(st->rs, st->a, cells, skeys);
 }
 
+/* Рекурсивный вложенно-цикловой join по таблицам tables[0..ntables). depth —
+ * текущая таблица; ctx накапливает строку по одной из каждой. Для JOIN проверяет
+ * условие ON, поддерживает INNER/LEFT/FULL/CROSS: при отсутствии совпадений для
+ * LEFT/FULL добавляет строку с NULL-заполнением (force_nulls протягивает NULL по
+ * оставшимся таблицам). На полной комбинации вызывает collect_row. */
 static void join_recurse(ExecState *st, int depth, JoinCtx *ctx,
                          TblData *tables, int ntables, bool force_nulls) {
     if (force_nulls) {
@@ -2467,6 +2510,12 @@ static void apply_windows(Arena *a, RS *rs, const SelectStmt *sel) {
 }
 
 /* ── Execute a SELECT statement ── */
+/* Полный конвейер SELECT → RS. Порядок: выполнить CTE (в vt-реестр), загрузить
+ * источники (таблицы через load_tbl / derived-подзапросы), определить нужду в
+ * агрегации, вывести имена и логические типы столбцов, прогнать join_recurse
+ * (→ WHERE/GROUP/проекция), затем emit_groups (агрегация), DISTINCT, оконные
+ * функции (apply_windows), ORDER BY (стабильная сортировка) и LIMIT/OFFSET.
+ * Несуществующий источник помечает tl_exec_error. */
 static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     /* Setup VT registry — inherit parent + add CTEs */
     VTReg local_vt={0};
@@ -2676,6 +2725,13 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
 }
 
 /* ── Execute a statement (handles SET_OP) ── */
+/* Точка входа исполнителя: диспетчер по типу Stmt. SELECT → exec_select;
+ * SET_OP (UNION [ALL]/INTERSECT/EXCEPT) — рекурсивно исполняет обе стороны и
+ * комбинирует строки; DELETE/UPDATE — скан WAL с оценкой WHERE, запись
+ * tombstone'ов/обновлений (в txn-буфер при активной транзакции g_txn_current,
+ * иначе прямо в таблицу; сжатые батчи маскируются и переписываются CSV) и
+ * возврат 1-столбцового RS с числом затронутых строк. INSERT здесь не
+ * реализован. Возвращает RS или NULL при ошибке. */
 static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
     if (!s) return NULL;
     if (s->type == STMT_SELECT) return exec_select(a, &s->select, vt);
@@ -3088,6 +3144,12 @@ static void h_tables_list(HttpReq *req, HttpResp *resp) {
 }
 
 /* ── POST /api/tables/query ── */
+/* Главный REST-эндпоинт SQL: тело {"sql":...,"limit"?}. Парсит запрос, проверяет
+ * RBAC/RLS (для SELECT — check_select_access, для DML — check_table_access +
+ * роль ≥ analyst), обрабатывает BEGIN/COMMIT/ROLLBACK через req->txn_id, режет
+ * SELECT до лимита (≤10000) и исполняет через exec_stmt. Ответ — JSON
+ * {columns, rows, elapsed_ms, row_count} с типизированным рендерингом ячеек
+ * (числа/bool без кавычек, NULL → json null). Несуществующая таблица → 400. */
 static void h_query(HttpReq *req, HttpResp *resp) {
     if (!req->body || req->body_len == 0) { http_resp_error(resp,400,"empty body"); return; }
     Arena *a = arena_create(1048576); /* 1 MiB arena */
@@ -3546,6 +3608,12 @@ static int pg_emulate_catalog(PgConn *conn, const char *sql) {
     return 0;
 }
 
+/* Мост pgwire → SQL-движок (см. объявление в app.h). Сначала перехватывает
+ * пробы pg_catalog/information_schema (pg_emulate_catalog), затем парсит и
+ * исполняет через exec_stmt, транслируя RS в протокол: RowDescription (OID
+ * столбцов выводится из первой не-NULL ячейки), поток DataRow (SQL-NULL по
+ * контракту → wire-NULL) и CommandComplete-тег (SELECT/INSERT/UPDATE/DELETE n).
+ * BEGIN/COMMIT/ROLLBACK — no-op с корректным тегом; ошибки → ErrorResponse. */
 void api_pg_execute(PgConn *conn, const char *sql) {
     /* Catalog probes go first so we don't hand them to a parser that
      * has no knowledge of pg_class etc. */
@@ -4764,6 +4832,13 @@ static void cursor_state_save(App *app, const char *pipeline_id, const char *ste
 }
 
 /* ── Run one connector step: pull all batches into target_table ── */
+/* Шаг-источник: загружает .so-коннектор по connector_type, определяет источник
+ * (query/table из config либо transform_sql) и постранично тянет батчи
+ * (read_batch) в целевую таблицу, пересоздавая её из схемы первого батча.
+ * Значения хранятся как TEXT (батчи всегда char*). Поддерживает инкрементальный
+ * режим (cursor_column): high-watermark курсор берётся/сохраняется между
+ * прогонами; иначе OFFSET-курсор по числу прочитанных строк. Возвращает число
+ * загруженных строк или -1 (ошибка read_batch — с причиной коннектора). */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *pipeline_id,
                               char *errbuf, size_t errsz) {
     char so_path[1024];

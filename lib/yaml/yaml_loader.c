@@ -46,6 +46,8 @@ typedef struct {
 } Yaml;
 
 /* ────────── Error helpers ────────── */
+/* Записать в err позицию (line:col) и printf-сообщение; всегда возвращает -1,
+ * чтобы вызов можно было сразу вернуть как код ошибки. err может быть NULL. */
 __attribute__((format(printf, 4, 5)))
 static int set_err(YamlError *err, int line, int col, const char *fmt, ...) {
     if (err) {
@@ -153,6 +155,8 @@ static char *parse_quoted(const char *s, char qc, Arena *a, size_t *advance) {
 }
 
 /* helper: append a YamlLine to y->lines */
+/* Добавить разобранную строку в массив y->lines, удваивая ёмкость по мере роста
+ * (арена без realloc — новый блок + копирование старого). */
 static void push_line(Yaml *y, YamlLine yl) {
     if (y->n >= y->cap) {
         int nc = y->cap * 2;
@@ -164,6 +168,11 @@ static void push_line(Yaml *y, YamlLine yl) {
 }
 
 /* ────────── Preprocess: source → YamlLine[] ────────── */
+/* Фаза 1: разбить исходник на строки и классифицировать каждую (отступ + вид:
+ * map/seq/скаляр/маркер). Определяет ключ/значение, распознаёт заголовки блочных
+ * скаляров "|"/">" и переводит парсер в режим absorbing, где вложенные строки
+ * сохраняются как непрозрачный контент (YL_BLANK+raw) до возврата отступа.
+ * Возврат: 0 — ok, -1 — синтаксическая ошибка (через set_err). */
 static int preprocess(Yaml *y, const char *src, size_t len) {
     /* Make a working copy we can chop into lines */
     char *buf = arena_alloc(y->a, len + 1);
@@ -312,6 +321,7 @@ static int  emit_block_scalar(Yaml *y, int *idx, int parent_indent,
                               char kind, JBuf *out);
 
 /* skip blank/marker lines */
+/* Продвинуть *idx за пустые строки и маркеры документа (--- / ...). */
 static void skip_blank(Yaml *y, int *idx) {
     while (*idx < y->n &&
            (y->lines[*idx].kind == YL_BLANK || y->lines[*idx].kind == YL_DOC_MARKER))
@@ -319,6 +329,8 @@ static void skip_blank(Yaml *y, int *idx) {
 }
 
 /* peek next non-blank line (returns NULL if none) */
+/* Как skip_blank, но возвращает первую значимую строку (и сдвигает *idx на неё);
+ * NULL, если до конца остались только пустые/маркеры. */
 static YamlLine *peek_nonblank(Yaml *y, int *idx) {
     int i = *idx;
     while (i < y->n &&
@@ -466,6 +478,9 @@ static int emit_block_scalar(Yaml *y, int *idx, int parent_indent,
 }
 
 /* ────────── Block sequence ────────── */
+/* Сериализовать блочную последовательность (строки "- …" с отступом my_indent)
+ * в JSON-массив. Элемент = inline-скаляр, вложенный блок ("-") или inline-mapping
+ * ("- key: value"). Завершается на первой строке с иным отступом/видом. */
 static int emit_block_seq(Yaml *y, int *idx, int my_indent, JBuf *out) {
     jb_arr_begin(out);
     while (*idx < y->n) {
@@ -562,6 +577,9 @@ static int emit_inline_seq_kv(Yaml *y, int *idx, int my_indent, JBuf *out) {
 }
 
 /* ────────── Block mapping ────────── */
+/* Сериализовать блочное отображение (строки "key: …" с отступом my_indent) в
+ * JSON-объект: скаляр, flow-массив [..], блочный скаляр |/> или вложенный блок
+ * (emit_value). Завершается на строке с иным отступом или не-map-видом. */
 static int emit_block_map(Yaml *y, int *idx, int my_indent, JBuf *out) {
     jb_obj_begin(out);
     while (*idx < y->n) {
@@ -593,6 +611,9 @@ static int emit_block_map(Yaml *y, int *idx, int my_indent, JBuf *out) {
 }
 
 /* ────────── emit_value: dispatch based on next non-blank line ────────── */
+/* Сериализовать вложенное значение (после "key:" / "-"). Если следующая значимая
+ * строка имеет отступ <= parent_indent, вложенного блока нет → пишем JSON null;
+ * иначе диспетчеризуем в map или seq по её виду. */
 static int emit_value(Yaml *y, int *idx, int parent_indent, JBuf *out) {
     YamlLine *l = peek_nonblank(y, idx);
     if (!l || l->indent <= parent_indent) {

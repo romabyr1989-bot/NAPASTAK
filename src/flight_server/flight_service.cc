@@ -41,6 +41,10 @@ DfoFlightService::~DfoFlightService() = default;
 /* ── helpers ───────────────────────────────────────────────────── */
 namespace {
 
+/* Извлекает SQL из полезной нагрузки Flight Ticket:
+ *   "sql:…"   — берётся текст после префикса;
+ *   "table:X" — превращается в SELECT * FROM X;
+ *   иначе payload трактуется как сырой SQL. */
 std::string ticket_to_sql(const flight::Ticket& t) {
     std::string s(reinterpret_cast<const char*>(t.ticket.data()), t.ticket.size());
     if (s.rfind("sql:", 0) == 0)   return s.substr(4);
@@ -54,6 +58,10 @@ std::string sql_ticket_str(const std::string& sql) { return "sql:" + sql; }
 }  // namespace
 
 /* ── ListFlights — every table is a flight ──────────────────── */
+/* Перечисляет все таблицы gateway (GET /api/tables) как отдельные flights.
+ * Для каждой таблицы схема выясняется отдельным запросом SELECT * LIMIT 0,
+ * а Ticket формируется как "sql:SELECT * FROM <table>". Таблицы, схему
+ * которых получить не удалось, молча пропускаются. */
 arrow::Status DfoFlightService::ListFlights(
     const flight::ServerCallContext&,
     const flight::Criteria*,
@@ -106,6 +114,10 @@ arrow::Status DfoFlightService::ListFlights(
 }
 
 /* ── GetFlightInfo — schema of one flight ───────────────────── */
+/* Возвращает FlightInfo (в первую очередь схему) для одного flight.
+ * Дескриптор PATH → "SELECT * FROM <path>"; дескриптор CMD → SQL из
+ * команды (с префиксом "sql:" или без). Схема выясняется прогоном запроса
+ * с добавленным LIMIT 0, число записей/байт неизвестно и отдаётся как -1. */
 arrow::Status DfoFlightService::GetFlightInfo(
     const flight::ServerCallContext&,
     const flight::FlightDescriptor& descriptor,
@@ -145,6 +157,10 @@ arrow::Status DfoFlightService::GetFlightInfo(
 }
 
 /* ── DoGet — execute SQL, stream Arrow ──────────────────────── */
+/* Основной путь чтения: извлекает SQL из Ticket, экранирует его для JSON,
+ * выполняет через POST /api/tables/query, конвертирует ответ в arrow::Table
+ * и отдаёт клиенту потоком record batch'ей. Таблица целиком строится в
+ * памяти (см. замечание о будущей pull-модели в шапке файла). */
 arrow::Status DfoFlightService::DoGet(
     const flight::ServerCallContext&,
     const flight::Ticket& request,
@@ -190,6 +206,8 @@ arrow::Status DfoFlightService::DoGet(
 }
 
 /* ── DoPut — stub (Step 2 ships read-only) ───────────────────── */
+/* Запись через Flight пока не поддержана: возвращает NotImplemented и
+ * подсказывает обходной путь — POST /api/ingest/csv на gateway. */
 arrow::Status DfoFlightService::DoPut(
     const flight::ServerCallContext&,
     std::unique_ptr<flight::FlightMessageReader>,

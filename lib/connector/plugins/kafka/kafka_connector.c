@@ -1,3 +1,18 @@
+/* kafka_connector.c — коннектор Kafka (источник + приёмник), ABI v3.
+ *
+ * Транспорт: librdkafka. Источник — consumer, читающий один топик; приёмник —
+ * producer, публикующий по одному JSON-сообщению на строку. Плагин экспортирует
+ * таблицу ABI как data-символ dfo_connector_entry (см. конец файла).
+ *
+ * Форматы payload (config data_format): "json" | "csv" | "avro".
+ *   json — сообщение = объект; ключи → колонки.
+ *   csv  — первая строка сэмпла = заголовок.
+ *   avro — Confluent-обёртка [0x00][schema_id:4 BE][Avro binary]; схема тянется
+ *          из Schema Registry по HTTP (libcurl) и кэшируется по id.
+ * Разбор Avro-схемы/двоичного слоя — в avro_record.h / avro_decode.h.
+ * Ко всем строкам применяется text-always модель: значения всегда char*,
+ * тип колонки в схеме — лишь метаданные (native int64/double → сегфолт ядра).
+ */
 /* Kafka streaming connector — ABI v2 (JSON/CSV/Avro + Schema Registry) */
 #include "../../../connector/connector.h"
 #include "../../../core/arena.h"
@@ -37,6 +52,10 @@ typedef struct AvroSchemaCache {
     pthread_mutex_t mu;
 } AvroSchemaCache;
 
+/* Контекст одного экземпляра коннектора (аллоцируется в host-арене).
+ * Хранит настройки из config_json, живой consumer rk с подпиской, кэш Avro-схем
+ * и состояние фонового CDC-потока. Все char-поля инициализируются дефолтами в
+ * kafka_create и опционально перекрываются из config_json. */
 typedef struct {
     rd_kafka_t                        *rk;
     rd_kafka_topic_partition_list_t   *tplist;
@@ -694,6 +713,7 @@ static void kafka_destroy(void *vctx)
      * gateway). Mirror pg_connector: release only the plugin's own resources. */
 }
 
+/* Единственная сущность коннектора — сконфигурированный топик (type="stream"). */
 static int kafka_list_entities(void *vctx, Arena *a, DfoEntityList *out)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
@@ -969,7 +989,10 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->ncols    = ncols;
     batch->nrows    = nrows;
 
-    /* Allocate merged value arrays */
+    /* Сшиваем per-message батчи (по 1 строке) в колоночные массивы: строка r
+     * колонки c берётся из msgs[r]->values[c][0]. Раскладка значения зависит от
+     * типа колонки (INT64/BOOL — native int64, DOUBLE — native double, иначе —
+     * char*), чтобы совпадать с тем, как батч заполнял batch_from_* . */
     for (int c = 0; c < ncols; c++) {
         batch->null_bitmap[c] = arena_calloc(a, (nrows + 7) / 8);
         switch (schema->cols[c].type) {
@@ -1021,12 +1044,18 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 
     *out = batch;
 
+    /* Курсор для пагинации — последний прочитанный offset ("offset:<N>"). Пишем
+     * поверх const-поля req->cursor через каст: вызывающий владеет структурой и
+     * читает обновлённый курсор после возврата. */
     if (last_offset >= 0)
         *(const char **)&req->cursor = arena_sprintf(a, "offset:%lld", (long long)last_offset);
 
     return 0;
 }
 
+/* Запускает фоновый CDC-поток (consumer_thread_fn), доставляющий каждое
+ * сообщение как CdcEvent(INSERT) в handler. Идемпотентно: повторный вызов при
+ * уже работающем потоке — no-op (0). */
 static int kafka_cdc_start(void *vctx, DfoCdcHandler handler, void *userdata)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
@@ -1047,6 +1076,7 @@ static int kafka_cdc_start(void *vctx, DfoCdcHandler handler, void *userdata)
     return 0;
 }
 
+/* Сбрасывает флаг consumer_running и дожидается завершения CDC-потока. */
 static int kafka_cdc_stop(void *vctx)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
@@ -1091,6 +1121,8 @@ static const char *kafka_last_error(void *vctx)
  *
  * NOTE: compiles and follows the standard rdkafka producer flow, but not
  * exercised against a live broker in this environment. */
+/* Дописывает s в растущий буфер *buf с JSON-экранированием (кавычки, слэши,
+ * управляющие символы < 0x20 → \uXXXX); при нехватке места *buf реаллоцируется. */
 static void kafka_json_escape(char **buf, size_t *len, size_t *cap, const char *s) {
     for (const char *p = s ? s : ""; *p; p++) {
         char esc[8]; const char *w; int n;

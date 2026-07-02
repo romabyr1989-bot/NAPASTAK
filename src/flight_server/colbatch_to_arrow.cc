@@ -24,6 +24,8 @@ namespace {
 
 enum class InferredType { Int64, Float64, Bool, Utf8 };
 
+/* Определяет тип столбца по одному образцовому значению;
+ * всё, что не bool/число, считается строкой (Utf8). */
 InferredType infer_type(const json& sample) {
     if (sample.is_boolean())            return InferredType::Bool;
     if (sample.is_number_integer())     return InferredType::Int64;
@@ -32,6 +34,7 @@ InferredType infer_type(const json& sample) {
     return InferredType::Utf8;
 }
 
+/* Сопоставляет выведенный InferredType соответствующему arrow::DataType. */
 std::shared_ptr<arrow::DataType> inferred_to_arrow(InferredType t) {
     switch (t) {
         case InferredType::Bool:    return arrow::boolean();
@@ -44,6 +47,11 @@ std::shared_ptr<arrow::DataType> inferred_to_arrow(InferredType t) {
 
 }  // namespace
 
+/* Конвертирует JSON-результат запроса gateway ({columns,rows,...}) в
+ * arrow::Table. Типы столбцов выводятся по первой строке; ячейки при
+ * необходимости приводятся к целевому типу (строки парсятся в число,
+ * несовместимые/null значения дают AppendNull). Возвращает ошибку, если
+ * отсутствуют обязательные поля columns[]/rows[]. */
 arrow::Result<std::shared_ptr<arrow::Table>> json_query_result_to_arrow(
     const json& result) {
 

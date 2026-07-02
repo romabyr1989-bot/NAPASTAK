@@ -98,6 +98,8 @@ static void cfg_get(const char *json, const char *key,
 }
 
 /* ── JSON-escape строки в растущий буфер ── */
+/* Экранирует спецсимволы и управляющие коды (< 0x20 → \uXXXX) для вставки
+ * значения/ключа в JSON-тело запроса к Siebel. */
 static void sb_json_escape(CurlBuf *b, const char *s) {
     char tmp[8];
     for (const char *p = s ? s : ""; *p; p++) {

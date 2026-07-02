@@ -25,6 +25,7 @@
 #include <strings.h>
 #include <stdint.h>
 
+/* Namespace-URI SOAP-конверта: 1.1 vs 1.2 (задают заголовки и xmlns:soap). */
 #define SOAP11_NS "http://schemas.xmlsoap.org/soap/envelope/"
 #define SOAP12_NS "http://www.w3.org/2003/05/soap-envelope"
 
@@ -50,12 +51,14 @@ typedef struct {
 } SoapCtx;
 
 /* ── Буфер libcurl / ручная сборка тела ── */
+/* Растущий буфер: write-callback libcurl и ручной аппендер SOAP-конверта. */
 typedef struct { char *data; size_t len, cap; } CurlBuf;
 static size_t curl_write(void *ptr, size_t size, size_t nmemb, void *ud) {
     CurlBuf *b=ud; size_t n=size*nmemb;
     if (b->len+n+1>b->cap) { size_t nc=b->cap?b->cap*2:4096; while(nc<b->len+n+1) nc*=2; b->data=realloc(b->data,nc); if(!b->data) return 0; b->cap=nc; }
     memcpy(b->data+b->len,ptr,n); b->len+=n; b->data[b->len]='\0'; return n;
 }
+/* cfg_get — мини-парсер плоского JSON-конфига (как в других коннекторах). */
 static void cfg_get(const char *json, const char *key, char *out, size_t outsz, const char *def) {
     if (def) { strncpy(out,def,outsz-1); out[outsz-1]='\0'; }
     if (!json) return;
@@ -76,6 +79,7 @@ static void cfg_get(const char *json, const char *key, char *out, size_t outsz, 
     }
     else { const char *e=p; while(*e&&*e!=','&&*e!='}'&&*e!=' '&&*e!='\n') e++; size_t n=(size_t)(e-p); if(n>=outsz)n=outsz-1; memcpy(out,p,n); out[n]='\0'; }
 }
+/* Экранирование текстового значения для вставки в XML/SOAP-конверт. */
 static void xml_escape(CurlBuf *b, const char *s) {
     for (const char *p=s?s:""; *p; p++) {
         switch (*p) {
@@ -87,6 +91,7 @@ static void xml_escape(CurlBuf *b, const char *s) {
         }
     }
 }
+/* Безопасное имя тега из имени колонки: недопустимые символы → '_'. */
 static void xml_tag(CurlBuf *b, const char *name) {
     const char *s=(name&&name[0])?name:"col";
     char c0=s[0];
@@ -99,6 +104,7 @@ static void xml_tag(CurlBuf *b, const char *name) {
 }
 
 /* ── Lifecycle ── */
+/* create(): аллоцирует SoapCtx в арене и заполняет из плоского JSON-конфига. */
 static void *soap_create(const char *cfg, Arena *a) {
     SoapCtx *ctx=arena_calloc(a,sizeof(SoapCtx));
     ctx->arena=a;
@@ -119,9 +125,11 @@ static void *soap_create(const char *cfg, Arena *a) {
     ctx->page_size=atoi(pgsz); if(ctx->page_size<=0) ctx->page_size=1000;
     return ctx;
 }
+/* Вся память ctx — в арене; отдельного освобождения нет. */
 static void soap_destroy(void *ctx) { (void)ctx; }
 static const char *soap_last_error(void *vctx) { SoapCtx *c=vctx; return (c&&c->last_err[0])?c->last_err:NULL; }
 
+/* Накладывает Basic/Bearer-auth на запрос (basic → хэндл, bearer → заголовок). */
 static void soap_apply_auth(CURL *curl, SoapCtx *ctx, struct curl_slist **hdrs) {
     if (strcasecmp(ctx->auth_type,"basic")==0 && ctx->user[0]) {
         curl_easy_setopt(curl,CURLOPT_HTTPAUTH,(long)CURLAUTH_BASIC);
@@ -132,6 +140,7 @@ static void soap_apply_auth(CURL *curl, SoapCtx *ctx, struct curl_slist **hdrs) 
         *hdrs=curl_slist_append(*hdrs,h);
     }
 }
+/* SOAP 1.2? (иначе — 1.1: разные Content-Type, заголовок SOAPAction и NS). */
 static int soap_is12(SoapCtx *ctx) { return strcmp(ctx->soap_version,"1.2")==0; }
 
 /* Подстановка {StartRow}/{PageSize} в шаблон запроса. */
@@ -222,6 +231,7 @@ static size_t soap_locate_rows(SoapCtx *ctx, XmlNode *root, XmlNode **out, size_
     return n;
 }
 
+/* Схема (TEXT-always): уникальные local-names прямых детей записи, в порядке появления. */
 static Schema *soap_schema_from(XmlNode *rec, Arena *a) {
     if (!rec) return NULL;
     const char *names[MAX_COLS]; int nc=0;
@@ -236,6 +246,7 @@ static Schema *soap_schema_from(XmlNode *rec, Arena *a) {
     for (int c=0;c<nc;c++){ sc->cols[c].name=arena_strdup(a,names[c]); sc->cols[c].type=COL_TEXT; sc->cols[c].nullable=true; }
     return sc;
 }
+/* Заполнить батч из массива записей по схеме; нет дочернего элемента → NULL-бит. */
 static int soap_fill(XmlNode **rows, int nrows, Schema *sc, ColBatch *b, Arena *a) {
     for (int n=0;n<nrows;n++) {
         XmlNode *rec=rows[n];
@@ -248,6 +259,8 @@ static int soap_fill(XmlNode **rows, int nrows, Schema *sc, ColBatch *b, Arena *
     return nrows;
 }
 
+/* describe(): POST-ит шаблон (StartRow=0), находит первую запись в ответе и
+ * выводит из неё TEXT-схему. entity игнорируется (одна сущность). */
 static int soap_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     (void)entity;
     SoapCtx *ctx=vctx;
@@ -316,6 +329,7 @@ static int soap_read_batch(void *vctx, Arena *a, DfoReadReq *req, const char *en
     return done?1:0;
 }
 
+/* list_entities(): одна сущность — имя SOAP-операции (operation или "Operation"). */
 static int soap_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     SoapCtx *ctx=vctx;
     out->items=arena_calloc(a,sizeof(DfoEntity));
@@ -323,6 +337,8 @@ static int soap_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     out->items[0].type="table"; out->count=1;
     return 0;
 }
+/* ping(): HEAD на url; успех = транспорт ОК и код < 500 (4xx/405 у SOAP-эндпоинта
+ * на HEAD/GET — норма: сервер жив, но метод не тот). */
 static int soap_ping(void *vctx) {
     SoapCtx *ctx=vctx;
     if (!ctx->url[0]) { snprintf(ctx->last_err,sizeof(ctx->last_err),"soap: не задан url"); return -1; }
@@ -389,6 +405,8 @@ static int soap_write_batch(void *vctx, Arena *a, const char *entity,
     return batch->nrows;
 }
 
+/* Точка входа плагина: по этому символу загрузчик находит ABI-таблицу.
+ * describe/read_batch — source, write_batch — sink; CDC не поддерживается. */
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "soap",

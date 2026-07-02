@@ -98,7 +98,11 @@ int64_t cron_next(const char *expr, int64_t after) {
 }
 
 /* ── Топологическая сортировка DAG зависимостей шагов (алгоритм Кана) ──
- * Возвращает 0 и порядок выполнения в order[], или -1 при обнаружении цикла. */
+ * deps[j] — индекс шага-предшественника; indegree[i] = число зависимостей шага i.
+ * Шаги с нулевой входящей степенью кладём в очередь; вынимая шаг u, уменьшаем
+ * indegree у зависящих от него и добавляем те, у кого он обнулился.
+ * Возвращает 0 и порядок выполнения в order[] (длиной p->nsteps), или -1, если
+ * не все шаги вошли в порядок — это признак цикла в графе. */
 static int topo_sort(Pipeline *p, int *order) {
     int indegree[MAX_STEPS] = {0};
     for(int i=0;i<p->nsteps;i++)
@@ -409,6 +413,12 @@ static const char *pipeline_active_cron(const Pipeline *p) {
     return p->cron[0] ? p->cron : NULL;
 }
 
+/* Тело фонового потока планировщика. Каждые 30 с под удержанием s->mu
+ * пробегает все пайплайны: для активного cron-триггера при первом проходе
+ * вычисляет next_run, а по достижении срока (и если запуск не идёт) помечает
+ * run_status=RUN_RUNNING, пересчитывает next_run и вызывает on_run прямо под
+ * мьютексом. Поэтому on_run обязан не выполнять работу синхронно, а лишь
+ * ставить её в очередь/пул. Завершается, когда s->running обнуляется. */
 static void *sched_loop(void *arg) {
     Scheduler *s = arg;
     LOG_INFO("scheduler started");
@@ -477,6 +487,8 @@ Pipeline *scheduler_find(Scheduler *s, const char *id) {
     return found;
 }
 
+/* Записать итог завершённого запуска обратно в живой пайплайн под s->mu
+ * (см. подробности в scheduler.h). No-op, если пайплайн с таким id уже удалён. */
 void scheduler_finish_run(Scheduler *s, const char *id, int run_status,
                           int last_run_failed, const char *error_msg) {
     pthread_mutex_lock(&s->mu);

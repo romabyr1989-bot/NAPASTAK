@@ -139,6 +139,8 @@ static void *client_thread_fn(void *arg) {
             handle_replicate(fd, &hdr, body, blen);
             break;
         case MSG_STATUS_REQ: {
+            /* Ответ о состоянии узла: standby всегда is_leader=0, реплик у него
+               нет (replica_count=0), а wal_offset — последний применённый LSN. */
             ProtoStatusBody sb;
             memset(&sb, 0, sizeof(sb));
             sb.is_leader     = 0;

@@ -44,7 +44,8 @@ static void send_to_replica(StorageClient *sc, const ReplItem *item) {
     }
     free(body);
 
-    /* Wait for ACK */
+    /* Ждём ACK: сам факт получения ответа = успех; тип и result_code внутри
+     * ahdr/abody не проверяются, ответ лишь синхронизирует темп отправки. */
     ProtoHeader ahdr; void *abody = NULL; size_t alen = 0;
     if (proto_recv(sc->fd, &ahdr, &abody, &alen) < 0) {
         storage_client_disconnect(sc);
@@ -78,6 +79,9 @@ static void *worker_fn(void *arg) {
         for (int i = 0; i < r->nreplicas; i++)
             send_to_replica(r->replicas[i], &item);
 
+        /* Обновляем «дошедший» LSN оптимистично: send_to_replica проглатывает
+         * ошибки/содержимое ACK, поэтому значение отражает разосланное, а не
+         * гарантированно применённое всеми репликами. */
         r->last_acked_lsn = item.lsn;
         free(item.data);  /* копия payload'а, выделенная при enqueue */
     }

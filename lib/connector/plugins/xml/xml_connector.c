@@ -43,6 +43,8 @@ typedef struct {
 } XmlCtx;
 
 /* ── Буфер libcurl + ручная сборка тела ── */
+/* Растущий буфер: используется и как write-callback libcurl (приём ответа), и
+ * как ручной аппендер при сборке XML-документа. Возврат != n прерывает передачу. */
 typedef struct { char *data; size_t len, cap; } CurlBuf;
 static size_t curl_write(void *ptr, size_t size, size_t nmemb, void *ud) {
     CurlBuf *b=ud; size_t n=size*nmemb;
@@ -98,6 +100,8 @@ static void xml_tag(CurlBuf *b, const char *name) {
 }
 
 /* ── Lifecycle ── */
+/* create(): аллоцирует XmlCtx в арене и заполняет из плоского JSON-конфига.
+ * url задан => HTTP-режим; иначе path => файловый режим (см. xml_is_file). */
 static void *xml_create(const char *cfg, Arena *a) {
     XmlCtx *ctx=arena_calloc(a,sizeof(XmlCtx));
     ctx->arena=a;
@@ -117,9 +121,12 @@ static void *xml_create(const char *cfg, Arena *a) {
     ctx->page_size=atoi(pgsz); if(ctx->page_size<=0) ctx->page_size=1000;
     return ctx;
 }
+/* Вся память ctx — в арене; отдельного освобождения нет. */
 static void xml_destroy(void *ctx) { (void)ctx; }
 static const char *xml_last_error(void *vctx) { XmlCtx *c=vctx; return (c&&c->last_err[0])?c->last_err:NULL; }
 
+/* Накладывает Basic- или Bearer-auth на запрос (basic → на хэндл, bearer →
+ * заголовком Authorization). */
 static void xml_apply_auth(CURL *curl, XmlCtx *ctx, struct curl_slist **hdrs) {
     if (strcasecmp(ctx->auth_type,"basic")==0 && ctx->user[0]) {
         curl_easy_setopt(curl,CURLOPT_HTTPAUTH,(long)CURLAUTH_BASIC);
@@ -132,6 +139,7 @@ static void xml_apply_auth(CURL *curl, XmlCtx *ctx, struct curl_slist **hdrs) {
 }
 
 /* ── Источник: получить XML-документ (HTTP-страница или файл) в арену ── */
+/* Файловый режим: задан path и НЕ задан url (url имеет приоритет). */
 static int xml_is_file(XmlCtx *ctx) { return ctx->path[0] && !ctx->url[0]; }
 
 static char *xml_read_file(const char *path, Arena *a, XmlCtx *ctx) {
@@ -143,6 +151,10 @@ static char *xml_read_file(const char *path, Arena *a, XmlCtx *ctx) {
     size_t rd=fread(buf,1,(size_t)sz,f); fclose(f);
     buf[rd]='\0'; return buf;
 }
+/* xml_http_fetch: один GET/POST XML-документа, тело ответа → арена a.
+ * GET c page_param: дописывает &page_param=offset к url (offset-пагинация).
+ * POST: тело post_body, Content-Type application/xml. NULL при ошибке (код
+ * вне 2xx или транспорт), причина → ctx->last_err. */
 static char *xml_http_fetch(XmlCtx *ctx, int64_t offset, Arena *a) {
     CURL *curl=curl_easy_init(); if(!curl) return NULL;
     int is_get = strcasecmp(ctx->method,"POST")!=0;
@@ -225,6 +237,8 @@ static Schema *xml_schema_from(XmlNode *rec, Arena *a) {
     return sc;
 }
 
+/* describe(): тянет документ (файл или первую HTTP-страницу), находит первую
+ * запись и выводит из неё TEXT-схему. entity игнорируется (одна сущность). */
 static int xml_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     (void)entity;
     XmlCtx *ctx=vctx;
@@ -255,6 +269,7 @@ static int xml_fill(XmlNode **rows, int nrows, Schema *sc, ColBatch *batch, Aren
     return nrows;
 }
 
+/* Собрать ColBatch: схема из первой записи, колоночные TEXT-массивы + битмапы. */
 static ColBatch *xml_build_batch(XmlNode **rows, int nrows, Arena *a, XmlCtx *ctx) {
     Schema *sc=xml_schema_from(rows[0],a);
     if (!sc) { snprintf(ctx->last_err,sizeof(ctx->last_err),"xml: не вывести схему из записей"); return NULL; }
@@ -317,6 +332,7 @@ static int xml_read_batch(void *vctx, Arena *a, DfoReadReq *req, const char *ent
     return done?1:0;
 }
 
+/* list_entities(): одна сущность — имя тега записи (row_tag или "row"). */
 static int xml_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     XmlCtx *ctx=vctx;
     out->items=arena_calloc(a,sizeof(DfoEntity));
@@ -324,6 +340,7 @@ static int xml_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     out->items[0].type="table"; out->count=1;
     return 0;
 }
+/* ping(): файл — проверка открытия; HTTP — пробный fetch первой страницы. */
 static int xml_ping(void *vctx) {
     XmlCtx *ctx=vctx;
     if (xml_is_file(ctx)) { FILE *f=fopen(ctx->path,"rb"); if(!f){snprintf(ctx->last_err,sizeof(ctx->last_err),"xml: файл недоступен: %s",ctx->path);return -1;} fclose(f); return 0; }
@@ -335,6 +352,8 @@ static int xml_ping(void *vctx) {
 }
 
 /* ── NULL-контракт приёмника (битмап или sentinel) ── */
+/* Ячейка = NULL если помечена в null_bitmap либо текст == DFO_NULL_SENTINEL;
+ * такое поле в выводе даёт пустой <col></col>. */
 static int xml_cell_null(const ColBatch *b, int c, int r) {
     const uint8_t *bm=b->null_bitmap[c];
     if (bm && ((bm[r/8]>>(r%8))&1u)) return 1;
@@ -423,6 +442,8 @@ static int xml_write_batch(void *vctx, Arena *a, const char *entity,
     return batch->nrows;
 }
 
+/* Точка входа плагина: по этому символу загрузчик находит ABI-таблицу.
+ * describe/read_batch — source, write_batch — sink; CDC не поддерживается. */
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "xml",

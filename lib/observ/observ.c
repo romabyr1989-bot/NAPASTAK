@@ -51,7 +51,8 @@ double metrics_avg(MetricRing *r, int n) {
 }
 
 /* Сериализует снимок всех метрик (счётчики + скользящие средние за 60 сэмплов)
- * в JSON-строку, выделенную в arena. */
+ * в JSON-строку, выделенную в arena. Метка "1min" верна лишь при семплировании
+ * ~1 раз/с: усредняется по 60 последним сэмплам, а не по 60 секундам времени. */
 char *metrics_to_json(Metrics *m, Arena *a) {
     int64_t now = (int64_t)time(NULL);
     char *buf = arena_sprintf(a,
@@ -93,7 +94,9 @@ char *metrics_to_json(Metrics *m, Arena *a) {
 }
 
 /* Прогоняет правило качества данных по таблице: формирует JSON-отчёт по каждой
- * проверке (*report_out, выделен в arena) и возвращает число проваленных проверок. */
+ * проверке (*report_out, выделен в arena) и возвращает число проваленных проверок.
+ * Саму таблицу не читает: pass_count/fail_count каждой QualityCheck должны быть
+ * заполнены заранее; проверка считается пройденной при fail_count == 0. */
 int qc_run(QualityRule *rule, const char *table_name,
            int64_t row_count, Arena *a, char **report_out) {
     char *buf = arena_alloc(a, 4096);

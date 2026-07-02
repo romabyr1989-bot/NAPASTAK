@@ -55,6 +55,8 @@ bool parse_args(int argc, char** argv, CliConfig& c) {
 
 std::unique_ptr<flight::FlightServerBase> g_server;
 
+/* Обработчик SIGINT/SIGTERM: инициирует graceful-остановку gRPC-сервера,
+ * после чего блокирующий Serve() в main возвращает управление. */
 void on_signal(int sig) {
     (void)sig;
     if (g_server) {

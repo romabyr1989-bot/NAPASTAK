@@ -1,6 +1,12 @@
-/* parquet_connector.c — минимальный ридер Apache Parquet v2 для DFO.
- * Поддерживает: INT32/64, INT96 (как INT64), FLOAT/DOUBLE, BYTE_ARRAY,
- * BOOLEAN; кодировка PLAIN; GZIP и UNCOMPRESSED; один файл или glob. */
+/* parquet_connector.c — минимальный ридер/райтер Apache Parquet v2 для DFO.
+ * Source: читает .parquet-файлы (INT32/64, INT96 как INT64, FLOAT/DOUBLE,
+ *   BYTE_ARRAY, BOOLEAN; кодировки PLAIN, PLAIN_DICTIONARY/RLE_DICTIONARY;
+ *   компрессия UNCOMPRESSED/GZIP/SNAPPY; один файл или glob).
+ * Sink: пишет минимальный валидный .parquet (см. pq_write_batch).
+ * Транспорт — локальная ФС (stdio fopen/fread). Внешних библиотек arrow/parquet
+ * НЕТ: формат разбирается вручную (Thrift Compact для метаданных, GZIP через
+ * zlib, SNAPPY — своя реализация). Реализует ABI DfoConnector (connector.h),
+ * экспорт — символ dfo_connector_entry. */
 #include "../../connector.h"
 #include "../../../core/log.h"
 #include <stdio.h>
@@ -141,6 +147,7 @@ typedef struct {
     bool optional;
 } PqColDef;
 
+/* Метаданные одной колонки внутри row group: где лежат страницы и как их читать */
 typedef struct {
     int64_t data_page_offset;
     int64_t dict_page_offset;   /* 0 = none; points to the dictionary page */
@@ -156,6 +163,7 @@ typedef struct {
     int       ncols;
 } PqRowGroup;
 
+/* Один открытый parquet-файл: дескриптор, схема (листовые колонки) и row groups */
 typedef struct {
     FILE     *fp;
     char      path[512];
@@ -191,6 +199,8 @@ static int gzip_decomp(const uint8_t *src, size_t slen,
 }
 
 /* ── RLE/Bit-Packing для уровней определения ── */
+/* Декодирует RLE/bit-packed hybrid в out (по одному байту на значение).
+ * Используется для def-levels опциональных колонок, где bit_width обычно 1. */
 static int rle_bp_dec(const uint8_t *data, size_t dlen,
                        int bw, uint8_t *out, int nmax) {
     TBuf b={data,0,dlen};
@@ -351,6 +361,8 @@ static int pq_parse_footer(const uint8_t *data, size_t len, PqFile *f) {
 }
 
 /* ── Открытие файла и чтение футера ── */
+/* Раскладка parquet: "PAR1" в начале и в конце; перед хвостовым "PAR1" — 4 байта
+ * LE с длиной FileMetaData, которая лежит непосредственно перед ней. */
 static int pq_open(PqFile *f, Arena *a) {
     f->fp=fopen(f->path,"rb");
     if (!f->fp) return -1;
@@ -360,7 +372,7 @@ static int pq_open(PqFile *f, Arena *a) {
     fseek(f->fp,-8,SEEK_END);
     uint8_t tail[8]; fread(tail,1,8,f->fp);
     if (memcmp(tail+4,"PAR1",4)!=0) { fclose(f->fp); f->fp=NULL; return -1; }
-    uint32_t flen=le32r(tail);
+    uint32_t flen=le32r(tail);  /* длина футера-метаданных */
     fseek(f->fp,-(long)(8+flen),SEEK_END);
     uint8_t *footer=arena_alloc(a,flen);
     fread(footer,1,flen,f->fp);
@@ -617,7 +629,10 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
         PageHdr ph; pq_parse_page_hdr(&tb,&ph);
         fseek(f->fp,hdr_pos+(long)ph.hdr_bytes,SEEK_SET);
 
-        /* Распаковщик тела V1-страницы (data/dict целиком сжаты). */
+        /* Читает тело страницы (compressed_size байт) в арену и, если кодек GZIP/
+         * SNAPPY и это НЕ DATA_V2, распаковывает целиком; BODY/BLEN указывают на
+         * итоговые (возможно распакованные) данные. Для V2 тело сжато частично —
+         * распаковка идёт отдельно ниже после отделения rep/def-уровней. */
         #define PQ_LOAD_BODY(BODY,BLEN) \
             uint8_t *comp=arena_alloc(a,(size_t)ph.compressed_size); \
             if (fread(comp,1,(size_t)ph.compressed_size,f->fp)!=(size_t)ph.compressed_size) break; \
@@ -628,6 +643,8 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
                     BODY=dd; BLEN=(size_t)ph.uncompressed_size; } }
 
         if (ph.page_type==PQ_DICT_PAGE) {
+            /* Словарь: декодируем все записи PLAIN в типизированные массивы
+             * di64/did/dis один раз; data-страницы затем ссылаются на них по индексу */
             PQ_LOAD_BODY(body,blen)
             dict_n=ph.num_values;
             const uint8_t *q=body, *qe=body+blen;
@@ -683,16 +700,23 @@ static void pq_read_col_range(PqFile *f, int rg_idx, int col_idx,
             }
         }
 
+        /* skip_in_page — сколько строк начала страницы пропустить (до start_row);
+         * take — сколько взять в этот батч */
         int skip_in_page=(int)(start_row>rows_seen ? start_row-rows_seen : 0);
         int avail=ph.num_values-skip_in_page;
         int take=(avail<nrows-rows_written)?avail:nrows-rows_written;
 
+        /* nn_skip — число НЕ-NULL значений среди пропускаемых строк: в потоке
+         * значений хранятся только не-NULL, поэтому пропускать нужно именно их */
         int nn_skip=0;
         if (def_lvls) { for (int i=0;i<skip_in_page;i++) if(def_lvls[i]) nn_skip++; }
         else nn_skip=skip_in_page;
 
         bool is_dict = (ph.encoding==2 || ph.encoding==8);  /* PLAIN_DICTIONARY | RLE_DICTIONARY */
         if (is_dict && dict_n>0) {
+            /* Dictionary-encoded: декодируем индексы всей страницы, затем берём
+             * срез [skip..skip+take). idx содержит только не-NULL позиции,
+             * поэтому индексируемся через ipos, начиная с nn_skip. */
             /* секция значений: 1 байт bit-width, затем RLE/bit-packed индексы */
             int bw=(p<end)?*p++:0;
             int nn_total=0;
@@ -1039,6 +1063,9 @@ static void pq_write_plain_value(WBuf *vals, const Schema *schema,
     }
 }
 
+/* write_batch (ABI-sink): entity = путь выходного .parquet-файла. Пишет весь
+ * batch как один самодостаточный файл (mode игнорируется — не append). Возврат:
+ * число записанных строк, либо -1 при ошибке открытия файла. */
 static int pq_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode) {
     (void)vctx; (void)a; (void)mode;   /* sink всегда пишет файл целиком */
@@ -1147,6 +1174,8 @@ static int pq_write_batch(void *vctx, Arena *a, const char *entity,
     return nrows;
 }
 
+/* Таблица экспорта плагина: точка входа для загрузчика (source + sink).
+ * CDC и last_error не поддержаны (NULL) — коннектор пакетный. */
 const DfoConnector dfo_connector_entry = {
     .abi_version  = DFO_CONNECTOR_ABI_VERSION,
     .name         = "parquet",

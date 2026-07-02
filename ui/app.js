@@ -677,6 +677,9 @@ document.addEventListener('DOMContentLoaded', () => {
 }, false);
 
 
+/* Универсальный рендер таблицы результата {columns, rows} → DOM-элемент.
+   Строки принимает и массивом значений, и объектом {колонка: значение};
+   NULL/undefined выводит как <span class="null-val">. Используется во всех превью. */
 function makeResultTable(data) {
   const cols = data.columns || [];
   const rows = data.rows    || [];
@@ -975,6 +978,9 @@ async function deletePipeline(id, name) {
 
 /* Перевод технической ошибки прогона в человекопонятный русский текст.
    Полный оригинал сохраняется в подсказке (title), здесь — короткая суть. */
+/* Превращает «сырую» ошибку сервера/трейсбек в короткое человекочитаемое сообщение
+   по ключевым словам (sink/python/sql/connection/timeout/…), при возможности
+   добавляя номер шага. Если ничего не распознано — возвращает первую строку (обрезанную). */
 function humanizeError(raw) {
   if (!raw) return '';
   const s = String(raw).trim();
@@ -1078,6 +1084,10 @@ function cronDescription(expr) {
   return CRON_DESCRIPTIONS[expr] || (expr ? 'Произвольное расписание' : 'Без расписания — только вручную');
 }
 
+/* Открывает конструктор конвейера: заполняет глобальное состояние pb и поля формы
+   из объекта pipeline (или пустыми значениями для нового), рисует шаги/триггеры,
+   восстанавливает свёрнутые секции и переключается на вид builder с URL
+   #builder/<id> (или /new), чтобы контекст пережил F5. */
 function openPipelineBuilder(pipeline) {
   pb.editId = pipeline ? (pipeline.id || null) : null;
   pb.steps  = pipeline ? (pipeline.steps || []).map(s => ({...s, deps: s.deps || []})) : [];
@@ -1225,6 +1235,9 @@ function pbChangeTriggerType(idx, type) {
   renderTriggers();
 }
 
+/* Рисует список событийных триггеров конвейера (webhook / появление файла).
+   Для webhook показывает готовый URL с секретным токеном, для file_arrival —
+   папку и маску файлов (только Linux). cron задаётся отдельным полем, не здесь. */
 function renderTriggers() {
   const el = document.getElementById('pb-triggers');
   if (!el) return;
@@ -1453,6 +1466,10 @@ async function pbPreviewKafka(idx) {
   }
 }
 
+/* Показывает первые строки источника шага под его карточкой через
+   /api/connector/probe/preview. Файловые/HTTP-источники берут адрес из конфига,
+   БД-источники — таблицу/SQL. Результат запоминается в step._lastPreview (для
+   модалки-обозревателя); по клику на таблицу БД открывается SQL-модалка. */
 async function pbPreviewSource(idx) {
   const step = pb.steps[idx];
   const out  = document.getElementById(`pb-dbpreview-${idx}`);
@@ -1633,6 +1650,9 @@ const SINK_OPTIONS = [
   ['csv','CSV'], ['parquet','Parquet'], ['siebel','Siebel / EIM'],
 ];
 
+/* Определяет тип шага для UI: явный s._ui_type имеет приоритет, иначе выводится
+   из заполненных полей (sink → 'sink:<коннектор>', match_rules, scd2, python, scala,
+   connector_type или по умолчанию 'sql'). */
 function stepType(step) {
   if (step._ui_type) return step._ui_type;
   if (step.is_sink && step.connector_type) return 'sink:' + step.connector_type;
@@ -1652,6 +1672,10 @@ function stepForApi(s) {
   return out;
 }
 
+/* Смена типа шага из выпадающего списка: обнуляет все «различающие» поля и заново
+   заполняет только выбранное (стартовый код/дефолтный коннектор/поля SCD2/…),
+   затем перерисовывает список шагов. type может быть 'source'/'sink'/'transform'
+   (унифицированные, выбор коннектора/языка внутри формы) или конкретным. */
 function pbChangeStepType(idx, type) {
   const s = pb.steps[idx];
   s._ui_type = type;
@@ -1813,6 +1837,8 @@ function makeSinkFieldsHTML(step, idx) {
     </div>`;
 }
 
+/* Поля SCD2-историзации (медленно меняющиеся измерения 2-го типа): бизнес-ключ,
+   целевая dim-таблица, колонки начала/конца действия версии записи. */
 function makeScd2FieldsHTML(step, idx) {
   const f = (label, key, ph) => `
     <div class="form-group" style="margin:0"><label>${label}</label>
@@ -1836,6 +1862,9 @@ function makeScd2FieldsHTML(step, idx) {
     </div>`;
 }
 
+/* Поля нечёткого сопоставления (метод «match»): две таблицы, колонка сравнения и
+   порог схожести. Кнопка «Построить запрос» генерирует SQL с jaro_winkler
+   (pbGenerateMatchSQL) в поле transform_sql. Значения хранятся в UI-полях _match_*. */
 function makeMatchFieldsHTML(step, idx) {
   const thr = step._match_threshold != null ? step._match_threshold : 0.85;
   return `
@@ -1984,6 +2013,9 @@ function openFlowModal() {
   document.getElementById('flow-modal').classList.remove('hidden');
 }
 
+/* Рисует DAG конвейера как inline-SVG: раскладывает шаги по колонкам-уровням
+   (уровень = длиннейший путь по deps), параллельные шаги уровня — стопкой по рядам,
+   связи — кривыми Безье со стрелкой. Клик по ноде скроллит к её карточке. */
 function renderFlowGraph() {
   const wrap = document.getElementById('pb-flow-graph');
   if (!wrap) return;
@@ -2085,6 +2117,11 @@ function renderFlowGraph() {
   wrap.innerHTML = s;
 }
 
+/* Собирает карточку одного шага конвейера: заголовок с типом, выбор
+   типа/языка/коннектора, блок SQL-входа, редактор кода или форму коннектора
+   (makeConnectorConfigHTML), поля SCD2/Match, зависимости (deps) и target_table.
+   Порядок блоков зависит от типа (для трансформаций вход→код, для коннекторов —
+   конфиг→SQL). Возвращает DOM-элемент .step-card. */
 function makeStepCard(step, idx) {
   const div = document.createElement('div');
   div.className = 'step-card' + (step._collapsed ? ' collapsed' : '');
@@ -2175,6 +2212,12 @@ function makeStepCard(step, idx) {
   return div;
 }
 
+/* Строит HTML-форму настроек коннектора для шага idx в зависимости от step.connector_type
+   (csv/parquet/json_http/postgresql/kafka/oracle/xml/soap/siebel/…) либо редактор кода
+   Python/Scala, если тип коннектора не задан. Поля пишут в step.connector_config через
+   pbUpdateConnConfig; для источников (не is_sink) добавляются кнопки «Показать данные»
+   (pbPreviewSource) и «Подключиться» (pbTestConnection). Ветки для sink скрывают
+   source-only поля (путь, заголовок, пагинация). Возвращает строку HTML. */
 function makeConnectorConfigHTML(step, idx) {
   const type = step.connector_type;
   const cfg  = safeParse(step.connector_config, {});
@@ -2875,6 +2918,8 @@ async function persistBuilderPipeline() {
                  webhook_on: webhookOn };
   if (pb.editId) body.id = pb.editId;
 
+  /* Редактирование = удалить старую версию и создать заново (нет PUT-эндпоинта);
+     новый id подхватываем ниже и синхронизируем URL. */
   if (pb.editId) {
     await apiFetch(`/api/pipelines/${pb.editId}`, 'DELETE');
   }
@@ -2911,6 +2956,9 @@ async function savePipeline() {
 let _mPipesAll = [], _mPipesPage = 0, _mPipesPerPage = 10;
 let _mMvAll    = [], _mMvPage    = 0, _mMvPerPage    = 10;
 
+/* Общий генератор HTML-пагинатора (стрелки + «N–M из T» + выбор размера страницы).
+   goFn/sizeFn — ИМЕНА глобальных функций-обработчиков (строки для onclick/onchange),
+   разные у каждого списка (метрики/аудит/сохранённые результаты). */
 function metricsPagerHTML(total, start, end, pages, page, all, perPage, goFn, sizeFn) {
   const navBtns = pages > 1 ? `
       <button class="btn btn-sm" ${page === 0 ? 'disabled' : ''} onclick="${goFn}(${page - 1})">← Назад</button>
@@ -3007,6 +3055,10 @@ function renderMetricsMv() {
 function mMvGoPage(p)     { _mMvPage = p; renderMetricsMv(); }
 function mMvSetPerPage(v) { _mMvPerPage = (v === 'all') ? Infinity : parseInt(v, 10); _mMvPage = 0; renderMetricsMv(); }
 
+/* Загружает и рисует раздел «Метрики»: параллельно тянет /api/metrics + tables +
+   pipelines + matviews, строит карточки показателей (аптайм, задержки, ошибки 4xx/5xx),
+   сводки и постраничные списки конвейеров/витрин. Вызывается по таймеру автообновления
+   (restartMetricsTimer) — пагинация списков между обновлениями сохраняется. */
 async function loadMetrics() {
   try {
     const [raw, tables, pipelines, matviews] = await Promise.all([
@@ -3217,6 +3269,10 @@ function anQuickTable(name) {
   runAnalyticsQuery();
 }
 
+/* Выполняет SQL из редактора Аналитики через /api/tables/query, нормализует ответ
+   в массив объектов {колонка: значение} (сервер может вернуть строки массивом),
+   кладёт в analyticsState.currentRows/Cols и обновляет таблицу, графики
+   (первый запуск → авто-графики) и селекторы статистики. */
 async function runAnalyticsQuery() {
   const sqlEl = document.getElementById('an-sql');
   const sql = (sqlEl?.value || '').trim();
@@ -3252,6 +3308,9 @@ async function runAnalyticsQuery() {
 }
 
 /* ── Chart management ── */
+/* Эвристикой подбирает оси и строит стартовый набор графиков: X — первая
+   нечисловая колонка (не *_id), Y — «похожая на метрику» число; если есть колонка
+   с датой → добавляет area по времени, иначе scatter по двум числовым. */
 function makeDefaultCharts(cols, rows) {
   const numCols  = cols.filter(c => rows.slice(0,20).some(r => Number.isFinite(Number(r[c])) && r[c] !== ''));
   const lblCols  = cols.filter(c => !numCols.includes(c));
@@ -3388,6 +3447,8 @@ function _anRAFRedraw(id) {
   _anResizeRAF = requestAnimationFrame(() => { buildChartById(id); _anResizeRAF = null; });
 }
 
+/* Тянущийся правый край: ширина карточки дискретна (1 → 2 → full колонки),
+   переключается по порогам сдвига мыши (delta), а не плавно. */
 function anResizeRight(ev, id) {
   ev.preventDefault();
   ev.stopPropagation();
@@ -3500,6 +3561,10 @@ function renderChartCardHtml(cfg) {
 }
 
 /* ── Data aggregation ── */
+/* Преобразует строки в точки графика: scatter — как есть (до 2000 точек),
+   histogram — по бинам, остальные — группировка по xCol с агрегатом agg
+   (sum/avg/count/min/max) по yCol. line/area сортируются по X, прочие — по убыванию
+   значения и обрезаются до topN, а «хвост» сворачивается в «Остальные». */
 function aggregateForChart(cfg, rows) {
   const { xCol, yCol, type, agg } = cfg;
   const N = Math.max(2, cfg.topN || 20);
@@ -3886,6 +3951,8 @@ function fillStatsSelectors(cols) {
 }
 
 /* ── Stat method visibility ── */
+/* Карта «id контейнера-поля → список методов, для которых оно показывается».
+   onStatMethodChange по выбранному методу прячет/показывает нужные поля. */
 const ST_CONTROLS = {
   'st-ctrl-xcol':   ['describe','percentile_analysis','freq','corr','covariance','regression','moving_avg','exp_smooth','ci_mean','ttest','ftest','anova','ztest','normalize','rank','bootstrap_mean','permutation_diff'],
   'st-ctrl-ycol':   ['corr','covariance','regression'],
@@ -3929,6 +3996,10 @@ function shortNum(v) {
 }
 
 
+/* Диспетчер вкладки «Статистика»: по выбранному методу (st-method) считает результат
+   поверх analyticsState.currentRows и рисует его в #stats-output. Каждая ветка ниже —
+   отдельный метод (описательная, перцентили, частоты, корреляция, регрессия, гипотезы,
+   ANOVA и т.д.). Побочно кладёт результат в lastStatsReport для сохранения/экспорта. */
 function runStatMethod() {
   const out = document.getElementById('stats-output');
   if (!out) return;
@@ -4903,6 +4974,9 @@ function closeSaveModal() {
   delete m._saveType;
 }
 
+/* Сохраняет результат в /api/analytics/results. Тип берётся из modal._saveType:
+   'stats' → сериализует lastStatsReport в таблицу (_statsReportToTable),
+   иначе — текущие строки запроса. Строки сохраняются массивами по порядку columns. */
 async function confirmSaveResult() {
   const name = (document.getElementById('save-result-name')?.value || '').trim();
   if (!name) { document.getElementById('save-result-name')?.focus(); return; }
@@ -5145,6 +5219,8 @@ function hideLogin() {
   document.getElementById('main-app').style.display = 'flex';
 }
 
+/* Логин: POST логин/пароль на /api/auth/token, сохраняет полученный JWT в
+   localStorage (dfo_jwt) и currentUser, прячет экран входа и запускает initApp. */
 async function login(username, password) {
   try {
     const resp = await fetch(API + '/api/auth/token', {
@@ -5512,6 +5588,8 @@ function rbacActionsLabel(mask) {
   return RBAC_ACTION_BITS.filter(([b]) => mask & b).map(([, l]) => l).join(', ');
 }
 
+/* Переключает под-вкладку раздела «Безопасность» (Пользователи/RBAC/Аудит/API-ключи),
+   запоминает выбор в localStorage (dfo_sec_tab) и лениво грузит данные активной вкладки. */
 function switchSecTab(tab) {
   ['users','rbac','audit','apikeys'].forEach(t => {
     document.getElementById(`sec-tab-${t}`).classList.toggle('active', t === tab);
