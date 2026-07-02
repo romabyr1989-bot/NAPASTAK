@@ -5,8 +5,8 @@
   "workers": 4,
   "connector_dir": "./build/debug/lib",
   "auth_enabled": true,
-  "jwt_secret": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-  "admin_password": "admin",
+  "jwt_secret": "CHANGE_ME_64_HEX_CHARS_MIN",
+  "admin_password": "CHANGE_ME",
   "tls_cert": "./certs/cert.pem",
   "tls_key": "./certs/key.pem"
 }

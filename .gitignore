@@ -1,13 +1,15 @@
 build/
 data/*
-!data/*.csv
 *.o
 *.d
 *.so
 *.dylib
 .DS_Store
 .claude/
-{lib/
+
+# TLS-сертификаты — генерируются scripts/gen_cert.sh; приватные ключи не коммитим
+certs/*.pem
+certs/*.key
 
 # Python test cache
 __pycache__/
