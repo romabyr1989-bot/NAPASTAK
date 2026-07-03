@@ -27,6 +27,7 @@
 #include <sqlite3.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -1671,6 +1672,13 @@ typedef struct {
     int               ngrps, cap_grps;
     Expr            **xagg;   /* aggregates only in HAVING/ORDER BY → extra accumulator slots */
     int               nxagg;
+    /* Ранняя пагинация: LIMIT/OFFSET применяются при эмиссии строк (collect_row),
+     * а не финальным срезом. Без этого OFFSET дальше MAX_RS_ROWS невозможен —
+     * rs обрезается на потолке ещё до среза (страничная выгрузка sink молча
+     * теряла всё сверх 100k строк). Включается только для простых запросов. */
+    bool              early_page;
+    int64_t           skip_left;   /* сколько строк ещё пропустить (OFFSET) */
+    int64_t           take_left;   /* сколько строк ещё отдать (LIMIT), -1 = без лимита */
 } ExecState;
 
 
@@ -1874,6 +1882,14 @@ static void collect_row(ExecState *st, JoinCtx *ctx) {
         GrpAcc *grp=find_or_create_grp(st,kbuf);
         agg_row(st,grp,ctx);
         return;
+    }
+
+    /* Ранняя пагинация: пропустить OFFSET строк, отдать не более LIMIT.
+     * Срабатывает ПОСЛЕ WHERE (отфильтрованные строки не тратят offset). */
+    if (st->early_page) {
+        if (st->take_left == 0) return;
+        if (st->skip_left > 0) { st->skip_left--; return; }
+        if (st->take_left > 0) st->take_left--;
     }
 
     /* Direct projection */
@@ -2630,6 +2646,19 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     ExecState st={0};
     st.a=a; st.sel=sel; st.vt=vt; st.rs=rs;
     st.do_agg=do_agg; st.implicit_agg=implicit_agg;
+    /* Ранняя пагинация допустима, только когда пост-обработка не меняет
+     * состав/порядок строк (нет агрегации, DISTINCT, ORDER BY, оконных
+     * функций) — тогда LIMIT/OFFSET на эмиссии эквивалентен финальному
+     * срезу, но работает и за потолком MAX_RS_ROWS. */
+    {
+        bool early_win = false;
+        for (int i = 0; i < sel->nselect && !early_win; i++)
+            early_win = expr_has_window(sel->select_list[i]);
+        st.early_page = !do_agg && !sel->distinct && sel->norder == 0 && !early_win
+                        && (sel->offset > 0 || sel->limit >= 0);
+        st.skip_left = sel->offset > 0 ? sel->offset : 0;
+        st.take_left = sel->limit >= 0 ? sel->limit : -1;
+    }
     /* Aggregates used only in HAVING/ORDER BY (not in the SELECT list) need their
      * own accumulator slots — e.g. HAVING SUM(x)>N where x is not selected. */
     if (do_agg) {
@@ -2712,6 +2741,7 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     /* ── LIMIT / OFFSET ── */
     int64_t off=sel->offset>0?sel->offset:0;
     int64_t lim=sel->limit;
+    if (st.early_page) { off = 0; lim = -1; }  /* уже применено при эмиссии */
     if (off > 0 || lim >= 0) {
         int start=(int)off; if(start>rs->nrows) start=rs->nrows;
         int end_idx=rs->nrows;
@@ -5080,44 +5110,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         snprintf(errbuf, errsz, "sink step %s: transform_sql (SELECT источника) обязателен", st->id);
         return -1;
     }
-    /* 1. Materialize the source rows */
-    Stmt *stmt = sql_parse(a, src_sql, strlen(src_sql));
-    if (stmt->error) {
-        snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
-        return -1;
-    }
-    tl_exec_error[0] = '\0';
-    RS *rs = exec_stmt(a, stmt, NULL);
-    if (tl_exec_error[0]) {
-        /* Source table doesn't exist → fail the sink step (status=1) instead of
-         * silently writing 0 rows out. Distinct from an existing-but-empty
-         * source, which yields a valid 0-row rs and takes the success path. */
-        snprintf(errbuf, errsz, "sink step %s: %s", st->id, tl_exec_error);
-        tl_exec_error[0] = '\0';
-        return -1;
-    }
-    if (!rs) {
-        snprintf(errbuf, errsz, "sink step %s: исходный SELECT вернул NULL", st->id);
-        return -1;
-    }
-
-    /* 2. Build the sink schema from the result columns. Values are always text
-     * (text-always model), but we carry the LOGICAL type so a typed sink (e.g.
-     * the PG sink) can create BIGINT/NUMERIC/BOOLEAN columns instead of all TEXT
-     * — typed write parity with the source. NULLs still flow via null_bitmap
-     * below (a real NULL param, never the sentinel text), so typed columns never
-     * see an uncastable value. */
-    Schema *schema = arena_calloc(a, sizeof(Schema));
-    schema->ncols = rs->ncols;
-    schema->cols  = arena_alloc(a, (size_t)rs->ncols * sizeof(ColDef));
-    for (int c = 0; c < rs->ncols; c++) {
-        ColType lt = rs->col_types ? rs->col_types[c] : COL_TEXT;
-        schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
-        schema->cols[c].type     = (lt==COL_INT64||lt==COL_DOUBLE||lt==COL_BOOL) ? lt : COL_TEXT;
-        schema->cols[c].nullable = true;
-    }
-
-    /* 3. Load the sink connector (.so). Map UI/YAML names to .so basenames. */
+    /* 1. Load the sink connector (once per step; moved before the read loop). */
     const char *conn = connector_so_name(st->connector_type);
     char so_path[1024];
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so", app->plugins_dir, conn);
@@ -5139,10 +5132,73 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     const char *entity = st->sink_entity[0] ? st->sink_entity : st->target_table;
     int mode = (strcasecmp(st->sink_mode, "overwrite") == 0) ? DFO_SINK_OVERWRITE : DFO_SINK_APPEND;
 
+    /* 2. Пагинация источника. exec_stmt МОЛЧА обрезает результат на
+     * MAX_RS_ROWS (100k) — одиночный SELECT по большой таблице тихо терял всё
+     * сверх этого (наблюдалось: sink выгрузил 100000 строк из 400000). Читаем
+     * страницами LIMIT/OFFSET меньше потолка, каждая страница в собственной
+     * арене — и полнота, и память O(страницы). Скан движка детерминирован
+     * (порядок WAL), поэтому OFFSET-страницы не пересекаются. Явный LIMIT
+     * пользователя уважаем: одна страница без обёртки. */
+    char *sql_clean = arena_strdup(a, src_sql);
+    size_t sql_len = strlen(sql_clean);
+    while (sql_len && (sql_clean[sql_len-1]==' ' || sql_clean[sql_len-1]=='\n' ||
+                       sql_clean[sql_len-1]=='\t' || sql_clean[sql_len-1]==';'))
+        sql_clean[--sql_len] = '\0';
+    bool user_limited = false;
+    for (const char *p = sql_clean; *p; p++) {
+        if ((p == sql_clean || (!isalnum((unsigned char)p[-1]) && p[-1] != '_'))
+            && strncasecmp(p, "limit", 5) == 0
+            && !isalnum((unsigned char)p[5]) && p[5] != '_') { user_limited = true; break; }
+    }
+    const int SINK_PAGE = 50000;
+
+    int total = 0, first = 1;
+    for (long long page_off = 0; ; page_off += SINK_PAGE) {
+    Arena *pa = arena_create(1 << 20);
+    const char *psql = user_limited ? sql_clean
+        : arena_sprintf(pa, "%s LIMIT %d OFFSET %lld", sql_clean, SINK_PAGE, page_off);
+    Stmt *stmt = sql_parse(pa, psql, strlen(psql));
+    if (stmt->error) {
+        snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
+        arena_destroy(pa); connector_unload(inst);
+        return -1;
+    }
+    tl_exec_error[0] = '\0';
+    RS *rs = exec_stmt(pa, stmt, NULL);
+    if (tl_exec_error[0]) {
+        /* Source table doesn't exist → fail the sink step (status=1) instead of
+         * silently writing 0 rows out. Distinct from an existing-but-empty
+         * source, which yields a valid 0-row rs and takes the success path. */
+        snprintf(errbuf, errsz, "sink step %s: %s", st->id, tl_exec_error);
+        tl_exec_error[0] = '\0';
+        arena_destroy(pa); connector_unload(inst);
+        return -1;
+    }
+    if (!rs) {
+        snprintf(errbuf, errsz, "sink step %s: исходный SELECT вернул NULL", st->id);
+        arena_destroy(pa); connector_unload(inst);
+        return -1;
+    }
+
+    /* 3. Схема страницы из колонок результата. Значения всегда текст
+     * (text-always), но логический тип сохраняем, чтобы типизированный sink
+     * (например PG) создавал BIGINT/NUMERIC/BOOLEAN, а не сплошной TEXT.
+     * NULL идут через null_bitmap (настоящий NULL, не текст-сентинел). Схема
+     * живёт в арене страницы: write_batch не удерживает указателей. */
+    Schema *schema = arena_calloc(pa, sizeof(Schema));
+    schema->ncols = rs->ncols;
+    schema->cols  = arena_alloc(pa, (size_t)rs->ncols * sizeof(ColDef));
+    for (int c = 0; c < rs->ncols; c++) {
+        ColType lt = rs->col_types ? rs->col_types[c] : COL_TEXT;
+        schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
+        schema->cols[c].type     = (lt==COL_INT64||lt==COL_DOUBLE||lt==COL_BOOL) ? lt : COL_TEXT;
+        schema->cols[c].nullable = true;
+    }
+
     /* 4. Stream rows out in BATCH_SIZE chunks. */
-    char ***cv = arena_alloc(a, (size_t)rs->ncols * sizeof(char **));
+    char ***cv = arena_alloc(pa, (size_t)rs->ncols * sizeof(char **));
     for (int c = 0; c < rs->ncols; c++)
-        cv[c] = arena_alloc(a, BATCH_SIZE * sizeof(char *));
+        cv[c] = arena_alloc(pa, BATCH_SIZE * sizeof(char *));
     ColBatch batch = {0};
     batch.schema = schema; batch.ncols = rs->ncols;
     for (int c = 0; c < rs->ncols; c++) batch.values[c] = cv[c];
@@ -5156,7 +5212,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
                 /* True SQL NULL → flag null_bitmap so write_batch emits a real
                  * NULL to the sink instead of the sentinel text. */
                 if (!batch.null_bitmap[c])
-                    batch.null_bitmap[c] = arena_calloc(a, (BATCH_SIZE + 7) / 8);
+                    batch.null_bitmap[c] = arena_calloc(pa, (BATCH_SIZE + 7) / 8);
                 batch.null_bitmap[c][rr / 8] |= (uint8_t)(1u << (rr % 8));
                 cv[c][rr] = (char *)"";
             } else {
@@ -5166,26 +5222,31 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
             }
         }
         if (++batch.nrows == BATCH_SIZE) {
-            int n = api->write_batch(ctx, a, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
+            int n = api->write_batch(ctx, pa, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
             if (n < 0) {
                 const char *why = api->last_error ? api->last_error(ctx) : NULL;
                 snprintf(errbuf, errsz, "sink step %s: write_batch failed%s%s", st->id,
                          (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
-                connector_unload(inst); return -1; }
+                arena_destroy(pa); connector_unload(inst); return -1; }
             total += batch.nrows; batch.nrows = 0; first = 0;
         }
     }
-    /* Final (or only) chunk — also covers the empty-result overwrite case so
-     * the destination is truncated even when there are 0 rows. */
-    if (batch.nrows > 0 || first) {
-        int n = api->write_batch(ctx, a, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
+    /* Хвост страницы; на первой странице пишем и при 0 строк, чтобы
+     * overwrite-режим опустошил приёмник даже при пустом источнике. */
+    if (batch.nrows > 0 || (first && page_off == 0)) {
+        int n = api->write_batch(ctx, pa, entity, schema, &batch, first ? mode : DFO_SINK_APPEND);
         if (n < 0) {
             const char *why = api->last_error ? api->last_error(ctx) : NULL;
             snprintf(errbuf, errsz, "sink step %s: write_batch failed%s%s", st->id,
                      (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
-            connector_unload(inst); return -1; }
-        total += batch.nrows;
+            arena_destroy(pa); connector_unload(inst); return -1; }
+        total += batch.nrows; first = 0;
     }
+
+    int page_rows = rs->nrows;
+    arena_destroy(pa);
+    if (user_limited || page_rows < SINK_PAGE) break;
+    }  /* конец страничного цикла */
 
     connector_unload(inst);
     LOG_INFO("sink step '%s' → %s:%s: %d rows (%s)", st->id, st->connector_type,
