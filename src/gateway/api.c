@@ -4521,6 +4521,21 @@ static Table *recreate_table(App *app, Arena *a, const char *tname, Schema *sche
     return t;
 }
 
+/* Глубокая копия схемы в арену `a` (ColDef-массив + имена колонок). Нужна,
+ * когда исходная схема живёт в короткоживущей странице-арене, а получатель
+ * (table_create / recreate_table) сохраняет указатель на неё. */
+static Schema *schema_deep_copy(Arena *a, const Schema *src) {
+    if (!src) return NULL;
+    Schema *dst = arena_calloc(a, sizeof(Schema));
+    dst->ncols = src->ncols;
+    dst->cols  = arena_alloc(a, (size_t)src->ncols * sizeof(ColDef));
+    for (int c = 0; c < src->ncols; c++) {
+        dst->cols[c] = src->cols[c];
+        dst->cols[c].name = arena_strdup(a, src->cols[c].name ? src->cols[c].name : "col");
+    }
+    return dst;
+}
+
 /* ── Write an RS (result set) into a Table ── */
 static int write_rs_to_table(App *app, Arena *a, const char *tname, RS *rs) {
     if (!rs || rs->ncols == 0) return 0;
@@ -4923,17 +4938,26 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
     if (incremental)
         cursor_state_load(app, pipeline_id, st->id, step_output(st), cursor_buf, sizeof(cursor_buf));
 
+    /* Страница-арена: каждый батч (JSON-парсинг, строки, текстовая конвертация)
+     * живёт ровно до записи страницы в таблицу, затем арена уничтожается.
+     * Раньше все страницы копились в арене запуска — на топике в сотни МБ
+     * это раздувало RSS в десятки раз и приводило к OOM-kill гейтвея
+     * (наблюдалось: 2.3 ГБ RSS при загрузке 72 МБ из Kafka). */
+    Arena *pa = NULL;
     for (;;) {
+        if (pa) arena_destroy(pa);
+        pa = arena_create(1 << 20);
         DfoReadReq req = { .cursor = cursor_buf, .limit = BATCH_SIZE, .filter = filter };
         ColBatch *batch = NULL;
         /* rc: <0 = error; 0 = ok (more pages); 1 = ok, last/only page. */
-        int rc = api->read_batch(ctx, a, &req, entity, &batch);
+        int rc = api->read_batch(ctx, pa, &req, entity, &batch);
         if (rc < 0) {
             /* A read error is a real failure — surface the connector's reason
              * instead of silently treating it as a successful 0-row read. */
             const char *why = api->last_error ? api->last_error(ctx) : NULL;
             snprintf(errbuf, errsz, "connector step %s: read_batch failed%s%s", st->id,
                      (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+            arena_destroy(pa);
             connector_unload(inst);
             return -1;
         }
@@ -4943,7 +4967,9 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
              * by a downstream append sink (S11). Also makes an empty read a
              * visible empty table rather than silently leaving none. */
             if (!table_created) {
-                Schema *sc = (batch && batch->schema) ? batch->schema : schema;
+                /* Схема может жить в странице-арене — копируем в арену шага,
+                 * т.к. table_create сохраняет указатель на неё. */
+                Schema *sc = schema_deep_copy(a, (batch && batch->schema) ? batch->schema : schema);
                 if (sc) { recreate_table(app, a, step_output(st), sc); table_created = true; }
             }
             break;
@@ -4951,7 +4977,7 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
 
         /* Create the table on first non-empty batch */
         if (!table_created) {
-            Schema *sc = batch->schema ? batch->schema : schema;
+            Schema *sc = schema_deep_copy(a, batch->schema ? batch->schema : schema);
             if (!sc) {
                 /* Build a minimal text schema from batch metadata */
                 sc = arena_calloc(a, sizeof(Schema));
@@ -4983,17 +5009,17 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
                 const uint8_t *bm = batch->null_bitmap[c];
                 if (_saved[c] == COL_INT64 || _saved[c] == COL_BOOL) {
                     int64_t *iv = (int64_t *)batch->values[c];
-                    char   **sv = arena_alloc(a, (size_t)batch->nrows * sizeof(char *));
+                    char   **sv = arena_alloc(pa, (size_t)batch->nrows * sizeof(char *));
                     for (int r = 0; r < batch->nrows; r++)
                         sv[r] = (bm && ((bm[r/8] >> (r%8)) & 1u)) ? NULL
-                              : arena_sprintf(a, "%lld", (long long)iv[r]);
+                              : arena_sprintf(pa, "%lld", (long long)iv[r]);
                     batch->values[c] = sv;
                 } else if (_saved[c] == COL_DOUBLE) {
                     double *dv = (double *)batch->values[c];
-                    char  **sv = arena_alloc(a, (size_t)batch->nrows * sizeof(char *));
+                    char  **sv = arena_alloc(pa, (size_t)batch->nrows * sizeof(char *));
                     for (int r = 0; r < batch->nrows; r++)
                         sv[r] = (bm && ((bm[r/8] >> (r%8)) & 1u)) ? NULL
-                              : arena_sprintf(a, "%.15g", dv[r]);
+                              : arena_sprintf(pa, "%.15g", dv[r]);
                     batch->values[c] = sv;
                 }
                 batch->schema->cols[c].type = COL_TEXT;
@@ -5021,6 +5047,7 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
         /* rc==1 = last/only page; a short batch also signals the end. */
         if (rc == 1 || batch->nrows < BATCH_SIZE) break;
     }
+    if (pa) arena_destroy(pa);
 
     /* Persist the final watermark so the next run resumes from here instead of
      * re-reading the whole source. Only meaningful (and only saved) in
