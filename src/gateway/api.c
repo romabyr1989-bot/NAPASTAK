@@ -543,6 +543,9 @@ typedef struct {
     int         ncols;
     int         nskeys;
     ColType    *col_types;   /* logical type per output column → typed JSON output */
+    bool        truncated;   /* результат обрезан потолком MAX_RS_ROWS — данные
+                              * НЕполные; потребители обязаны либо показать это
+                              * (REST), либо отказаться (SCD2/sink/transform). */
 } RS;
 
 static RS *rs_new(Arena *a, int ncols, char **col_names, int nskeys) {
@@ -561,7 +564,14 @@ static RS *rs_new(Arena *a, int ncols, char **col_names, int nskeys) {
 }
 
 static void rs_add(RS *rs, Arena *a, char **cells, char **skeys) {
-    if (rs->nrows >= MAX_RS_ROWS) return;
+    if (rs->nrows >= MAX_RS_ROWS) {
+        /* Потолок достигнут: строка отброшена. Раньше это происходило МОЛЧА —
+         * SELECT «успешно» возвращал ровно 100000 строк, и потребители
+         * (sink/transform/SCD2/REST) не могли отличить полный результат от
+         * усечённого. Теперь усечение всегда помечено. */
+        rs->truncated = true;
+        return;
+    }
     if (rs->nrows == rs->cap) {
         int nc = rs->cap * 2;
         OutRow *nb = arena_alloc(a, (size_t)nc * sizeof(OutRow));
@@ -2751,6 +2761,9 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
         rs->nrows=new_n;
     }
 
+    if (rs->truncated)
+        LOG_WARN("SELECT: результат усечён потолком %d строк — данные НЕполные "
+                 "(добавьте фильтр или страничный LIMIT/OFFSET)", MAX_RS_ROWS);
     return rs;
 }
 
@@ -2831,6 +2844,8 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
                 if(!found) rs_add(out,a,L->rows[i].cells,NULL);
             }
         }
+        /* Усечение любой из сторон делает и комбинированный результат неполным. */
+        out->truncated = out->truncated || L->truncated || R->truncated;
         return out;
     }
 
@@ -3269,10 +3284,18 @@ static void h_query(HttpReq *req, HttpResp *resp) {
         arena_destroy(a); return;
     }
 
-    /* Apply request-level limit cap */
+    /* Apply request-level limit cap. Раньше лимит навязывался МОЛЧА — ответ на
+     * SELECT по большой таблице был неотличим от таблицы ровно в 10000 строк.
+     * Теперь просим cap+1 строку как маркер «есть ещё»: лишняя строка
+     * отбрасывается ниже, а ответ получает "truncated":true. */
+    int64_t rest_cap = -1;
+    bool rest_clipped = false;
     if (stmt->type == STMT_SELECT) {
-        int64_t cap = (req_limit > 0 && req_limit < 10000) ? req_limit : 10000;
-        if (stmt->select.limit < 0 || stmt->select.limit > cap) stmt->select.limit = cap;
+        rest_cap = (req_limit > 0 && req_limit < 10000) ? req_limit : 10000;
+        if (stmt->select.limit < 0 || stmt->select.limit > rest_cap) {
+            stmt->select.limit = rest_cap + 1;
+            rest_clipped = true;
+        }
     }
 
     g_txn_current = req->txn_id;
@@ -3287,6 +3310,10 @@ static void h_query(HttpReq *req, HttpResp *resp) {
         tl_exec_error[0] = '\0';
         arena_destroy(a);
         return;
+    }
+    if (rest_clipped && rs && rs->nrows > (int)rest_cap) {
+        rs->nrows = (int)rest_cap;   /* маркерная строка не отдаётся клиенту */
+        rs->truncated = true;
     }
 
     JBuf jb; jb_init(&jb, a, 65536);
@@ -3319,6 +3346,8 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     double ms=(double)(t1-t0)*1000.0/CLOCKS_PER_SEC;
     jb_key(&jb,"elapsed_ms"); jb_double(&jb,ms);
     jb_key(&jb,"row_count");  jb_int(&jb, rs?rs->nrows:0);
+    /* Явный признак неполноты: результат обрезан потолком MAX_RS_ROWS. */
+    if (rs && rs->truncated) { jb_key(&jb,"truncated"); jb_bool(&jb,true); }
     jb_obj_end(&jb);
 
     metrics_push(&g_app.metrics->query_latency_ms, ms);
@@ -3459,6 +3488,8 @@ static void h_query_named(HttpReq *req, HttpResp *resp) {
     }
     jb_arr_end(&jb);
     jb_key(&jb,"row_count"); jb_int(&jb, rs?rs->nrows:0);
+    /* Явный признак неполноты: результат обрезан потолком MAX_RS_ROWS. */
+    if (rs && rs->truncated) { jb_key(&jb,"truncated"); jb_bool(&jb,true); }
     jb_obj_end(&jb);
     http_resp_json(resp, 200, jb_done(&jb));
 }
@@ -3695,6 +3726,10 @@ void api_pg_execute(PgConn *conn, const char *sql) {
         pgwire_send_error(conn, "XX000", "query execution failed");
         arena_destroy(a); return;
     }
+    if (rs->truncated)
+        LOG_WARN("pgwire: результат SELECT усечён потолком %d строк — клиент "
+                 "получит неполные данные (используйте LIMIT/OFFSET-страницы)",
+                 MAX_RS_ROWS);
 
     /* RowDescription — at least one column for SELECT; for DML, exec_stmt
      * returns a 1-col RS containing the affected count. Week 3: column
@@ -5179,6 +5214,17 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         arena_destroy(pa); connector_unload(inst);
         return -1;
     }
+    if (rs->truncated) {
+        /* Страница усечена потолком ДО среза LIMIT/OFFSET — так бывает, когда
+         * ранняя пагинация неприменима (ORDER BY/агрегация/DISTINCT/окна на
+         * >MAX_RS_ROWS строк): выгрузка была бы неполной. Отказ вместо тихой
+         * потери. */
+        snprintf(errbuf, errsz, "sink step %s: запрос с сортировкой/агрегацией на > %d строк "
+                 "не может быть выгружен полностью — уберите ORDER BY/DISTINCT или сузьте выборку.",
+                 st->id, MAX_RS_ROWS);
+        arena_destroy(pa); connector_unload(inst);
+        return -1;
+    }
 
     /* 3. Схема страницы из колонок результата. Значения всегда текст
      * (text-always), но логический тип сохраняем, чтобы типизированный sink
@@ -5547,6 +5593,11 @@ static int script_step_ingest_output(App *app, Arena *a, PipelineStep *st,
                        ? fields[i] : (char *)DFO_NULL_SENTINEL;
         rs_add(rs, a, cells, NULL);
         cursor = line_end ? line_end + 1 : NULL;
+    }
+    if (rs->truncated) {
+        snprintf(errbuf, errsz, "%s: вывод скрипта превышает %d строк — усечён, "
+                 "шаг остановлен, чтобы не записать неполные данные.", label, MAX_RS_ROWS);
+        return -1;
     }
 
     int rows_written = write_rs_to_table(app, a, step_output(st), rs);
@@ -5978,6 +6029,13 @@ static int run_scd2_step(App *app, Arena *a, Pipeline *p, PipelineStep *st, char
         return -1;
     }
     if (!src) { snprintf(errbuf, errsz, "scd2 step %s: source SQL exec failed", st->id); return -1; }
+    if (src->truncated) {
+        /* Неполный источник -> сверка закрыла/продублировала бы версии по
+         * отсутствующим ключам. Отказ вместо тихой порчи истории. */
+        snprintf(errbuf, errsz, "scd2 step %s: источник превышает %d строк — результат усечён, "
+                 "сверка прервана. Сузьте source_sql (фильтр/инкремент).", st->id, MAX_RS_ROWS);
+        return -1;
+    }
     write_rs_to_table(app, a, src_tbl, src);
 
     /* Resolve business-key column indices in the source. */
@@ -6047,6 +6105,12 @@ static int run_scd2_step(App *app, Arena *a, Pipeline *p, PipelineStep *st, char
         char *hist_sql = arena_sprintf(a, "SELECT * FROM %s", st->target_table);
         Stmt *hstmt = sql_parse(a, hist_sql, strlen(hist_sql));
         hist = (hstmt && !hstmt->error) ? exec_stmt(a, hstmt, NULL) : NULL;
+        if (hist && hist->truncated) {
+            /* Неполная история -> close-pass закрыл бы не те версии. */
+            snprintf(errbuf, errsz, "scd2 step %s: история %s превышает %d строк — "
+                     "усечена, сверка прервана.", st->id, st->target_table, MAX_RS_ROWS);
+            return -1;
+        }
     }
     if (hist && hist->ncols) {
         /* Explicit column list (star won't expand alongside the window col). */
@@ -6064,6 +6128,11 @@ static int run_scd2_step(App *app, Arena *a, Pipeline *p, PipelineStep *st, char
         LOG_INFO("scd2 step '%s': current-version SQL: %s", st->id, cur_sql);
         Stmt *cstmt = sql_parse(a, cur_sql, strlen(cur_sql));
         cur = (cstmt && !cstmt->error) ? exec_stmt(a, cstmt, NULL) : NULL;
+        if (cur && cur->truncated) {
+            snprintf(errbuf, errsz, "scd2 step %s: текущие версии %s превышают %d строк — "
+                     "усечены, сверка прервана.", st->id, st->target_table, MAX_RS_ROWS);
+            return -1;
+        }
 
         if (!cur || !cur->ncols) {
             /* Fallback: derive current = open versions from history in memory
@@ -6355,6 +6424,11 @@ static int run_match_step(App *app, Arena *a, PipelineStep *st,
         return -1;
     }
     if (!cand) { snprintf(errbuf, errsz, "match step %s: SQL exec failed", st->id); return -1; }
+    if (cand->truncated) {
+        snprintf(errbuf, errsz, "match step %s: кандидаты превышают %d строк — усечены, "
+                 "сопоставление прервано (пропущенные пары = ложные не-дубли).", st->id, MAX_RS_ROWS);
+        return -1;
+    }
 
     /* Output RS — always created (empty candidate set → empty result table). */
     const char *out_cols[] = {"id_a", "id_b", "rule_name", "metric_value"};
@@ -6733,6 +6807,14 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     } else if (!rs) {
                         st->status = STEP_FAILED;
                         snprintf(p->error_msg, sizeof(p->error_msg), "step[%d]: execution returned null", si);
+                    } else if (rs->truncated) {
+                        /* Неполный результат в таблицу не пишем — это тихая
+                         * потеря данных (потолок MAX_RS_ROWS). */
+                        st->status = STEP_FAILED;
+                        snprintf(p->error_msg, sizeof(p->error_msg),
+                                 "step[%d]: результат превышает %d строк — усечён; шаг остановлен, "
+                                 "чтобы не записать неполные данные. Сузьте запрос фильтром.",
+                                 si, MAX_RS_ROWS);
                     } else {
                         /* Cache for {@step:<id>:<col>} references by later steps. */
                         pipeline_set_step_result(p, st->id, rs);
@@ -7897,8 +7979,14 @@ static int matview_exec_fn(const char *def_sql, const char *target_table, void *
         tl_exec_error[0] = '\0';
         RS *rs = exec_stmt(a, stmt, NULL);
         /* A missing source table fails the refresh (n stays -1) rather than
-         * silently materialising an empty datamart. */
-        if (rs && !tl_exec_error[0]) n = write_rs_to_table(app, a, target_table, rs);
+         * silently materialising an empty datamart. A truncated result also
+         * fails: a datamart with silently missing rows is worse than a stale one. */
+        if (rs && rs->truncated) {
+            LOG_ERROR("matview %s: определение возвращает > %d строк — результат "
+                      "усечён, обновление витрины отклонено.", target_table, MAX_RS_ROWS);
+        } else if (rs && !tl_exec_error[0]) {
+            n = write_rs_to_table(app, a, target_table, rs);
+        }
         tl_exec_error[0] = '\0';
     }
     arena_destroy(a);
