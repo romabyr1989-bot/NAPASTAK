@@ -2769,6 +2769,7 @@ function makeConnectorConfigHTML(step, idx) {
     const fmt = cfg.data_format || 'json';
     const sec = cfg.security_protocol || '';
     const needsSasl = sec.indexOf('SASL') === 0;
+    const needsTls  = sec === 'SSL' || sec === 'SASL_SSL';
     const off = cfg.offset_reset || 'earliest';
     return `
     <div class="conn-group">
@@ -2837,6 +2838,31 @@ function makeConnectorConfigHTML(step, idx) {
           <label>Пароль</label>
           <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder=""
                  oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
+        </div>
+      </div>` : ''}
+      ${needsTls ? `
+      <div class="step-row-2" style="margin-top:.4rem;align-items:start">
+        <div class="form-group" style="margin:0;flex:2">
+          <label>CA‑сертификат (путь на сервере)</label>
+          <input type="text" value="${escAttr(cfg.ssl_ca_location || '')}" placeholder="/opt/dataflow-os/certs/ca.pem"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_ca_location',this.value)">
+        </div>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0">
+          <label>Клиентский сертификат (mTLS, необяз.)</label>
+          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="/…/client.pem"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_certificate_location',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Клиентский ключ (mTLS, необяз.)</label>
+          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="/…/client.key"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_key_location',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пароль ключа</label>
+          <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder=""
+                 oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>
       </div>` : ''}
       ${fmt==='avro' ? `

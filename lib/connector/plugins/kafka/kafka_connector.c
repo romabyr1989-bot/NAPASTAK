@@ -70,6 +70,11 @@ typedef struct {
     char  sasl_mechanism[32];     /* PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512 */
     char  sasl_username[256];
     char  sasl_password[256];
+    /* TLS (security_protocol SSL | SASL_SSL). Пути к файлам на хосте gateway. */
+    char  ssl_ca_location[512];          /* CA-сертификат для проверки брокера (PEM) */
+    char  ssl_certificate_location[512]; /* клиентский сертификат для mTLS (PEM) */
+    char  ssl_key_location[512];         /* клиентский приватный ключ для mTLS (PEM) */
+    char  ssl_key_password[256];         /* пароль ключа, если зашифрован */
     char  offset_reset[16];       /* earliest | latest (default earliest) */
     char  last_err[512];          /* human-readable reason of the last failure */
 
@@ -157,6 +162,17 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
         rd_kafka_conf_set(conf, "sasl.username", ctx->sasl_username, errstr, errlen);
     if (ctx->sasl_password[0])
         rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
+    /* TLS: CA для проверки брокера + клиентский cert/key для mTLS. Задаются
+     * только при непустом значении, так что PLAINTEXT/SASL_PLAINTEXT не трогаются.
+     * Проверку сертификата брокера НЕ отключаем (безопасность по умолчанию). */
+    if (ctx->ssl_ca_location[0])
+        rd_kafka_conf_set(conf, "ssl.ca.location", ctx->ssl_ca_location, errstr, errlen);
+    if (ctx->ssl_certificate_location[0])
+        rd_kafka_conf_set(conf, "ssl.certificate.location", ctx->ssl_certificate_location, errstr, errlen);
+    if (ctx->ssl_key_location[0])
+        rd_kafka_conf_set(conf, "ssl.key.location", ctx->ssl_key_location, errstr, errlen);
+    if (ctx->ssl_key_password[0])
+        rd_kafka_conf_set(conf, "ssl.key.password", ctx->ssl_key_password, errstr, errlen);
 }
 
 /* Создаёт consumer rd_kafka: задаёт брокеры, group.id, auto.offset.reset и
@@ -182,6 +198,11 @@ static rd_kafka_t *make_consumer(const KafkaCtx *ctx, char *errstr, size_t errle
         rd_kafka_conf_destroy(conf);
         return NULL;
     }
+    /* Не коммитим оффсеты автоматически: с эфемерной группой (см. kafka_create)
+     * это даёт «читать всё каждый раз» — каждый запуск читает топик с начала и
+     * ничего не оставляет закоммиченным. Инкрементальность (только новые
+     * сообщения) достигается явным устойчивым group_id в конфиге шага. */
+    rd_kafka_conf_set(conf, "enable.auto.commit", "false", errstr, errlen);
     /* Force IPv4 by default: "localhost" resolves to ::1 first on many hosts,
      * but most Kafka/Redpanda brokers listen only on IPv4 — librdkafka then
      * reports "all brokers down". Overridable via broker_address_family. */
@@ -309,11 +330,19 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
         JVal *v = root->vals[i];
         if (!v || v->type == JV_NULL)
             schema->cols[i + 1].type = COL_TEXT;
-        else if (v->type == JV_NUMBER)
-            /* Logical DOUBLE; the value is kept as text (text-always model), so
-             * there is no native read-back crash and money precision is exact,
-             * while the catalog type renders it as a JSON number on output. */
-            schema->cols[i + 1].type = COL_DOUBLE;
+        else if (v->type == JV_NUMBER) {
+            /* Store JSON numbers NATIVELY, matching json_http/siebel and the CSV
+             * contract: values[c] holds a native int64 array for INT64 columns and
+             * a native double array for DOUBLE columns. Integer-valued numbers give
+             * an exact INT64 (account ids, counts fitting in 63 bits); fractional
+             * ones give a DOUBLE. The previous code declared COL_DOUBLE but stored a
+             * char*, so the merge (kafka_read_batch) and the preview endpoint read
+             * that pointer back as a native number and returned garbage (a heap
+             * address / denormal double). Values wider than 63 bits or needing exact
+             * decimals arrive as JSON strings (COL_TEXT) and stay exact. */
+            int64_t iv = (int64_t)v->n;
+            schema->cols[i + 1].type = ((double)iv == v->n) ? COL_INT64 : COL_DOUBLE;
+        }
         else if (v->type == JV_BOOL)
             /* TEXT-always: bool хранится текстом "true"/"false" (значение — char*).
              * Раньше схема была COL_BOOL, а значение native int64 → ядро читало
@@ -328,10 +357,10 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
     batch->ncols  = (int)ncols;
     batch->nrows  = 1;
 
-    /* offset column */
-    char **offsets = arena_alloc(a, sizeof(char *));
-    char obuf[24]; snprintf(obuf, sizeof(obuf), "%lld", (long long)offset_val);
-    offsets[0] = arena_strdup(a, obuf);
+    /* offset column — native INT64 (COL_INT64), matching batch_from_raw and the
+     * CSV/json_http contract; the merge + preview read values[0] as int64_t*. */
+    int64_t *offsets = arena_alloc(a, sizeof(int64_t));
+    offsets[0] = offset_val;
     batch->values[0] = offsets;
     batch->null_bitmap[0] = arena_calloc(a, 1);
 
@@ -350,16 +379,19 @@ static ColBatch *batch_from_json(Arena *a, const char *payload, size_t payload_l
             batch->values[i + 1] = sv;
             batch->null_bitmap[i + 1][0] = 1;
         } else if (v->type == JV_NUMBER) {
-            /* Format the number to TEXT from v->n. NOTE: JVal is a union — for a
-             * JV_NUMBER, v->s aliases v->n, so the generic text branch below
-             * (arena_strndup(v->s,v->len)) would read garbage. Format here.
-             * %.10g matches the engine's numeric rendering and prints integers
-             * cleanly (5 -> "5", 123.45 -> "123.45"). */
-            char numbuf[40];
-            snprintf(numbuf, sizeof(numbuf), "%.10g", v->n);
-            char **sv = arena_alloc(a, sizeof(char *));
-            sv[0] = arena_strdup(a, numbuf);
-            batch->values[i + 1] = sv;
+            /* Native storage matching the column type decided above: integer-valued
+             * numbers → int64_t*, fractional → double*. This is exactly what the
+             * merge and the preview endpoint read back (both dispatch on the
+             * declared column type), so no pointer-as-number corruption. */
+            if (schema->cols[i + 1].type == COL_INT64) {
+                int64_t *nv = arena_alloc(a, sizeof(int64_t));
+                nv[0] = (int64_t)v->n;
+                batch->values[i + 1] = nv;
+            } else {
+                double *nv = arena_alloc(a, sizeof(double));
+                nv[0] = v->n;
+                batch->values[i + 1] = nv;
+            }
         } else if (v->type == JV_BOOL) {
             /* TEXT-always: значение — char* "true"/"false" (не native int64). */
             char **sv = arena_alloc(a, sizeof(char *));
@@ -643,19 +675,26 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
         cfg_str(config_json, "\"sasl_username\"",     ctx->sasl_username,     sizeof(ctx->sasl_username));
         cfg_str(config_json, "\"sasl_password\"",     ctx->sasl_password,     sizeof(ctx->sasl_password));
+        /* TLS/mTLS (для security_protocol SSL | SASL_SSL) */
+        cfg_str(config_json, "\"ssl_ca_location\"",          ctx->ssl_ca_location,          sizeof(ctx->ssl_ca_location));
+        cfg_str(config_json, "\"ssl_certificate_location\"", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));
+        cfg_str(config_json, "\"ssl_key_location\"",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
+        cfg_str(config_json, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
         cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
     }
 
-    /* Per-topic default consumer group. A single global default ("dfo-consumer")
-     * was shared by EVERY Kafka pipeline, so once one pipeline committed the
-     * topic's offsets a second pipeline (or a re-run) on the same broker read 0
-     * already-consumed messages and reported a silent green success (S18). Keying
-     * the default by topic stops distinct topics from sharing an offset; an
-     * explicit group_id in connector_config still wins. */
-    if (strcmp(ctx->group_id, "dfo-consumer") == 0 && ctx->topic_name[0]) {
-        char g[128];
-        snprintf(g, sizeof(g), "dfo-%s", ctx->topic_name);
-        snprintf(ctx->group_id, sizeof(ctx->group_id), "%s", g);
+    /* «Читать всё каждый раз»: если явный group_id не задан (осталось значение по
+     * умолчанию "dfo-consumer"), делаем группу УНИКАЛЬНОЙ на каждый запуск. Свежая
+     * группа не имеет закоммиченных оффсетов, поэтому auto.offset.reset=earliest
+     * читает весь топик заново, а enable.auto.commit=false ничего не оставляет.
+     * Ранее группа была стабильной (dfo-<topic>) → повторный прогон читал 0. Явный
+     * group_id в конфиге шага сохраняет инкрементальную семантику (только новые). */
+    if (strcmp(ctx->group_id, "dfo-consumer") == 0) {
+        static _Atomic unsigned kafka_group_seq = 0;
+        unsigned n = atomic_fetch_add(&kafka_group_seq, 1);
+        const char *t = ctx->topic_name[0] ? ctx->topic_name : "topic";
+        snprintf(ctx->group_id, sizeof(ctx->group_id),
+                 "dfo-%s-%ld-%u", t, (long)time(NULL), n);
     }
 
     if (strcasecmp(ctx->data_format, "avro") == 0 && !ctx->schema_registry_url[0])
@@ -920,8 +959,10 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
      * arrives. We give the coordinator up to `deadline_ms` of real time, but once
      * we've received at least one message we stop as soon as the topic drains. */
     const int64_t deadline_ms = 10000;
+    const int64_t brokers_down_grace_ms = 6000;  /* сколько ждём переподключения */
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     bool got_any = false;
+    int64_t brokers_down_since = -1;             /* -1 = кластер не помечен down */
 
     while (msg_count < (int)limit) {
         struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
@@ -929,15 +970,24 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                            + (tn.tv_nsec - t0.tv_nsec) / 1000000;
         if (elapsed_ms >= deadline_ms) break;
 
-        /* If the cluster dropped while we were polling, stop and surface it
-         * rather than spinning to the deadline and reporting a green 0 rows. */
+        /* Транзиентный реконнект: librdkafka переподключается сам за секунды, а
+         * preflight в начале read_batch уже подтвердил доступность кластера.
+         * Поэтому НЕ падаем на первом же ALL_BROKERS_DOWN (это ронял чтение при
+         * кратковременном обрыве — «отваливается»); даём grace на восстановление и
+         * жёстко падаем, только если брокеры недоступны непрерывно дольше grace и
+         * ни одного сообщения так и не пришло. */
         if (!got_any && atomic_load(&ctx->all_brokers_down)) {
-            if (!ctx->last_err[0])
-                snprintf(ctx->last_err, sizeof(ctx->last_err),
-                         "all brokers down (%s)", ctx->brokers);
-            LOG_ERROR("kafka: %s", ctx->last_err);
-            *out = NULL;
-            return -1;
+            if (brokers_down_since < 0) brokers_down_since = elapsed_ms;
+            else if (elapsed_ms - brokers_down_since >= brokers_down_grace_ms) {
+                if (!ctx->last_err[0])
+                    snprintf(ctx->last_err, sizeof(ctx->last_err),
+                             "all brokers down (%s)", ctx->brokers);
+                LOG_ERROR("kafka: %s", ctx->last_err);
+                *out = NULL;
+                return -1;
+            }
+        } else {
+            brokers_down_since = -1;  /* пришло сообщение или флаг снят — сбрасываем */
         }
 
         rd_kafka_message_t *msg = rd_kafka_consumer_poll(ctx->rk, 500 /*ms*/);
