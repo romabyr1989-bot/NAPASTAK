@@ -4967,16 +4967,35 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
             table_created = true;
         }
 
-        /* Store as TEXT: connector batch values are always char* text, while the
-         * catalog (via recreate_table above) keeps the LOGICAL type. Temporarily
-         * present a COL_TEXT schema to table_append/compress so they read char**
-         * (never reinterpret text as a native int64/double — that crashed SELECT).
-         * Restored immediately so the logical schema survives for later pages. */
+        /* Store as TEXT: the table stores every value as text, while the catalog
+         * (via recreate_table above) keeps the LOGICAL type. Connectors fill
+         * values[c] per the DECLARED column type (native int64 or double arrays
+         * for INT64/BOOL/DOUBLE, char** for TEXT — the CSV/json_http/kafka
+         * contract), so native columns are FORMATTED into text here.
+         * The previous code merely relabeled every column COL_TEXT without
+         * converting, so compress strcmp'd native int64s as char* pointers —
+         * SIGSEGV on the first kafka/csv/json_http batch with a numeric column. */
         {
             ColType _saved[MAX_COLS];
             int _nc = batch->ncols < MAX_COLS ? batch->ncols : MAX_COLS;
             for (int c = 0; c < _nc; c++) {
                 _saved[c] = batch->schema->cols[c].type;
+                const uint8_t *bm = batch->null_bitmap[c];
+                if (_saved[c] == COL_INT64 || _saved[c] == COL_BOOL) {
+                    int64_t *iv = (int64_t *)batch->values[c];
+                    char   **sv = arena_alloc(a, (size_t)batch->nrows * sizeof(char *));
+                    for (int r = 0; r < batch->nrows; r++)
+                        sv[r] = (bm && ((bm[r/8] >> (r%8)) & 1u)) ? NULL
+                              : arena_sprintf(a, "%lld", (long long)iv[r]);
+                    batch->values[c] = sv;
+                } else if (_saved[c] == COL_DOUBLE) {
+                    double *dv = (double *)batch->values[c];
+                    char  **sv = arena_alloc(a, (size_t)batch->nrows * sizeof(char *));
+                    for (int r = 0; r < batch->nrows; r++)
+                        sv[r] = (bm && ((bm[r/8] >> (r%8)) & 1u)) ? NULL
+                              : arena_sprintf(a, "%.15g", dv[r]);
+                    batch->values[c] = sv;
+                }
                 batch->schema->cols[c].type = COL_TEXT;
             }
             table_append(t, batch);
