@@ -6,7 +6,6 @@
 #   docker build --build-arg BASE_IMAGE=<redos-image> -f packaging/redos/Dockerfile ...
 ARG BASE_IMAGE=rockylinux:9
 FROM ${BASE_IMAGE} AS build
-ARG VERSION=redos
 # ODPI-C — open-source (UPL/Apache) C-обёртка Oracle. Свободно распространяется;
 # проприетарный Oracle Instant Client она dlopen()-ит только в момент подключения.
 ARG ODPI_VERSION=4.6.1
@@ -36,6 +35,10 @@ RUN curl -fsSL "https://github.com/oracle/odpi/archive/refs/tags/v${ODPI_VERSION
 
 WORKDIR /src
 COPY . .
+# ARG VERSION объявлен ПОСЛЕ тяжёлых слоёв (dnf, ODPI): он меняется с каждым
+# коммитом, и объяви его раньше — кэш этих слоёв сбрасывался бы на каждую
+# сборку (повторное скачивание ODPI с GitHub, лишняя зависимость от сети).
+ARG VERSION=redos
 RUN make clean >/dev/null 2>&1 || true
 RUN make BUILD=release dist VERSION="${VERSION}"
 
