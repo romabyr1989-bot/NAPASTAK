@@ -1689,7 +1689,21 @@ typedef struct {
     bool              early_page;
     int64_t           skip_left;   /* сколько строк ещё пропустить (OFFSET) */
     int64_t           take_left;   /* сколько строк ещё отдать (LIMIT), -1 = без лимита */
+    /* Потоковый скан: строки приходят из короткоживущей арены сканера, поэтому
+     * star-проекция обязана копировать ячейки в арену запроса (не-star путь
+     * копирует всегда через eval_val/val_cell). */
+    bool              stream_rows;
+    /* Арена для ПРОМЕЖУТОЧНЫХ вычислений строки (WHERE, ключи GROUP BY,
+     * аргументы агрегатов, val_cell/val_str перед финальным strdup). При
+     * потоковом скане указывает на арену порции и умирает вместе с ней —
+     * иначе аллоцирующие выражения (UPPER(), ILIKE, col/100 в GROUP BY)
+     * копили бы O(строк таблицы) в арене запроса и возвращали OOM, который
+     * стриминг призван устранить. NULL — обычный путь (всё в a). */
+    Arena            *eval_a;
 } ExecState;
+
+/* Арена для промежуточных вычислений текущей строки. */
+#define ST_EVAL_A(st) ((st)->eval_a ? (st)->eval_a : (st)->a)
 
 
 /* Находит группу по её key (значения GROUP BY, склеенные через \x1F) либо
@@ -1750,14 +1764,14 @@ static void agg_accumulate(ExecState *st, GrpAcc *g, int s, Expr *agg_e, JoinCtx
     if (!strcasecmp(fn,"COUNT")) {
         if (is_star) g->cnts[s]++;
         else {
-            Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
-            if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,st->a))))
+            Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,ST_EVAL_A(st));
+            if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,ST_EVAL_A(st)))))
                 g->cnts[s]++;
         }
     } else {
-        Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,st->a);
-        if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,st->a)))) {
-            const char *sv=val_str(v,st->a);
+        Val v=eval_val(agg_e->nargs>0?agg_e->args[0]:NULL,ctx,ST_EVAL_A(st));
+        if (!v.is_null && (!distinct || agg_distinct_first_seen(st,g,s,val_str(v,ST_EVAL_A(st))))) {
+            const char *sv=val_str(v,ST_EVAL_A(st));
             double n=v.num; if (!v.is_num) pnum(sv,&n);
             g->sums[s]+=n; g->cnts[s]++;
             if (!g->min_set[s]) {
@@ -1786,8 +1800,8 @@ static void agg_row(ExecState *st, GrpAcc *g, JoinCtx *ctx) {
                       ? base : find_first_agg(base);
         if (agg_e) agg_accumulate(st, g, s, agg_e, ctx);
         else if (!g->first_str[s]) {       /* non-agg: keep first value */
-            Val v=eval_val(base,ctx,st->a);
-            g->first_str[s]=arena_strdup(st->a,val_str(v,st->a));
+            Val v=eval_val(base,ctx,ST_EVAL_A(st));
+            g->first_str[s]=arena_strdup(st->a,val_str(v,ST_EVAL_A(st)));
         }
     }
     /* aggregates appearing only in HAVING/ORDER BY → appended accumulator slots */
@@ -1875,7 +1889,7 @@ static void emit_groups(ExecState *st) {
 static void collect_row(ExecState *st, JoinCtx *ctx) {
     /* WHERE filter */
     if (st->sel->where) {
-        Val w=eval_val(st->sel->where,ctx,st->a);
+        Val w=eval_val(st->sel->where,ctx,ST_EVAL_A(st));
         if (!vt(w)) return;
     }
 
@@ -1884,9 +1898,9 @@ static void collect_row(ExecState *st, JoinCtx *ctx) {
         char kbuf[4096]; kbuf[0]='\0';
         if (!st->implicit_agg) {
             for (int g=0;g<st->sel->ngroup;g++) {
-                Val gv=eval_val(st->sel->group_by[g],ctx,st->a);
+                Val gv=eval_val(st->sel->group_by[g],ctx,ST_EVAL_A(st));
                 if (g) strncat(kbuf,"\x1F",sizeof(kbuf)-strlen(kbuf)-1);
-                strncat(kbuf,val_str(gv,st->a),sizeof(kbuf)-strlen(kbuf)-1);
+                strncat(kbuf,val_str(gv,ST_EVAL_A(st)),sizeof(kbuf)-strlen(kbuf)-1);
             }
         }
         GrpAcc *grp=find_or_create_grp(st,kbuf);
@@ -1921,14 +1935,19 @@ static void collect_row(ExecState *st, JoinCtx *ctx) {
                 if (ctx->schemas[t]) for (int c=0;c<ctx->schemas[t]->ncols;c++) cells[ci++]="";
                 continue;
             }
-            for (int c=0;c<ctx->schemas[t]->ncols;c++) cells[ci++]=ctx->rows[t][c]?ctx->rows[t][c]:"";
+            for (int c=0;c<ctx->schemas[t]->ncols;c++) {
+                const char *cv = ctx->rows[t][c] ? ctx->rows[t][c] : "";
+                /* Потоковый скан: строка живёт в арене сканера до следующего
+                 * батча — в RS обязана попасть копия. */
+                cells[ci++] = st->stream_rows ? arena_strdup(st->a, cv) : (char *)cv;
+            }
         }
     } else {
         for (int s=0;s<nc;s++) {
             Expr *se=st->sel->select_list[s];
             Expr *base=(se->type==EXPR_ALIAS)?se->expr:se;
-            Val v=eval_val(base,ctx,st->a);
-            cells[s]=arena_strdup(st->a,val_cell(v,st->a));
+            Val v=eval_val(base,ctx,ST_EVAL_A(st));
+            cells[s]=arena_strdup(st->a,val_cell(v,ST_EVAL_A(st)));
         }
     }
 
@@ -1953,8 +1972,8 @@ static void collect_row(ExecState *st, JoinCtx *ctx) {
                 if (se->type==EXPR_ALIAS) se=se->expr;
                 oe=se;
             }
-            Val sv=eval_val(oe,ctx,st->a);
-            skeys[o]=arena_strdup(st->a,val_str(sv,st->a));
+            Val sv=eval_val(oe,ctx,ST_EVAL_A(st));
+            skeys[o]=arena_strdup(st->a,val_str(sv,ST_EVAL_A(st)));
         }
     }
 
@@ -2542,6 +2561,203 @@ static void apply_windows(Arena *a, RS *rs, const SelectStmt *sel) {
  * (→ WHERE/GROUP/проекция), затем emit_groups (агрегация), DISTINCT, оконные
  * функции (apply_windows), ORDER BY (стабильная сортировка) и LIMIT/OFFSET.
  * Несуществующий источник помечает tl_exec_error. */
+/* ── Потоковый скан одиночной таблицы (без материализации в RAM) ──
+ * Для SELECT из одной каталожной таблицы строки читаются из WAL порциями и
+ * сразу эмитятся в collect_row; память — O(батча), а не O(таблицы): load_tbl
+ * материализовал всю таблицу, и запрос по таблице в 56 млн строк (7.6 ГБ)
+ * исчерпал бы RAM сервера. Семантика идентична load_tbl+join_recurse: тот же
+ * порядок строк (порядок WAL), те же tombstone-правила; ORDER BY / DISTINCT /
+ * оконные функции работают над RS как раньше (он ограничен MAX_RS_ROWS с
+ * флагом truncated). Ускорения: целые сжатые батчи пропускаются по nrows из
+ * заголовка (early_page без WHERE — страничная выгрузка sink не платит за
+ * декомпрессию пропускаемого префикса); скан останавливается при исчерпании
+ * LIMIT и при переполнении RS без агрегации (дальнейшие строки всё равно
+ * отбрасываются). */
+static void stream_tbl_scan(ExecState *st, TblData *td) {
+    Arena *a = st->a;
+    int ncols = td->schema->ncols;
+    char wal_path[1024];
+    snprintf(wal_path, sizeof(wal_path), "%s/%s/wal.bin", g_app.data_dir, td->tname);
+    FILE *wf = fopen(wal_path, "rb");
+    if (!wf) return;                          /* WAL нет — пустая таблица */
+
+    /* Pass 1: tombstones (O(числа DML-операций) — живут в арене запроса). */
+    typedef struct { int64_t orig_off; uint8_t op; char *new_csv; size_t new_len; } Tomb;
+    int tb_cap = 16, ntb = 0;
+    Tomb *tbs = arena_alloc(a, (size_t)tb_cap * sizeof(Tomb));
+    {
+        char tbuf[262144];
+        while (1) {
+            uint32_t l = 0;
+            if (fread(&l, 1, 4, wf) != 4) break;
+            if (l == 0 || l > sizeof(tbuf) - 1) { fseeko(wf, (off_t)l, SEEK_CUR); continue; }
+            if (fread(tbuf, 1, l, wf) != l) break;
+            uint8_t op = (uint8_t)tbuf[0];
+            if ((op == WAL_OP_DELETE || op == WAL_OP_UPDATE) && l >= 9) {
+                int64_t orig = 0;
+                for (int b = 0; b < 8; b++) orig = (orig << 8) | ((uint8_t)tbuf[1 + b]);
+                if (ntb == tb_cap) {
+                    tb_cap *= 2;
+                    Tomb *nb = arena_alloc(a, (size_t)tb_cap * sizeof(Tomb));
+                    memcpy(nb, tbs, (size_t)ntb * sizeof(Tomb)); tbs = nb;
+                }
+                tbs[ntb].orig_off = orig; tbs[ntb].op = op;
+                tbs[ntb].new_csv = NULL; tbs[ntb].new_len = 0;
+                if (op == WAL_OP_UPDATE && l > 9) {
+                    size_t cl = l - 9;
+                    char *nc = arena_alloc(a, cl + 1);
+                    memcpy(nc, tbuf + 9, cl); nc[cl] = '\0';
+                    tbs[ntb].new_csv = nc; tbs[ntb].new_len = cl;
+                }
+                ntb++;
+            }
+        }
+        rewind(wf);
+    }
+
+    JoinCtx ctx = {0};
+    ctx.n = 1;
+    ctx.schemas[0] = td->schema;
+    ctx.tnames[0]  = td->tname ? td->tname : "";
+    ctx.aliases[0] = td->alias ? td->alias : "";
+
+    /* Пропуск строк до OFFSET без разбора допустим, только когда WHERE нет:
+     * offset считается по строкам ПОСЛЕ фильтра. */
+    bool fast_skip = st->early_page && st->sel->where == NULL;
+    Arena *sa = arena_create(1 << 20);       /* арена текущей порции */
+    st->eval_a = sa;                          /* промежуточные вычисления — в порцию */
+    int64_t file_off = 0;
+    unsigned nrec = 0;
+
+    /* Стоп: LIMIT выбран, либо RS переполнен и агрегации нет (все дальнейшие
+     * строки отбрасывались бы в rs_add — результат уже не изменится). */
+    #define DFO_SCAN_DONE() \
+        ((st->early_page && st->take_left == 0) || (st->rs->truncated && !st->do_agg))
+
+    while (!DFO_SCAN_DONE()) {
+        uint32_t l = 0;
+        if (fread(&l, 1, 4, wf) != 4) break;
+        int64_t rec_off = file_off; file_off += 4 + (int64_t)l;
+        if (l == 0 || l > 16777216) { fseeko(wf, (off_t)l, SEEK_CUR); continue; }
+
+        int op = fgetc(wf);
+        if (op == EOF) break;
+        if (op == WAL_OP_DELETE || op == WAL_OP_UPDATE) {  /* tombstone-запись */
+            fseeko(wf, (off_t)(l - 1), SEEK_CUR); continue;
+        }
+
+        /* Судьба записи по tombstone известна до чтения тела (по rec_off). */
+        bool dead = false; char *upd_csv = NULL; size_t upd_len = 0;
+        for (int ti = 0; ti < ntb; ti++) {
+            if (tbs[ti].orig_off == rec_off) {
+                dead = true;
+                if (tbs[ti].op == WAL_OP_UPDATE) { upd_csv = tbs[ti].new_csv; upd_len = tbs[ti].new_len; }
+                break;
+            }
+        }
+
+        if (op == 0x01 && l > 1) {                         /* сжатый батч */
+            if (dead && !upd_csv) { fseeko(wf, (off_t)(l - 1), SEEK_CUR); continue; }
+            if (l <= 14) {  /* короче заголовка: битая запись — 0 строк, как в load_tbl */
+                fseeko(wf, (off_t)(l - 1), SEEK_CUR); continue;
+            }
+            char hdr[13];                                   /* "DCMB"+ver+ncols+nrows */
+            if (fread(hdr, 1, 13, wf) != 13) break;
+            uint32_t bn = 0; memcpy(&bn, hdr + 9, 4);
+            /* fast-skip доверяет nrows только валидному заголовку; иначе полный
+             * декод (битая запись даст NULL и 0 строк — паритет с load_tbl). */
+            bool hdr_ok = memcmp(hdr, "DCMB", 4) == 0 && hdr[4] == 1 &&
+                          bn > 0 && bn <= 16777216;
+            if (fast_skip && hdr_ok && st->skip_left >= (int64_t)bn) {
+                st->skip_left -= (int64_t)bn;               /* батч целиком до OFFSET */
+                fseeko(wf, (off_t)(l - 14), SEEK_CUR);
+                continue;
+            }
+            char *line = arena_alloc(sa, (size_t)l + 1);
+            line[0] = (char)op; memcpy(line + 1, hdr, 13);
+            if (fread(line + 14, 1, (size_t)l - 14, wf) != (size_t)l - 14) break;
+            CompressedBatch *cb = compressed_batch_deserialize(line + 1, (size_t)(l - 1), sa);
+            ColBatch *batch = cb ? decompress_batch(cb, sa) : NULL;
+            if (batch) {
+                for (int r = 0; r < batch->nrows && !DFO_SCAN_DONE(); r++) {
+                    if (fast_skip && st->skip_left > 0) { st->skip_left--; continue; }
+                    char **row = arena_alloc(sa, (size_t)ncols * sizeof(char *));
+                    for (int c = 0; c < ncols; c++) {
+                        if (c >= batch->ncols) { row[c] = (char *)DFO_NULL_SENTINEL; continue; }
+                        if (batch->null_bitmap[c]) {
+                            int bi = r / 8;
+                            if (batch->null_bitmap[c][bi] & (1u << (r % 8))) { row[c] = (char *)DFO_NULL_SENTINEL; continue; }
+                        }
+                        ColType t = (batch->schema && c < batch->schema->ncols) ? batch->schema->cols[c].type : COL_TEXT;
+                        switch (t) {
+                            case COL_INT64:  row[c] = arena_sprintf(sa, "%lld", (long long)((int64_t *)batch->values[c])[r]); break;
+                            case COL_DOUBLE: row[c] = (char *)dbl_fmt(sa, ((double *)batch->values[c])[r]); break;
+                            case COL_BOOL:   row[c] = ((int64_t *)batch->values[c])[r] ? "true" : "false"; break;
+                            case COL_TEXT: {
+                                char *cv = ((char **)batch->values[c])[r];
+                                /* см. load_tbl: защита от legacy-батча с числом под TEXT-слотом */
+                                row[c] = ((uintptr_t)cv < 0x1000) ? (char *)DFO_NULL_SENTINEL : cv;
+                                break;
+                            }
+                            default: row[c] = (char *)DFO_NULL_SENTINEL; break;
+                        }
+                    }
+                    ctx.rows[0] = row;
+                    collect_row(st, &ctx);
+                }
+            }
+            arena_destroy(sa); sa = arena_create(1 << 20);  /* память O(батча) */
+            st->eval_a = sa;
+            continue;
+        }
+
+        /* несжатая CSV-запись */
+        if (dead && !upd_csv) { fseeko(wf, (off_t)(l - 1), SEEK_CUR); continue; }
+        char *line = arena_alloc(sa, (size_t)l + 1);
+        line[0] = (char)op;
+        if (l > 1 && fread(line + 1, 1, (size_t)l - 1, wf) != (size_t)l - 1) break;
+        line[l] = '\0';
+
+        /* printable-фильтр тела оригинала — ДО применения UPDATE (как в load_tbl:
+         * непечатаемая запись отбрасывается, даже если на неё есть UPDATE). */
+        {
+            size_t rl0 = strlen(line);
+            while (rl0 > 0 && (line[rl0-1]=='\n' || line[rl0-1]=='\r')) line[--rl0] = '\0';
+            int pr0 = 0;
+            for (size_t ci = 0; ci < rl0; ci++) if ((unsigned char)line[ci] >= 0x20) pr0++;
+            if (pr0 < 2) {
+                if (((++nrec) & 2047u) == 0) { arena_destroy(sa); sa = arena_create(1 << 20); st->eval_a = sa; }
+                continue;
+            }
+        }
+        char **row = NULL;
+        if (upd_csv) {
+            char *uline = arena_alloc(sa, upd_len + 1);
+            memcpy(uline, upd_csv, upd_len); uline[upd_len] = '\0';
+            size_t ul = strlen(uline);
+            while (ul > 0 && (uline[ul-1]=='\n' || uline[ul-1]=='\r')) uline[--ul] = '\0';
+            char *vals[MAX_COLS] = {0}; int nv = 0;
+            split_line_simple(uline, ',', vals, MAX_COLS, &nv);
+            row = arena_alloc(sa, (size_t)ncols * sizeof(char *));
+            for (int i = 0; i < ncols; i++) row[i] = (i < nv && vals[i]) ? vals[i] : "";
+        } else {
+            char *vals[MAX_COLS] = {0}; int nv = 0;
+            split_line_simple(line, ',', vals, MAX_COLS, &nv);
+            row = arena_alloc(sa, (size_t)ncols * sizeof(char *));
+            for (int i = 0; i < ncols; i++) row[i] = (i < nv && vals[i]) ? vals[i] : "";
+        }
+        if (row) {
+            if (fast_skip && st->skip_left > 0) st->skip_left--;
+            else { ctx.rows[0] = row; collect_row(st, &ctx); }
+        }
+        if (((++nrec) & 2047u) == 0) { arena_destroy(sa); sa = arena_create(1 << 20); st->eval_a = sa; }
+    }
+    #undef DFO_SCAN_DONE
+    st->eval_a = NULL;                        /* HAVING/emit_groups после скана — в арене запроса */
+    arena_destroy(sa);
+    fclose(wf);
+}
+
 static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     /* Setup VT registry — inherit parent + add CTEs */
     VTReg local_vt={0};
@@ -2582,6 +2798,7 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
 
     IdxHint ih = extract_idx_hint(sel->where);
     TblData *tables=arena_calloc(a,(size_t)ntables*sizeof(TblData));
+    bool stream_scan = false;   /* единственная каталожная таблица → потоковый скан */
     for (int i=0;i<ntables;i++) {
         const char *tname=sel->from[i].table;
         const char *alias=sel->from[i].alias;
@@ -2603,6 +2820,38 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
             tables[i].tname=alias?alias:"_sub";
             tables[i].alias=alias;
         } else if (tname) {
+            /* Потоковый скан: единственная таблица запроса, из каталога (не
+             * CTE/derived) и без применимого индексного хинта — строки НЕ
+             * материализуются, читаются из WAL в stream_tbl_scan ниже. */
+            if (ntables == 1) {
+                RS *vrs = NULL; Schema *vsc = NULL;
+                bool is_vt = (vt && vt_get(vt, tname, &vrs, &vsc) && vrs);
+                if (!is_vt &&
+                    catalog_get_schema(g_app.catalog, tname, &tables[i].schema, a) == 0 &&
+                    tables[i].schema) {
+                    bool idx_usable = false;
+                    if (ih.valid && ih.col) {
+                        for (int c2 = 0; c2 < tables[i].schema->ncols; c2++) {
+                            if (tables[i].schema->cols[c2].name &&
+                                strcasecmp(tables[i].schema->cols[c2].name, ih.col) == 0 &&
+                                tables[i].schema->cols[c2].type == COL_INT64) {
+                                pthread_mutex_lock(&g_app.tables_mu);
+                                Table *tt2 = hm_get(&g_app.tables, tname);
+                                idx_usable = tt2 && table_get_index(tt2, c2) != NULL;
+                                pthread_mutex_unlock(&g_app.tables_mu);
+                                break;
+                            }
+                        }
+                    }
+                    if (!idx_usable) {
+                        tables[i].tname = tname; tables[i].alias = alias;
+                        tables[i].rows = NULL; tables[i].nrows = 0;
+                        stream_scan = true;
+                        continue;
+                    }
+                    /* есть рабочий B-tree по хинту → точечный load_tbl ниже */
+                }
+            }
             if (load_tbl(a,tname,alias,vt,&tables[i],&ih)!=0) {
                 /* Unresolvable source table: NOT in the virtual registry
                  * (CTE/derived) and NOT in the catalog → "no such table". This
@@ -2689,8 +2938,13 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     st.cap_grps=64;
     st.grps=arena_alloc(a,(size_t)st.cap_grps*sizeof(GrpAcc));
 
-    JoinCtx ctx={0};
-    join_recurse(&st, 0, &ctx, tables, ntables, false);
+    if (stream_scan) {
+        st.stream_rows = true;
+        stream_tbl_scan(&st, &tables[0]);
+    } else {
+        JoinCtx ctx={0};
+        join_recurse(&st, 0, &ctx, tables, ntables, false);
+    }
 
     if (do_agg) emit_groups(&st);
 
@@ -5192,13 +5446,37 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
             && strncasecmp(p, "limit", 5) == 0
             && !isalnum((unsigned char)p[5]) && p[5] != '_') { user_limited = true; break; }
     }
+    /* Хвостовой «LIMIT N» (без OFFSET): при N > MAX_RS_ROWS одна страница
+     * усекается и truncated-страж валит шаг. Снимаем суффикс и превращаем N
+     * в постраничный предел — выгрузка страницами до N строк. */
+    long long user_cap = -1;
+    if (user_limited) {
+        size_t e = strlen(sql_clean), d = e;
+        while (d > 0 && isdigit((unsigned char)sql_clean[d-1])) d--;
+        if (d < e && d >= 6) {
+            size_t k = d;
+            while (k > 0 && (sql_clean[k-1]==' '||sql_clean[k-1]=='\n'||sql_clean[k-1]=='\t')) k--;
+            if (k >= 5 && strncasecmp(sql_clean + k - 5, "limit", 5) == 0 &&
+                (k == 5 || (!isalnum((unsigned char)sql_clean[k-6]) && sql_clean[k-6] != '_'))) {
+                user_cap = atoll(sql_clean + d);
+                sql_clean[k - 5] = '\0';
+                size_t sl2 = strlen(sql_clean);
+                while (sl2 && (sql_clean[sl2-1]==' '||sql_clean[sl2-1]=='\n'||sql_clean[sl2-1]=='\t'))
+                    sql_clean[--sl2] = '\0';
+                user_limited = false;    /* дальше обычная пагинация до user_cap */
+            }
+        }
+    }
     const int SINK_PAGE = 50000;
 
     int total = 0, first = 1;
     for (long long page_off = 0; ; page_off += SINK_PAGE) {
+    if (user_cap >= 0 && page_off >= user_cap) break;      /* пользовательский предел исчерпан */
+    long long page_lim = SINK_PAGE;
+    if (user_cap >= 0 && user_cap - page_off < page_lim) page_lim = user_cap - page_off;
     Arena *pa = arena_create(1 << 20);
     const char *psql = user_limited ? sql_clean
-        : arena_sprintf(pa, "%s LIMIT %d OFFSET %lld", sql_clean, SINK_PAGE, page_off);
+        : arena_sprintf(pa, "%s LIMIT %lld OFFSET %lld", sql_clean, page_lim, page_off);
     Stmt *stmt = sql_parse(pa, psql, strlen(psql));
     if (stmt->error) {
         snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
@@ -5298,7 +5576,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
 
     int page_rows = rs->nrows;
     arena_destroy(pa);
-    if (user_limited || page_rows < SINK_PAGE) break;
+    if (user_limited || (long long)page_rows < page_lim) break;
     }  /* конец страничного цикла */
 
     connector_unload(inst);
