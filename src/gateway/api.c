@@ -5109,8 +5109,15 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
             snprintf(cursor_buf, sizeof(cursor_buf), "%d", total_rows);
         }
 
-        /* rc==1 = last/only page; a short batch also signals the end. */
-        if (rc == 1 || batch->nrows < BATCH_SIZE) break;
+        /* Конец источника — ТОЛЬКО rc==1 (последняя страница) или пустая
+         * страница (проверено выше). Короткая страница концом НЕ считается:
+         * у потоковых источников (Kafka) poll может недобрать страницу из-за
+         * I/O-паузы брокера/диска, и прежняя эвристика «short page = EOF»
+         * молча обрывала загрузку (наблюдалось: 48.1 млн строк из 56.2 млн
+         * при столле диска — прогон завершился «успехом»). Цена: у
+         * коннекторов, не возвращающих rc==1, конец стоит один лишний
+         * read_batch с пустым результатом. */
+        if (rc == 1) break;
     }
     if (pa) arena_destroy(pa);
 

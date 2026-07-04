@@ -174,16 +174,23 @@ static int csv_describe(void *vctx, Arena *a, const char *entity, Schema **out) 
 
 /* Читает до BATCH_SIZE строк в колоночный батч, парся ячейки по типам схемы;
  * пустые/null/na помечаются в null_bitmap. Заголовок пропускается при наличии.
- * ВНИМАНИЕ: req (cursor/limit/filter) игнорируется — файл читается с начала,
- * пагинации между вызовами нет; отдаётся только первый батч файла. */
+ * Пагинация: req->cursor — номер строки данных, с которой читать; конец файла
+ * сигналится rc=1 (короткая/пустая страница). */
 static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                            const char *entity, ColBatch **out_batch) {
-    (void)entity; (void)req;
+    (void)entity;
     CsvCtx *ctx=vctx;
     if (!ctx->schema) return -1;
 
     FILE *f=fopen(ctx->path,"r");
     if (!f) return -1;
+
+    /* Раньше req игнорировался: каждый вызов заново читал ПЕРВЫЕ BATCH_SIZE
+     * строк, а конец определялся только эвристикой «короткая страница» у
+     * вызывающего — файл крупнее одной страницы зациклил бы runner на дублях
+     * первой страницы. Теперь курсор — смещение в строках данных. */
+    long long start = 0;
+    if (req && req->cursor && req->cursor[0]) start = atoll(req->cursor);
 
     int ncols=ctx->schema->ncols;
     ColBatch *batch=arena_calloc(a,sizeof(ColBatch));
@@ -204,6 +211,7 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 
     char line[65536]; int row=0;
     if (ctx->has_header) fgets(line,sizeof(line),f); /* skip header */
+    for (long long s=0; s<start && fgets(line,sizeof(line),f); s++) ;  /* перемотка на курсор */
     while (row<BATCH_SIZE && fgets(line,sizeof(line),f)) {
         int n; int perr=0; char **vals=split_line_ex(a,line,ctx->delimiter,&n,&perr);
         /* RFC-4180 strictness: a quote-parse error (unterminated/stray quote) is a
@@ -239,7 +247,8 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     fclose(f);
     batch->nrows=row;
     *out_batch=batch;
-    return 0;
+    /* Файл детерминирован: неполная страница = конец данных (rc=1). */
+    return (row < BATCH_SIZE) ? 1 : 0;
 }
 
 /* helper needed from storage.h for bit ops */
