@@ -67,9 +67,14 @@ typedef struct {
 
     /* Security (managed Kafka: Confluent Cloud / MSK / Aiven need SASL_SSL) */
     char  security_protocol[32];  /* PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL */
-    char  sasl_mechanism[32];     /* PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512 */
+    char  sasl_mechanism[32];     /* PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512 | GSSAPI */
     char  sasl_username[256];
     char  sasl_password[256];
+    /* Kerberos (sasl_mechanism = GSSAPI). Логин/пароль не используются —
+     * аутентификация по keytab+principal либо по внешнему кэшу билетов. */
+    char  sasl_kerberos_service_name[128]; /* имя сервис-принципала брокера, обычно "kafka" */
+    char  sasl_kerberos_principal[256];    /* клиентский принципал, напр. user@REALM */
+    char  sasl_kerberos_keytab[512];       /* путь к keytab на хосте gateway */
     /* TLS (security_protocol SSL | SASL_SSL). Пути к файлам на хосте gateway. */
     char  ssl_ca_location[512];          /* CA-сертификат для проверки брокера (PEM) */
     char  ssl_certificate_location[512]; /* клиентский сертификат для mTLS (PEM) */
@@ -165,10 +170,45 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
          * sasl.kerberos.keytab", и SASL-подключение по логину/паролю не
          * работает вовсе. Разумный дефолт для username/password — PLAIN. */
         rd_kafka_conf_set(conf, "sasl.mechanism", "PLAIN", errstr, errlen);
-    if (ctx->sasl_username[0])
-        rd_kafka_conf_set(conf, "sasl.username", ctx->sasl_username, errstr, errlen);
-    if (ctx->sasl_password[0])
-        rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
+    /* GSSAPI (Kerberos) — работает «под капотом», без секретов в конфиге
+     * конвейера. Всё берётся из окружения хоста gateway, настроенного ops:
+     *   - /etc/krb5.conf (realm → KDC) — обязателен;
+     *   - keytab+principal из ENV (KAFKA_KERBEROS_KEYTAB / _PRINCIPAL) →
+     *     librdkafka сама держит билет свежим через kinit;
+     *   - либо, если keytab не задан, внешний кэш билетов (системный kinit /
+     *     cron): отключаем внутренний kinit, чтобы librdkafka не падала на
+     *     отсутствующем keytab, и используем готовый ccache (KRB5CCNAME).
+     * service.name (сервис-принципал брокера) — из ENV или дефолт "kafka".
+     * Поля sasl_kerberos_* в конфиге — необязательный override для API/YAML. */
+    if (strcmp(ctx->sasl_mechanism, "GSSAPI") == 0) {
+        const char *svc = getenv("KAFKA_KERBEROS_SERVICE_NAME");
+        if (!svc || !svc[0]) svc = ctx->sasl_kerberos_service_name[0] ? ctx->sasl_kerberos_service_name : "kafka";
+        rd_kafka_conf_set(conf, "sasl.kerberos.service.name", svc, errstr, errlen);
+
+        const char *keytab = getenv("KAFKA_KERBEROS_KEYTAB");
+        if (!keytab || !keytab[0]) keytab = ctx->sasl_kerberos_keytab;
+        const char *princ  = getenv("KAFKA_KERBEROS_PRINCIPAL");
+        if (!princ || !princ[0]) princ = ctx->sasl_kerberos_principal;
+
+        if (keytab && keytab[0] && princ && princ[0]) {
+            rd_kafka_conf_set(conf, "sasl.kerberos.keytab", keytab, errstr, errlen);
+            rd_kafka_conf_set(conf, "sasl.kerberos.principal", princ, errstr, errlen);
+        } else {
+            /* Внешний кэш билетов (kinit сделан заранее — cron/системно):
+             * заменяем дефолтный kinit.cmd на no-op "true". Пустая строка НЕ
+             * годится — librdkafka всё равно валидирует дефолт со ссылкой на
+             * %{sasl.kerberos.keytab} и падает; "true" убирает эту ссылку и
+             * отключает внутренний kinit, а билет берётся из готового ccache
+             * (KRB5CCNAME). */
+            rd_kafka_conf_set(conf, "sasl.kerberos.kinit.cmd", "true", errstr, errlen);
+        }
+    } else {
+        /* PLAIN/SCRAM — по логину/паролю. */
+        if (ctx->sasl_username[0])
+            rd_kafka_conf_set(conf, "sasl.username", ctx->sasl_username, errstr, errlen);
+        if (ctx->sasl_password[0])
+            rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
+    }
     /* TLS: CA для проверки брокера + клиентский cert/key для mTLS. Задаются
      * только при непустом значении, так что PLAINTEXT/SASL_PLAINTEXT не трогаются.
      * Проверку сертификата брокера НЕ отключаем (безопасность по умолчанию). */
@@ -682,6 +722,9 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
         cfg_str(config_json, "\"sasl_username\"",     ctx->sasl_username,     sizeof(ctx->sasl_username));
         cfg_str(config_json, "\"sasl_password\"",     ctx->sasl_password,     sizeof(ctx->sasl_password));
+        cfg_str(config_json, "\"sasl_kerberos_service_name\"", ctx->sasl_kerberos_service_name, sizeof(ctx->sasl_kerberos_service_name));
+        cfg_str(config_json, "\"sasl_kerberos_principal\"",    ctx->sasl_kerberos_principal,    sizeof(ctx->sasl_kerberos_principal));
+        cfg_str(config_json, "\"sasl_kerberos_keytab\"",       ctx->sasl_kerberos_keytab,       sizeof(ctx->sasl_kerberos_keytab));
         /* TLS/mTLS (для security_protocol SSL | SASL_SSL) */
         cfg_str(config_json, "\"ssl_ca_location\"",          ctx->ssl_ca_location,          sizeof(ctx->ssl_ca_location));
         cfg_str(config_json, "\"ssl_certificate_location\"", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));

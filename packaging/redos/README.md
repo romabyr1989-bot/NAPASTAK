@@ -135,6 +135,44 @@ sudo systemctl restart dataflow-os
 ```
 Остальные 9 коннекторов работают без каких-либо внешних установок.
 
+### Kafka: Kerberos (GSSAPI)
+
+Коннектор Kafka поддерживает механизм SASL **GSSAPI (Kerberos)** — стандарт
+enterprise/банковских кластеров. В форме конвейера секретов нет: выбирается
+только механизм «GSSAPI», а аутентификация настраивается **на сервере gateway**
+(«под капотом»). Нужно три вещи:
+
+1. **Рантайм-плагин SASL** — иначе librdkafka не сможет в GSSAPI:
+   ```bash
+   sudo dnf install -y cyrus-sasl-gssapi krb5-workstation   # даёт /usr/lib64/sasl2/libgssapiv2.so
+   ```
+   (в офлайн-среде — поставьте эти RPM из локального репозитория/зеркала.)
+
+2. **`/etc/krb5.conf`** с realm → KDC вашего домена (`[libdefaults] default_realm`,
+   `[realms] … kdc = …`). Проверка: `kinit <user>@REALM` должен выдать билет.
+
+3. **Учётные данные** — один из двух режимов (никаких паролей в конвейере):
+
+   * **Keytab (рекомендуется)** — ops кладёт keytab и задаёт две переменные
+     окружения сервиса. librdkafka сама держит билет свежим:
+     ```bash
+     sudo install -m 0640 -o dataflow -g dataflow client.keytab /opt/dataflow-os/certs/
+     sudo systemctl edit dataflow-os      # добавить в [Service]:
+     #   Environment=KAFKA_KERBEROS_KEYTAB=/opt/dataflow-os/certs/client.keytab
+     #   Environment=KAFKA_KERBEROS_PRINCIPAL=svc-dfo@REALM.EXAMPLE.COM
+     #   Environment=KRB5_CONFIG=/etc/krb5.conf
+     sudo systemctl restart dataflow-os
+     ```
+   * **Внешний кэш билетов** — если билет обновляется системно (cron `kinit` /
+     `k5start`): ничего в env не задавайте, коннектор возьмёт готовый ccache
+     (`KRB5CCNAME`). Внутренний kinit при этом отключён (kinit.cmd=`true`).
+
+   Имя сервис-принципала брокера по умолчанию `kafka`; переопределяется
+   переменной `KAFKA_KERBEROS_SERVICE_NAME`.
+
+Проверено end-to-end против MIT KDC + Apache Kafka с SASL/GSSAPI-листенером
+(оба режима: keytab и внешний ccache).
+
 ## Примечание про базовый образ
 
 `rockylinux:9` совпадает с RedOS 8 по поколению библиотек (glibc 2.34, OpenSSL 3),

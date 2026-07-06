@@ -2788,6 +2788,8 @@ function makeConnectorConfigHTML(step, idx) {
      * (Kerberos) и падает на keytab. Проставляем дефолт PLAIN сразу при
      * рендере, чтобы отправляемый конфиг всегда был явным. */
     if (needsSasl && !cfg.sasl_mechanism) pbUpdateConnConfig(idx, 'sasl_mechanism', 'PLAIN');
+    const mech = cfg.sasl_mechanism || 'PLAIN';
+    const isKerberos = mech === 'GSSAPI';   /* Kerberos: keytab/principal вместо логина/пароля */
     const needsTls  = sec === 'SSL' || sec === 'SASL_SSL';
     const off = cfg.offset_reset || 'earliest';
     return `
@@ -2842,12 +2844,14 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.4rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Механизм SASL</label>
-          <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value)">
-            <option value="PLAIN"         ${(cfg.sasl_mechanism||'PLAIN')==='PLAIN' ?'selected':''}>PLAIN</option>
-            <option value="SCRAM-SHA-256" ${cfg.sasl_mechanism==='SCRAM-SHA-256'    ?'selected':''}>SCRAM-SHA-256</option>
-            <option value="SCRAM-SHA-512" ${cfg.sasl_mechanism==='SCRAM-SHA-512'    ?'selected':''}>SCRAM-SHA-512</option>
+          <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+            <option value="PLAIN"         ${mech==='PLAIN'         ?'selected':''}>PLAIN</option>
+            <option value="SCRAM-SHA-256" ${mech==='SCRAM-SHA-256' ?'selected':''}>SCRAM-SHA-256</option>
+            <option value="SCRAM-SHA-512" ${mech==='SCRAM-SHA-512' ?'selected':''}>SCRAM-SHA-512</option>
+            <option value="GSSAPI"        ${mech==='GSSAPI'        ?'selected':''}>GSSAPI (Kerberos)</option>
           </select>
         </div>
+        ${isKerberos ? '' : `
         <div class="form-group" style="margin:0">
           <label>Пользователь</label>
           <input type="text" value="${escAttr(cfg.sasl_username || '')}" placeholder="имя пользователя (Confluent Cloud — API-ключ)"
@@ -2857,8 +2861,10 @@ function makeConnectorConfigHTML(step, idx) {
           <label>Пароль</label>
           <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder=""
                  oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
-        </div>
-      </div>` : ''}
+        </div>`}
+      </div>
+      ${isKerberos ? `
+      <div style="margin-top:.35rem;font-size:.8rem;color:var(--text-dim)">Kerberos настраивается на сервере (krb5.conf + keytab/kinit) — логин и пароль не нужны, аутентификация проходит под капотом.</div>` : ''}` : ''}
       ${needsTls ? `
       <div class="step-row-2" style="margin-top:.4rem;align-items:start">
         <div class="form-group" style="margin:0;flex:2">
