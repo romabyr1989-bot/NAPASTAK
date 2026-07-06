@@ -59,6 +59,7 @@ typedef struct AvroSchemaCache {
 typedef struct {
     rd_kafka_t                        *rk;
     rd_kafka_topic_partition_list_t   *tplist;
+    bool  assigned;          /* read_batch: партиции уже назначены (assign) — не переназначаем при пагинации */
     char  brokers[512];
     char  group_id[128];
     char  topic_name[128];
@@ -993,6 +994,54 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
             *out = NULL;
             return -1;
         }
+    }
+
+    /* Разовое чтение топика: НЕ подписываемся на consumer-группу, а вручную
+     * назначаем все партиции топика (assign). Группа требует join+назначения
+     * (~3с даже на тёплом брокере, а на холодном старте/медленном кластере не
+     * укладывается в дедлайн → «топик не пришёл» на первом же «Показать
+     * данные»). Assign обходит координацию: первый poll сразу тянет данные.
+     * Назначаем один раз на инстанс; при пагинации позиция консюмера сама
+     * продвигается между вызовами read_batch. earliest → OFFSET_BEGINNING
+     * («читать всё каждый раз»), latest → OFFSET_END (только новые). */
+    if (!ctx->assigned) {
+        const char *topic = check_topic;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_new(ctx->rk, topic, NULL);
+        const struct rd_kafka_metadata *meta = NULL;
+        rd_kafka_resp_err_t merr = rkt
+            ? rd_kafka_metadata(ctx->rk, 0, rkt, &meta, 5000) : RD_KAFKA_RESP_ERR__FAIL;
+        if (merr != RD_KAFKA_RESP_ERR_NO_ERROR || !meta) {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "kafka: metadata for topic '%s' failed: %s", topic, rd_kafka_err2str(merr));
+            LOG_ERROR("%s", ctx->last_err);
+            if (rkt) rd_kafka_topic_destroy(rkt);
+            *out = NULL; return -1;
+        }
+        int64_t start_off = (strcasecmp(ctx->offset_reset, "latest") == 0)
+                          ? RD_KAFKA_OFFSET_END : RD_KAFKA_OFFSET_BEGINNING;
+        rd_kafka_topic_partition_list_t *parts = rd_kafka_topic_partition_list_new(4);
+        for (int i = 0; i < meta->topic_cnt; i++) {
+            if (strcmp(meta->topics[i].topic, topic) != 0) continue;
+            for (int p = 0; p < meta->topics[i].partition_cnt; p++) {
+                rd_kafka_topic_partition_t *tp =
+                    rd_kafka_topic_partition_list_add(parts, topic, meta->topics[i].partitions[p].id);
+                tp->offset = start_off;
+            }
+        }
+        rd_kafka_metadata_destroy(meta);
+        rd_kafka_topic_destroy(rkt);
+        rd_kafka_unsubscribe(ctx->rk);              /* снять групповую подписку из kafka_create */
+        rd_kafka_resp_err_t aerr = rd_kafka_assign(ctx->rk, parts);
+        rd_kafka_topic_partition_list_destroy(parts);
+        if (aerr != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "kafka: assign failed: %s", rd_kafka_err2str(aerr));
+            LOG_ERROR("%s", ctx->last_err);
+            *out = NULL; return -1;
+        }
+        ctx->assigned = true;
+        LOG_INFO("kafka: assigned partitions of topic=%s (offset=%s)",
+                 topic, start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest");
     }
 
     int64_t limit = (req->limit > 0 && req->limit < BATCH_SIZE) ? req->limit : BATCH_SIZE;
