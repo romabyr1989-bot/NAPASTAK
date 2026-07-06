@@ -1392,6 +1392,20 @@ function pbUpdateConnConfig(idx, field, val) {
   if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
 }
 
+/* Смена «Защиты соединения» в форме Kafka. При выборе SASL-протокола сразу
+ * фиксируем механизм PLAIN, если он ещё не задан: иначе бэкенд получит пустой
+ * sasl.mechanism, а librdkafka по умолчанию уходит в GSSAPI (Kerberos) и падает
+ * на отсутствующем keytab. Затем перерисовываем форму (появятся поля SASL/TLS). */
+function pbSetKafkaSecurity(idx, val) {
+  pbUpdateConnConfig(idx, 'security_protocol', val);
+  if (val.indexOf('SASL') === 0) {
+    const cfg = safeParse(pb.steps[idx].connector_config, {});
+    if (!cfg.sasl_mechanism) pbUpdateConnConfig(idx, 'sasl_mechanism', 'PLAIN');
+  }
+  const el = document.getElementById('step-conn-cfg-' + idx);
+  if (el) el.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
+}
+
 /* Toggle the DB connection for a step. First click tests + (on success) turns
  * the button green and remembers it (step._dbok, survives re-render). Clicking
  * the green button "disconnects" — resets the state. */
@@ -2769,6 +2783,11 @@ function makeConnectorConfigHTML(step, idx) {
     const fmt = cfg.data_format || 'json';
     const sec = cfg.security_protocol || '';
     const needsSasl = sec.indexOf('SASL') === 0;
+    /* SASL выбран, но механизм в конфиге пуст (дропдаун не меняли) → бэкенд
+     * получил бы пустой sasl.mechanism, а librdkafka по умолчанию берёт GSSAPI
+     * (Kerberos) и падает на keytab. Проставляем дефолт PLAIN сразу при
+     * рендере, чтобы отправляемый конфиг всегда был явным. */
+    if (needsSasl && !cfg.sasl_mechanism) pbUpdateConnConfig(idx, 'sasl_mechanism', 'PLAIN');
     const needsTls  = sec === 'SSL' || sec === 'SASL_SSL';
     const off = cfg.offset_reset || 'earliest';
     return `
@@ -2793,7 +2812,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Защита соединения</label>
-          <select onchange="pbUpdateConnConfig(${idx},'security_protocol',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <select onchange="pbSetKafkaSecurity(${idx},this.value)">
             <option value=""               ${sec===''              ?'selected':''}>Без авторизации</option>
             <option value="SASL_SSL"       ${sec==='SASL_SSL'       ?'selected':''}>SASL + TLS</option>
             <option value="SASL_PLAINTEXT" ${sec==='SASL_PLAINTEXT' ?'selected':''}>SASL без TLS</option>

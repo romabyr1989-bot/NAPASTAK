@@ -158,6 +158,13 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
         rd_kafka_conf_set(conf, "security.protocol", ctx->security_protocol, errstr, errlen);
     if (ctx->sasl_mechanism[0])
         rd_kafka_conf_set(conf, "sasl.mechanism", ctx->sasl_mechanism, errstr, errlen);
+    else if (strncmp(ctx->security_protocol, "SASL", 4) == 0)
+        /* SASL-протокол выбран, но механизм не задан. У librdkafka дефолт
+         * sasl.mechanism = GSSAPI (Kerberos) → без keytab она сразу падает с
+         * "Invalid sasl.kerberos.kinit.cmd value: Property not available:
+         * sasl.kerberos.keytab", и SASL-подключение по логину/паролю не
+         * работает вовсе. Разумный дефолт для username/password — PLAIN. */
+        rd_kafka_conf_set(conf, "sasl.mechanism", "PLAIN", errstr, errlen);
     if (ctx->sasl_username[0])
         rd_kafka_conf_set(conf, "sasl.username", ctx->sasl_username, errstr, errlen);
     if (ctx->sasl_password[0])
