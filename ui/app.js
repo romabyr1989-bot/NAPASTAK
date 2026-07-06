@@ -2831,7 +2831,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пользователь</label>
-          <input type="text" value="${escAttr(cfg.sasl_username || '')}" placeholder="api-key"
+          <input type="text" value="${escAttr(cfg.sasl_username || '')}" placeholder="имя пользователя (Confluent Cloud — API-ключ)"
                  oninput="pbUpdateConnConfig(${idx},'sasl_username',this.value)">
         </div>
         <div class="form-group" style="margin:0">
