@@ -44,13 +44,24 @@ static int64_t clock_monotonic_ms(void) {
 #include <stdarg.h>
 
 /* ── Response helpers ── */
+/* КОПИРУЕМ тело во владение ответа: обработчики строят JSON в своей арене и
+ * уничтожают её (arena_destroy) ДО того, как сервер запишет тело в сокет. При
+ * большой арене (напр. preview Kafka, 1МБ) destroy делает munmap — указатель
+ * body становится невалидным, и клиент получает пустое тело при корректном
+ * Content-Length («топик не пришёл»). Копия живёт до отправки; сервер освободит. */
 void http_resp_json(HttpResp *r, int status, const char *json) {
     r->status = status; r->content_type = "application/json";
-    r->body = json; r->body_len = json ? strlen(json) : 0;
+    free(r->body_alloc);
+    r->body_alloc = json ? strdup(json) : NULL;
+    r->body = r->body_alloc ? r->body_alloc : "";
+    r->body_len = r->body_alloc ? strlen(r->body_alloc) : 0;
 }
 void http_resp_text(HttpResp *r, int status, const char *text) {
     r->status = status; r->content_type = "text/plain";
-    r->body = text; r->body_len = text ? strlen(text) : 0;
+    free(r->body_alloc);
+    r->body_alloc = text ? strdup(text) : NULL;
+    r->body = r->body_alloc ? r->body_alloc : "";
+    r->body_len = r->body_alloc ? strlen(r->body_alloc) : 0;
 }
 void http_resp_error(HttpResp *r, int status, const char *msg) {
     static _Thread_local char buf[512];
@@ -664,6 +675,7 @@ static void handle_conn(HttpServer *srv, int fd) {
         send_response(fd, &resp);
     }
 
+    free(resp.body_alloc);   /* владелец копии тела (http_resp_json/_text) */
     free(buf);
     arena_destroy(a);
     close(fd);

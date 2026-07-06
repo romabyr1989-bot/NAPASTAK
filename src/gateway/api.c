@@ -7373,7 +7373,8 @@ static void h_webhook_trigger(HttpReq *req, HttpResp *resp) {
 static void h_metrics(HttpReq *req, HttpResp *resp) {
     (void)req;
     Arena *a=arena_create(2048);
-    http_resp_json(resp,200,metrics_to_json(g_app.metrics,a));
+    http_resp_json(resp,200,metrics_to_json(g_app.metrics,a));  /* копирует тело */
+    arena_destroy(a);
 }
 
 /* ── GET /metrics  (Prometheus text format) ── */
@@ -7494,10 +7495,9 @@ static void h_metrics_prometheus(HttpReq *req, HttpResp *resp) {
 
 #undef PM
 
-    resp->status = 200;
+    http_resp_text(resp, 200, buf);   /* копирует тело во владение ответа */
     resp->content_type = "text/plain; version=0.0.4; charset=utf-8";
-    resp->body = buf;
-    resp->body_len = used;
+    arena_destroy(a);
 }
 
 /* ── JVal serializer helper ── */

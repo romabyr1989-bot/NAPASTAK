@@ -40,6 +40,10 @@ typedef struct {
     const char *content_type;
     const char *body;
     size_t      body_len;
+    char       *body_alloc;  /* владелец копии тела (http_resp_json/_text): тело
+                              * переживает уничтожение арены обработчика. Сервер
+                              * освобождает после отправки. NULL, если тело —
+                              * статическая строка (присвоена body напрямую). */
     bool        is_ws;
     char        correlation_id[37]; /* эхо из req, возвращается в X-Correlation-Id */
 } HttpResp;
