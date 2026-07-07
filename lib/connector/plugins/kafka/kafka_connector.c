@@ -649,6 +649,7 @@ static ColBatch *batch_from_avro(KafkaCtx *ctx, Arena *a,
 static void *consumer_thread_fn(void *arg)
 {
     KafkaCtx *ctx = (KafkaCtx *)arg;
+    unsigned since_commit = 0;   /* сколько событий с последнего коммита */
 
     while (atomic_load(&ctx->consumer_running)) {
         rd_kafka_message_t *msg = rd_kafka_consumer_poll(ctx->rk, 100 /*ms*/);
@@ -679,7 +680,19 @@ static void *consumer_thread_fn(void *arg)
 
         arena_destroy(ev_arena);
         rd_kafka_message_destroy(msg);
+
+        /* Инкремент CDC: коммитим позицию в группу батчами (async, throttled),
+         * чтобы после рестарта поток продолжил с обработанного места
+         * (at-least-once). assign+commit — БЕЗ subscribe/join → без ребаланса. */
+        if (ctx->explicit_group && ++since_commit >= 100) {
+            rd_kafka_commit(ctx->rk, NULL, 1 /*async*/);
+            since_commit = 0;
+        }
     }
+
+    /* Финальный коммит при остановке — не потерять последние обработанные. */
+    if (ctx->explicit_group && since_commit > 0)
+        rd_kafka_commit(ctx->rk, NULL, 0 /*sync*/);
 
     return NULL;
 }
@@ -1252,17 +1265,14 @@ static int kafka_cdc_start(void *vctx, DfoCdcHandler handler, void *userdata)
     if (!ctx->rk) return -1;
     if (atomic_load(&ctx->consumer_running)) return 0; /* already running */
 
-    /* Непрерывный CDC — единственный режим, где consumer-группа уместна
-     * (распределённое отказоустойчивое потоковое чтение). Подписываемся здесь,
-     * а не при создании: разовое чтение/describe в группу не вступают. */
-    rd_kafka_resp_err_t serr = rd_kafka_subscribe(ctx->rk, ctx->tplist);
-    if (serr != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        snprintf(ctx->last_err, sizeof(ctx->last_err),
-                 "kafka: CDC subscribe failed: %s", rd_kafka_err2str(serr));
-        LOG_ERROR("%s", ctx->last_err);
-        return -1;
-    }
-    LOG_INFO("kafka: CDC subscribed to topic=%s (consumer group=%s)",
+    /* CDC тоже через assign, а НЕ subscribe: непрерывное чтение назначенных
+     * партиций без вступления в consumer-группу → без rebalance чужих
+     * консюмеров на боевом кластере. Инкремент (resume после рестарта)
+     * обеспечивают committed offset при assign + периодический commit в
+     * потоке (см. consumer_thread_fn) при явном group_id. */
+    if (kafka_assign_all(ctx, ctx->topic_name) != 0)
+        return -1;   /* last_err уже выставлен */
+    LOG_INFO("kafka: CDC assigned topic=%s (group=%s, без subscribe/ребаланса)",
              ctx->topic_name, ctx->group_id);
 
     ctx->cdc_handler  = handler;
