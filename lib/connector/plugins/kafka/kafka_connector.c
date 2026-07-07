@@ -29,6 +29,9 @@
 #define RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_ID RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART
 #endif
 #include <curl/curl.h>
+#include <openssl/pkcs12.h>   /* PKCS#12 / DER: определение формата клиентского сертификата */
+#include <openssl/pem.h>      /* PEM_write_X509 / PEM_write_PrivateKey (DER→PEM) */
+#include <unistd.h>           /* unlink, close (temp-файлы автоконверсии) */
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -77,17 +80,28 @@ typedef struct {
     char  sasl_kerberos_service_name[128]; /* имя сервис-принципала брокера, обычно "kafka" */
     char  sasl_kerberos_principal[256];    /* клиентский принципал, напр. user@REALM */
     char  sasl_kerberos_keytab[512];       /* путь к keytab на хосте gateway */
-    /* TLS (security_protocol SSL | SASL_SSL). Пути к файлам на хосте gateway. */
-    char  ssl_ca_location[512];          /* CA-сертификат для проверки брокера (PEM) */
-    char  ssl_certificate_location[512]; /* клиентский сертификат для mTLS (PEM) */
-    char  ssl_key_location[512];         /* клиентский приватный ключ для mTLS (PEM) */
-    char  ssl_key_password[256];         /* пароль ключа, если зашифрован */
+    /* TLS (security_protocol SSL | SASL_SSL). Пути к файлам на хосте gateway.
+     * Форматы читаются разные: CA — PEM или DER (авто-конверсия); клиентский
+     * cert/key — PEM (раздельно) ЛИБО PKCS#12/.p12/.pfx (cert+key в одном файле,
+     * авто-определение). JKS не поддерживается librdkafka — конвертируйте в
+     * PKCS#12 (keytool -importkeystore -deststoretype PKCS12). */
+    char  ssl_ca_location[512];          /* CA-сертификат брокера (PEM или DER) */
+    char  ssl_certificate_location[512]; /* клиентский cert: PEM или PKCS#12 (cert+key) */
+    char  ssl_key_location[512];         /* клиентский приватный ключ (PEM); для PKCS#12 не нужен */
+    char  ssl_key_password[256];         /* пароль ключа/keystore, если зашифрован */
+    char  ssl_keystore_location[512];    /* явный PKCS#12 keystore (альтернатива cert+key) */
+    /* Временные PEM-файлы автоконверсии DER→PEM (librdkafka читает только PEM/PKCS#12).
+     * Создаются лениво, переиспользуются, удаляются в kafka_destroy. */
+    char  ssl_tmp_ca[256];
+    char  ssl_tmp_cert[256];
+    char  ssl_tmp_key[256];
     char  offset_reset[16];       /* earliest | latest (default earliest) */
     char  last_err[512];          /* human-readable reason of the last failure */
 
     /* Avro / Schema Registry (data_format == "avro") */
-    char  schema_registry_url[512];  /* e.g. "http://registry:8081" */
+    char  schema_registry_url[512];  /* e.g. "https://registry:8081" */
     char  sr_auth[256];              /* optional "user:pass" basic auth */
+    char  sr_ca_location[512];       /* CA для TLS реестра (частный CA); PEM */
     AvroSchemaCache *schema_cache;   /* id → parsed Avro schema (lazy) */
 
     /* Set by rd_kafka error_cb when librdkafka reports that every configured
@@ -154,13 +168,154 @@ static void kafka_error_cb(rd_kafka_t *rk, int err, const char *reason, void *op
     }
 }
 
+/* ── Определение формата файла сертификата ─────────────────────────────────
+ * Банки выдают сертификаты в разных форматах: PEM (текст, "-----BEGIN"),
+ * DER (бинарный ASN.1), PKCS#12 (.p12/.pfx — cert+key одним файлом). librdkafka
+ * читает напрямую только PEM (раздельно) и PKCS#12 (keystore); DER мы
+ * конвертируем в PEM «на лету». JKS не поддерживается — конвертируйте keytool. */
+
+/* PEM ли файл: содержит текстовый маркер "-----BEGIN" в первых байтах. */
+static bool kafka_pem_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return true;   /* нечитаемый путь — отдадим librdkafka, пусть отчитается */
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    for (size_t i = 0; i + 10 <= n; i++)
+        if (memcmp(buf + i, "-----BEGIN", 10) == 0) return true;
+    return false;
+}
+
+/* PKCS#12 ли файл: пробуем распарсить ASN.1-структуру PKCS12 (надёжнее, чем
+ * судить по расширению .p12/.pfx). */
+static bool kafka_pkcs12_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    PKCS12 *p12 = d2i_PKCS12_fp(f, NULL);
+    fclose(f);
+    if (!p12) return false;
+    PKCS12_free(p12);
+    return true;
+}
+
+/* Конвертирует DER-сертификат (X509) в PEM во временный файл. Путь пишется в
+ * slot и переиспользуется при повторных вызовах (идемпотентно). Возвращает slot
+ * при успехе, иначе исходный путь (librdkafka отчитается об ошибке сама). */
+static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_t slot_sz)
+{
+    if (slot[0]) return slot;                    /* уже сконвертировано */
+    FILE *f = fopen(der_path, "rb");
+    if (!f) return der_path;
+    X509 *x = d2i_X509_fp(f, NULL);
+    fclose(f);
+    if (!x) return der_path;
+    char tmpl[] = "/tmp/dfo_kafka_cert_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { X509_free(x); return der_path; }
+    FILE *out = fdopen(fd, "wb");
+    int ok = out && PEM_write_X509(out, x);
+    if (out) fclose(out); else close(fd);
+    X509_free(x);
+    if (!ok) { unlink(tmpl); return der_path; }
+    snprintf(slot, slot_sz, "%s", tmpl);
+    return slot;
+}
+
+/* Конвертирует DER-приватный ключ (PKCS#8/traditional) в PEM во временный файл. */
+static const char *kafka_der_key_to_pem(const char *der_path, char *slot, size_t slot_sz)
+{
+    if (slot[0]) return slot;
+    FILE *f = fopen(der_path, "rb");
+    if (!f) return der_path;
+    unsigned char buf[16384];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    const unsigned char *p = buf;
+    EVP_PKEY *k = d2i_AutoPrivateKey(NULL, &p, (long)n);
+    if (!k) return der_path;
+    char tmpl[] = "/tmp/dfo_kafka_key_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { EVP_PKEY_free(k); return der_path; }
+    FILE *out = fdopen(fd, "wb");
+    int ok = out && PEM_write_PrivateKey(out, k, NULL, NULL, 0, NULL, NULL);
+    if (out) fclose(out); else close(fd);
+    EVP_PKEY_free(k);
+    if (!ok) { unlink(tmpl); return der_path; }
+    snprintf(slot, slot_sz, "%s", tmpl);
+    return slot;
+}
+
+/* Применяет TLS-настройки (CA + клиентский cert/key) с поддержкой разных
+ * форматов. slot-поля ctx мутабельны (кэш temp-файлов), поэтому берём non-const. */
+static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
+                            char *errstr, size_t errlen)
+{
+    /* Явно фиксируем безопасные проверки TLS, когда протокол — SSL/SASL_SSL.
+     * Иначе поведение зависит от дефолтов librdkafka конкретной версии (на 1.6.1
+     * они безопасны, но не гарантированы и не видны в аудите):
+     *   - проверка цепочки сертификата брокера (не отключаем никогда);
+     *   - проверка соответствия имени хоста (endpoint.identification=https) —
+     *     защита от MITM с валидным, но чужим сертификатом. */
+    if (strstr(ctx->security_protocol, "SSL")) {
+        rd_kafka_conf_set(conf, "enable.ssl.certificate.verification", "true", errstr, errlen);
+        rd_kafka_conf_set(conf, "ssl.endpoint.identification.algorithm", "https", errstr, errlen);
+    }
+
+    /* CA брокера: PEM — как есть; DER — конвертируем в PEM. */
+    if (ctx->ssl_ca_location[0]) {
+        const char *ca = ctx->ssl_ca_location;
+        if (!kafka_pem_file(ca))
+            ca = kafka_der_cert_to_pem(ca, ctx->ssl_tmp_ca, sizeof ctx->ssl_tmp_ca);
+        rd_kafka_conf_set(conf, "ssl.ca.location", ca, errstr, errlen);
+    }
+
+    /* Клиентский сертификат для mTLS. Приоритет:
+     *   1) явный PKCS#12 keystore (ssl_keystore_location);
+     *   2) ssl_certificate_location, если это PKCS#12 (cert+key одним файлом);
+     *   3) PEM/DER раздельно: cert + key. */
+    const char *keystore = NULL;
+    if (ctx->ssl_keystore_location[0])
+        keystore = ctx->ssl_keystore_location;
+    else if (ctx->ssl_certificate_location[0] && kafka_pkcs12_file(ctx->ssl_certificate_location))
+        keystore = ctx->ssl_certificate_location;
+
+    if (keystore) {
+        rd_kafka_conf_set(conf, "ssl.keystore.location", keystore, errstr, errlen);
+        if (ctx->ssl_key_password[0])
+            rd_kafka_conf_set(conf, "ssl.keystore.password", ctx->ssl_key_password, errstr, errlen);
+        LOG_INFO("kafka: клиентский сертификат в формате PKCS#12 (keystore)");
+    } else {
+        if (ctx->ssl_certificate_location[0]) {
+            const char *cert = ctx->ssl_certificate_location;
+            if (!kafka_pem_file(cert))
+                cert = kafka_der_cert_to_pem(cert, ctx->ssl_tmp_cert, sizeof ctx->ssl_tmp_cert);
+            rd_kafka_conf_set(conf, "ssl.certificate.location", cert, errstr, errlen);
+        }
+        if (ctx->ssl_key_location[0]) {
+            const char *key = ctx->ssl_key_location;
+            if (!kafka_pem_file(key))
+                key = kafka_der_key_to_pem(key, ctx->ssl_tmp_key, sizeof ctx->ssl_tmp_key);
+            rd_kafka_conf_set(conf, "ssl.key.location", key, errstr, errlen);
+        }
+        if (ctx->ssl_key_password[0])
+            rd_kafka_conf_set(conf, "ssl.key.password", ctx->ssl_key_password, errstr, errlen);
+    }
+}
+
 /* Apply SASL/SSL security settings to a conf (consumer or producer). Each key
  * is set only when non-empty, so plaintext clusters keep working unchanged.
  * Managed Kafka (Confluent Cloud / MSK / Aiven) typically needs:
  *   security.protocol=SASL_SSL, sasl.mechanism=PLAIN, sasl.username/password. */
-static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
+static void kafka_apply_security(rd_kafka_conf_t *conf, KafkaCtx *ctx,
                                  char *errstr, size_t errlen)
 {
+    /* TCP keepalive: librdkafka по умолчанию его НЕ включает, из-за чего
+     * полуоткрытые (в т.ч. TLS/SASL) сессии после обрыва сети/файрвола висят до
+     * системного таймаута. Включаем всегда — гигиена соединения. */
+    rd_kafka_conf_set(conf, "socket.keepalive.enable", "true", errstr, errlen);
+
     if (ctx->security_protocol[0])
         rd_kafka_conf_set(conf, "security.protocol", ctx->security_protocol, errstr, errlen);
     if (ctx->sasl_mechanism[0])
@@ -211,22 +366,14 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, const KafkaCtx *ctx,
         if (ctx->sasl_password[0])
             rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
     }
-    /* TLS: CA для проверки брокера + клиентский cert/key для mTLS. Задаются
-     * только при непустом значении, так что PLAINTEXT/SASL_PLAINTEXT не трогаются.
-     * Проверку сертификата брокера НЕ отключаем (безопасность по умолчанию). */
-    if (ctx->ssl_ca_location[0])
-        rd_kafka_conf_set(conf, "ssl.ca.location", ctx->ssl_ca_location, errstr, errlen);
-    if (ctx->ssl_certificate_location[0])
-        rd_kafka_conf_set(conf, "ssl.certificate.location", ctx->ssl_certificate_location, errstr, errlen);
-    if (ctx->ssl_key_location[0])
-        rd_kafka_conf_set(conf, "ssl.key.location", ctx->ssl_key_location, errstr, errlen);
-    if (ctx->ssl_key_password[0])
-        rd_kafka_conf_set(conf, "ssl.key.password", ctx->ssl_key_password, errstr, errlen);
+    /* TLS: CA брокера + клиентский cert/key для mTLS. Форматы читаются разные —
+     * см. kafka_apply_tls (PEM раздельно ИЛИ PKCS#12 одним файлом). */
+    kafka_apply_tls(conf, ctx, errstr, errlen);
 }
 
 /* Создаёт consumer rd_kafka: задаёт брокеры, group.id, auto.offset.reset и
  * применяет security-настройки. Возвращает NULL при ошибке конфигурации. */
-static rd_kafka_t *make_consumer(const KafkaCtx *ctx, char *errstr, size_t errlen)
+static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
 {
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
 
@@ -512,6 +659,13 @@ static char *sr_fetch_schema(KafkaCtx *ctx, int32_t schema_id)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sr_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    /* TLS реестра: явно требуем проверку цепочки и имени хоста (иначе basic-auth
+     * user:pass ушёл бы на подменный/непроверенный хост). Для частного CA —
+     * путь из конфига. Значения совпадают с дефолтами curl, но фиксируем явно. */
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    if (ctx->sr_ca_location[0])
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ctx->sr_ca_location);
     if (ctx->sr_auth[0]) {
         curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
         curl_easy_setopt(curl, CURLOPT_USERPWD, ctx->sr_auth);
@@ -723,6 +877,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
     snprintf(ctx->addr_family, sizeof(ctx->addr_family), "v4");
     ctx->schema_registry_url[0] = '\0';
     ctx->sr_auth[0]             = '\0';
+    ctx->sr_ca_location[0]      = '\0';
 
     if (config_json) {
         cfg_str(config_json, "\"brokers\"",     ctx->brokers,     sizeof(ctx->brokers));
@@ -732,6 +887,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"broker_address_family\"", ctx->addr_family, sizeof(ctx->addr_family));
         cfg_str(config_json, "\"schema_registry_url\"",  ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
         cfg_str(config_json, "\"schema_registry_auth\"", ctx->sr_auth,             sizeof(ctx->sr_auth));
+        cfg_str(config_json, "\"schema_registry_ca_location\"", ctx->sr_ca_location, sizeof(ctx->sr_ca_location));
         /* security (optional — empty keeps plaintext) */
         cfg_str(config_json, "\"security_protocol\"", ctx->security_protocol, sizeof(ctx->security_protocol));
         cfg_str(config_json, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
@@ -745,6 +901,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"ssl_certificate_location\"", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));
         cfg_str(config_json, "\"ssl_key_location\"",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
         cfg_str(config_json, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
+        cfg_str(config_json, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
         cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
     }
 
@@ -809,6 +966,11 @@ static void kafka_destroy(void *vctx)
     }
     if (ctx->tplist)
         rd_kafka_topic_partition_list_destroy(ctx->tplist);
+
+    /* Временные PEM-файлы автоконверсии DER→PEM. */
+    if (ctx->ssl_tmp_ca[0])   unlink(ctx->ssl_tmp_ca);
+    if (ctx->ssl_tmp_cert[0]) unlink(ctx->ssl_tmp_cert);
+    if (ctx->ssl_tmp_key[0])  unlink(ctx->ssl_tmp_key);
 
     if (ctx->schema_cache)
         pthread_mutex_destroy(&ctx->schema_cache->mu);

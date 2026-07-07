@@ -1406,6 +1406,56 @@ function pbSetKafkaSecurity(idx, val) {
   if (el) el.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
 }
 
+/* Preflight-проверка конфига Kafka до обращения к брокеру: ловим очевидные
+ * пропуски (адрес, парная mTLS, логин/пароль SASL) и отдаём понятную причину
+ * с указанием поля, а не сырую ошибку librdkafka после таймаута. Возвращает
+ * { block:[...], warn:[...] }: block — жёсткие ошибки (не пускаем), warn —
+ * предупреждения (пускаем, но подсвечиваем риск). */
+function kafkaCfgProblems(cfg) {
+  const block = [], warn = [];
+  const sec = cfg.security_protocol || '';
+  const mech = cfg.sasl_mechanism || 'PLAIN';
+  const needsTls  = sec === 'SSL' || sec === 'SASL_SSL';
+  const needsSasl = sec.indexOf('SASL') === 0;
+  if (!(cfg.brokers || '').trim()) block.push('Укажите адрес брокеров (host:port).');
+  if (needsSasl && mech !== 'GSSAPI') {
+    if (!(cfg.sasl_username || '').trim()) block.push('Механизм ' + mech + ' требует поле «Пользователь».');
+    if (!(cfg.sasl_password || '').trim()) block.push('Механизм ' + mech + ' требует поле «Пароль».');
+  }
+  if (needsTls) {
+    const hasCert = (cfg.ssl_certificate_location || '').trim() || (cfg.ssl_keystore_location || '').trim();
+    const hasKey  = (cfg.ssl_key_location || '').trim() || (cfg.ssl_keystore_location || '').trim();
+    const isP12   = /\.(p12|pfx)$/i.test(cfg.ssl_certificate_location || '') || (cfg.ssl_keystore_location || '').trim();
+    if ((cfg.ssl_certificate_location || '').trim() && !hasKey && !isP12)
+      block.push('Для mTLS в формате PEM/DER укажите «Клиентский ключ» (или используйте PKCS#12).');
+    if (hasCert && !hasKey && !isP12)
+      block.push('Клиентский сертификат задан без ключа — для mTLS нужны оба (или один PKCS#12).');
+    if (!(cfg.ssl_ca_location || '').trim())
+      warn.push('CA‑сертификат не задан — проверка брокера пойдёт по системному хранилищу (частный банковский CA обычно нужно указать явно).');
+  }
+  return { block, warn };
+}
+
+/* Перевод сырой ошибки librdkafka/коннектора в понятную причину с привязкой к
+ * полю формы. Возвращает подсказку; исходный текст добавляем в скобках. */
+function kafkaFriendlyError(err) {
+  const e = String(err || '');
+  const m = [
+    [/unknown topic|does not exist|UNKNOWN_TOPIC/i,                         'Топик не найден на брокере — проверьте имя топика.'],
+    [/certificate verify|verify failed|broker certificate|SSL handshake|ssl handshake|CERTIFICATE_VERIFY|unable to get local issuer|self.signed/i,
+                                                                            'Сертификат брокера не прошёл проверку — проверьте «CA‑сертификат» и соответствие имени хоста в сертификате.'],
+    [/PKCS12|keystore|private key|bad decrypt|key values mismatch|ssl.key/i,'Проблема с клиентским сертификатом/ключом — проверьте пути и «Пароль ключа / keystore».'],
+    [/authentication failed|SASL|sasl|Authentication|SaslAuthentication|invalid credentials/i,
+                                                                            'Аутентификация не прошла — проверьте механизм SASL, «Пользователь» и «Пароль».'],
+    [/Kerberos|GSSAPI|krb5|keytab|kinit/i,                                  'Ошибка Kerberos/GSSAPI — проверьте krb5.conf и keytab/ccache на сервере gateway.'],
+    [/resolve|nodename|Name or service|getaddrinfo/i,                       'Не удалось разрешить адрес брокера — проверьте host в поле «Брокеры».'],
+    [/refused|Disconnected|brokers are down|transport failure|timed out|Connection setup timeout|all broker connections/i,
+                                                                            'Брокер недоступен — проверьте адрес/порт «Брокеры», сетевой доступ и протокол.'],
+  ];
+  for (const [re, hint] of m) if (re.test(e)) return e ? `${hint} (${e})` : hint;
+  return e || 'неизвестная причина';
+}
+
 /* Toggle the DB connection for a step. First click tests + (on success) turns
  * the button green and remembers it (step._dbok, survives re-render). Clicking
  * the green button "disconnects" — resets the state. */
@@ -1426,6 +1476,14 @@ async function pbTestConnection(idx) {
   }
 
   const cfg = safeParse(step.connector_config, {});
+  /* Kafka: preflight — очевидные пропуски ловим до похода к брокеру. */
+  if (step.connector_type === 'kafka') {
+    const pr = kafkaCfgProblems(cfg);
+    if (pr.block.length) { showToast(pr.block.join(' '), 'error'); return; }
+    if (pr.warn.length)  showToast(pr.warn.join(' '), 'warn');
+  }
+  const friendly = (r, e) => step.connector_type === 'kafka'
+    ? kafkaFriendlyError((r && r.error) || e) : ((r && r.error) || e || 'неизвестная причина');
   set('', '', 'Проверка…'); btn.disabled = true;
   try {
     const r = await apiPost('/api/connector/probe/ping', { type: step.connector_type, config: cfg });
@@ -1435,12 +1493,12 @@ async function pbTestConnection(idx) {
     } else {
       step._dbok = false;
       set('', '', 'Подключиться');   /* the toast carries the reason */
-      showToast(`Не удалось подключиться: ${(r && r.error) || 'неизвестная причина'}`, 'error');
+      showToast(`Не удалось подключиться: ${friendly(r)}`, 'error');
     }
   } catch (e) {
     step._dbok = false;
     set('', '', 'Подключиться');
-    showToast(`Не удалось подключиться: ${e}`, 'error');
+    showToast(`Не удалось подключиться: ${friendly(null, e)}`, 'error');
   } finally { btn.disabled = false; }
 }
 
@@ -1456,6 +1514,12 @@ async function pbPreviewKafka(idx) {
     out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи топик</div>';
     return;
   }
+  /* preflight: понятные пропуски до чтения (адрес, mTLS-пара, логин/пароль SASL) */
+  const pr = kafkaCfgProblems(cfg);
+  if (pr.block.length) {
+    out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem">${escHtml(pr.block.join(' '))}</div>`;
+    return;
+  }
   /* fresh group each time → always reads from the beginning, no offset commits
      to the real consumer group */
   const previewCfg = { ...cfg, group_id: `dfo_preview_${idx}_${Date.now()}`, offset_reset: 'earliest' };
@@ -1465,7 +1529,7 @@ async function pbPreviewKafka(idx) {
       { type: 'kafka', config: previewCfg, query: cfg.topic, limit: 50 });
     if (!r) { out.innerHTML = '<div style="padding:.4rem;color:var(--red);font-size:.8rem">Пустой ответ</div>'; return; }
     if (r.error) {
-      out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem;white-space:pre-wrap">${escHtml(r.error)}</div>`;
+      out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem;white-space:pre-wrap">${escHtml(kafkaFriendlyError(r.error))}</div>`;
       return;
     }
     out.innerHTML = '';
@@ -2815,13 +2879,17 @@ function makeConnectorConfigHTML(step, idx) {
         <div class="form-group" style="margin:0">
           <label>Защита соединения</label>
           <select onchange="pbSetKafkaSecurity(${idx},this.value)">
-            <option value=""               ${sec===''              ?'selected':''}>Без авторизации</option>
+            <option value=""               ${sec===''              ?'selected':''}>Без шифрования и авторизации (PLAINTEXT)</option>
             <option value="SASL_SSL"       ${sec==='SASL_SSL'       ?'selected':''}>SASL + TLS</option>
             <option value="SASL_PLAINTEXT" ${sec==='SASL_PLAINTEXT' ?'selected':''}>SASL без TLS</option>
             <option value="SSL"            ${sec==='SSL'            ?'selected':''}>Только TLS</option>
           </select>
         </div>
       </div>
+      ${sec==='SASL_PLAINTEXT' ? `
+      <div style="margin-top:.35rem;font-size:.8rem;color:var(--red)">⚠ SASL без TLS: логин и пароль передаются по сети открытым текстом. Для прод-контура используйте «SASL + TLS».</div>` :
+        sec==='' ? `
+      <div style="margin-top:.35rem;font-size:.8rem;color:var(--amber)">⚠ Трафик не шифруется и не аутентифицируется. Допустимо только для доверенной внутренней сети.</div>` : ''}
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Формат сообщений</label>
@@ -2876,33 +2944,50 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.4rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Клиентский сертификат (mTLS, необяз.)</label>
-          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="/…/client.pem"
+          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="client.pem / client.p12"
                  oninput="pbUpdateConnConfig(${idx},'ssl_certificate_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Клиентский ключ (mTLS, необяз.)</label>
-          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="/…/client.key"
+          <label>Клиентский ключ (для PEM/DER)</label>
+          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="client.key — не нужен для PKCS#12"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Пароль ключа</label>
-          <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder=""
+          <label>Пароль ключа / keystore</label>
+          <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>
-      </div>` : ''}
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0;flex:2">
+          <label>PKCS#12 keystore (необяз., альтернатива cert+key)</label>
+          <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="client.p12 / client.pfx"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_keystore_location',this.value)">
+        </div>
+      </div>
+      <div style="margin-top:.35rem;font-size:.8rem;color:var(--text-dim)">Форматы сертификатов определяются автоматически: PEM (.pem/.crt + .key), DER (.der/.cer) и PKCS#12 (.p12/.pfx — сертификат и ключ одним файлом, ключ отдельно указывать не нужно). Для PKCS#12 можно указать файл в поле «Клиентский сертификат» или в «PKCS#12 keystore», пароль — в «Пароль ключа / keystore». JKS: конвертируйте в PKCS#12 (<code>keytool -importkeystore -deststoretype PKCS12</code>).</div>` : ''}
       ${fmt==='avro' ? `
       <div class="step-row-2" style="margin-top:.4rem">
         <div class="form-group" style="margin:0;flex:2">
           <label>Адрес Schema Registry</label>
-          <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="http://registry:8081"
+          <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="https://registry:8081"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_url',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Авторизация реестра</label>
-          <input type="text" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="user:pass"
+          <label>Авторизация реестра (user:pass)</label>
+          <input type="password" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="user:pass" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
         </div>
-      </div>` : ''}
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0;flex:2">
+          <label>CA реестра (для private CA, необяз.)</label>
+          <input type="text" value="${escAttr(cfg.schema_registry_ca_location || '')}" placeholder="/opt/dataflow-os/certs/registry-ca.pem"
+                 oninput="pbUpdateConnConfig(${idx},'schema_registry_ca_location',this.value)">
+        </div>
+      </div>
+      ${/^http:\/\//i.test(cfg.schema_registry_url||'') && (cfg.schema_registry_auth||'') ? `
+      <div style="margin-top:.35rem;font-size:.8rem;color:var(--red)">⚠ Реестр по http:// с логином/паролем — учётные данные уйдут открытым текстом. Используйте https://.</div>` : ''}` : ''}
       ${step.is_sink ? '' : `
       <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
