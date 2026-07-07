@@ -60,6 +60,7 @@ typedef struct {
     rd_kafka_t                        *rk;
     rd_kafka_topic_partition_list_t   *tplist;
     bool  assigned;          /* read_batch: партиции уже назначены (assign) — не переназначаем при пагинации */
+    bool  explicit_group;    /* задан явный group_id → инкремент (committed offset + commit), иначе read-all */
     char  brokers[512];
     char  group_id[128];
     char  topic_name[128];
@@ -740,7 +741,12 @@ static void *kafka_create(const char *config_json, Arena *arena)
      * читает весь топик заново, а enable.auto.commit=false ничего не оставляет.
      * Ранее группа была стабильной (dfo-<topic>) → повторный прогон читал 0. Явный
      * group_id в конфиге шага сохраняет инкрементальную семантику (только новые). */
-    if (strcmp(ctx->group_id, "dfo-consumer") == 0) {
+    /* Явный ли group_id? (не дефолт) → инкрементальная семантика: читаем с
+     * закоммиченного оффсета и коммитим после чтения (паттерн simple consumer:
+     * assign + committed/commit, БЕЗ subscribe → без ребаланса). Иначе —
+     * уникальная эфемерная группа и «читать всё каждый раз». */
+    ctx->explicit_group = (strcmp(ctx->group_id, "dfo-consumer") != 0);
+    if (!ctx->explicit_group) {
         static _Atomic unsigned kafka_group_seq = 0;
         unsigned n = atomic_fetch_add(&kafka_group_seq, 1);
         const char *t = ctx->topic_name[0] ? ctx->topic_name : "topic";
@@ -846,6 +852,20 @@ static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
     }
     rd_kafka_metadata_destroy(meta);
     rd_kafka_topic_destroy(rkt);
+
+    /* Явный group_id → инкремент: спрашиваем у координатора закоммиченные
+     * оффсеты этой группы (rd_kafka_committed — обычный OffsetFetch, НЕ join,
+     * НЕ ребаланс). Где есть валидный коммит — стартуем оттуда; где нет
+     * (первый прогон) — от offset_reset. Так group_id работает как курсор без
+     * участия в rebalance-протоколе. */
+    if (ctx->explicit_group) {
+        if (rd_kafka_committed(ctx->rk, parts, 5000) == RD_KAFKA_RESP_ERR_NO_ERROR) {
+            for (int i = 0; i < parts->cnt; i++)
+                if (parts->elems[i].offset < 0)         /* нет коммита → offset_reset */
+                    parts->elems[i].offset = start_off;
+        }
+    }
+
     rd_kafka_resp_err_t aerr = rd_kafka_assign(ctx->rk, parts);
     rd_kafka_topic_partition_list_destroy(parts);
     if (aerr != RD_KAFKA_RESP_ERR_NO_ERROR) {
@@ -855,8 +875,9 @@ static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
         return -1;
     }
     ctx->assigned = true;
-    LOG_INFO("kafka: assigned partitions of topic=%s (offset=%s, без consumer-группы)",
-             topic, start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest");
+    LOG_INFO("kafka: assigned partitions of topic=%s (%s, без consumer-группы/ребаланса)",
+             topic, ctx->explicit_group ? "инкремент по committed offset group_id"
+                                        : (start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest"));
     return 0;
 }
 
@@ -1202,6 +1223,16 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     }
 
     *out = batch;
+
+    /* Инкремент: коммитим позицию в группу (OffsetCommit, синхронно). С assign
+     * (не subscribe) это коммит «простого консюмера» — координатор сохраняет
+     * оффсет, но rebalance-протокол НЕ запускается, чужие консюмеры не
+     * трогаются. Следующий прогон с тем же group_id продолжит с этой точки. */
+    if (ctx->explicit_group && msg_count > 0) {
+        rd_kafka_resp_err_t cerr = rd_kafka_commit(ctx->rk, NULL, 0 /*sync*/);
+        if (cerr != RD_KAFKA_RESP_ERR_NO_ERROR && cerr != RD_KAFKA_RESP_ERR__NO_OFFSET)
+            LOG_WARN("kafka: commit offset failed: %s", rd_kafka_err2str(cerr));
+    }
 
     /* Курсор для пагинации — последний прочитанный offset ("offset:<N>"). Пишем
      * поверх const-поля req->cursor через каст: вызывающий владеет структурой и
