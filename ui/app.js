@@ -1423,13 +1423,15 @@ function kafkaCfgProblems(cfg) {
     if (!(cfg.sasl_password || '').trim()) block.push('Механизм ' + mech + ' требует поле «Пароль».');
   }
   if (needsTls) {
-    const hasCert = (cfg.ssl_certificate_location || '').trim() || (cfg.ssl_keystore_location || '').trim();
-    const hasKey  = (cfg.ssl_key_location || '').trim() || (cfg.ssl_keystore_location || '').trim();
-    const isP12   = /\.(p12|pfx)$/i.test(cfg.ssl_certificate_location || '') || (cfg.ssl_keystore_location || '').trim();
-    if ((cfg.ssl_certificate_location || '').trim() && !hasKey && !isP12)
-      block.push('Для mTLS в формате PEM/DER укажите «Клиентский ключ» (или используйте PKCS#12).');
-    if (hasCert && !hasKey && !isP12)
-      block.push('Клиентский сертификат задан без ключа — для mTLS нужны оба (или один PKCS#12).');
+    const cert     = (cfg.ssl_certificate_location || '').trim();
+    const keystore = (cfg.ssl_keystore_location || '').trim();
+    const hasKey   = (cfg.ssl_key_location || '').trim() || keystore;
+    const looksP12 = /\.(p12|pfx)$/i.test(cert) || keystore;
+    /* НЕ блокируем: коннектор определяет PKCS#12 по содержимому файла, а не по
+     * расширению — валидный .p12 без расширения не должен запрещать подключение.
+     * Только мягко предупреждаем. */
+    if (cert && !hasKey && !looksP12)
+      warn.push('Клиентский сертификат указан без ключа: если это не PKCS#12-контейнер (cert+key одним файлом), заполните «Клиентский ключ».');
     if (!(cfg.ssl_ca_location || '').trim())
       warn.push('CA‑сертификат не задан — проверка брокера пойдёт по системному хранилищу (частный банковский CA обычно нужно указать явно).');
   }
@@ -1445,9 +1447,12 @@ function kafkaFriendlyError(err) {
     [/certificate verify|verify failed|broker certificate|SSL handshake|ssl handshake|CERTIFICATE_VERIFY|unable to get local issuer|self.signed/i,
                                                                             'Сертификат брокера не прошёл проверку — проверьте «CA‑сертификат» и соответствие имени хоста в сертификате.'],
     [/PKCS12|keystore|private key|bad decrypt|key values mismatch|ssl.key/i,'Проблема с клиентским сертификатом/ключом — проверьте пути и «Пароль ключа / keystore».'],
+    /* Kerberos/GSSAPI — ВЫШЕ общего SASL: текст ошибок GSSAPI часто содержит
+     * «sasl» (напр. "sasl_cyrus: GSSAPI Error"), иначе маршрутизируется в
+     * подсказку про логин/пароль, которых для GSSAPI нет. */
+    [/Kerberos|GSSAPI|krb5|keytab|kinit|gss/i,                              'Ошибка Kerberos/GSSAPI — проверьте krb5.conf и keytab/ccache на сервере gateway.'],
     [/authentication failed|SASL|sasl|Authentication|SaslAuthentication|invalid credentials/i,
                                                                             'Аутентификация не прошла — проверьте механизм SASL, «Пользователь» и «Пароль».'],
-    [/Kerberos|GSSAPI|krb5|keytab|kinit/i,                                  'Ошибка Kerberos/GSSAPI — проверьте krb5.conf и keytab/ccache на сервере gateway.'],
     [/resolve|nodename|Name or service|getaddrinfo/i,                       'Не удалось разрешить адрес брокера — проверьте host в поле «Брокеры».'],
     [/refused|Disconnected|brokers are down|transport failure|timed out|Connection setup timeout|all broker connections/i,
                                                                             'Брокер недоступен — проверьте адрес/порт «Брокеры», сетевой доступ и протокол.'],
@@ -2886,10 +2891,6 @@ function makeConnectorConfigHTML(step, idx) {
           </select>
         </div>
       </div>
-      ${sec==='SASL_PLAINTEXT' ? `
-      <div style="margin-top:.35rem;font-size:.8rem;color:var(--red)">⚠ SASL без TLS: логин и пароль передаются по сети открытым текстом. Для прод-контура используйте «SASL + TLS».</div>` :
-        sec==='' ? `
-      <div style="margin-top:.35rem;font-size:.8rem;color:var(--amber)">⚠ Трафик не шифруется и не аутентифицируется. Допустимо только для доверенной внутренней сети.</div>` : ''}
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Формат сообщений</label>
@@ -2930,9 +2931,7 @@ function makeConnectorConfigHTML(step, idx) {
           <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder=""
                  oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
         </div>`}
-      </div>
-      ${isKerberos ? `
-      <div style="margin-top:.35rem;font-size:.8rem;color:var(--text-dim)">Kerberos настраивается на сервере (krb5.conf + keytab/kinit) — логин и пароль не нужны, аутентификация проходит под капотом.</div>` : ''}` : ''}
+      </div>` : ''}
       ${needsTls ? `
       <div class="step-row-2" style="margin-top:.4rem;align-items:start">
         <div class="form-group" style="margin:0;flex:2">
@@ -2964,8 +2963,7 @@ function makeConnectorConfigHTML(step, idx) {
           <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="client.p12 / client.pfx"
                  oninput="pbUpdateConnConfig(${idx},'ssl_keystore_location',this.value)">
         </div>
-      </div>
-      <div style="margin-top:.35rem;font-size:.8rem;color:var(--text-dim)">Форматы сертификатов определяются автоматически: PEM (.pem/.crt + .key), DER (.der/.cer) и PKCS#12 (.p12/.pfx — сертификат и ключ одним файлом, ключ отдельно указывать не нужно). Для PKCS#12 можно указать файл в поле «Клиентский сертификат» или в «PKCS#12 keystore», пароль — в «Пароль ключа / keystore». JKS: конвертируйте в PKCS#12 (<code>keytool -importkeystore -deststoretype PKCS12</code>).</div>` : ''}
+      </div>` : ''}
       ${fmt==='avro' ? `
       <div class="step-row-2" style="margin-top:.4rem">
         <div class="form-group" style="margin:0;flex:2">
@@ -2985,9 +2983,7 @@ function makeConnectorConfigHTML(step, idx) {
           <input type="text" value="${escAttr(cfg.schema_registry_ca_location || '')}" placeholder="/opt/dataflow-os/certs/registry-ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_ca_location',this.value)">
         </div>
-      </div>
-      ${/^http:\/\//i.test(cfg.schema_registry_url||'') && (cfg.schema_registry_auth||'') ? `
-      <div style="margin-top:.35rem;font-size:.8rem;color:var(--red)">⚠ Реестр по http:// с логином/паролем — учётные данные уйдут открытым текстом. Используйте https://.</div>` : ''}` : ''}
+      </div>` : ''}
       ${step.is_sink ? '' : `
       <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"

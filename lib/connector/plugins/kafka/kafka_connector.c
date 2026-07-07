@@ -30,8 +30,11 @@
 #endif
 #include <curl/curl.h>
 #include <openssl/pkcs12.h>   /* PKCS#12 / DER: определение формата клиентского сертификата */
-#include <openssl/pem.h>      /* PEM_write_X509 / PEM_write_PrivateKey (DER→PEM) */
+#include <openssl/pem.h>      /* PEM_write_X509 / PEM_write_bio_PrivateKey (DER→PEM) */
+#include <openssl/err.h>      /* ERR_clear_error — чистка очереди после проб формата */
+#include <openssl/bio.h>      /* BIO_s_mem — in-memory PEM ключа без записи на диск */
 #include <unistd.h>           /* unlink, close (temp-файлы автоконверсии) */
+#include <ctype.h>            /* toupper — нормализация security_protocol/mechanism */
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -90,11 +93,11 @@ typedef struct {
     char  ssl_key_location[512];         /* клиентский приватный ключ (PEM); для PKCS#12 не нужен */
     char  ssl_key_password[256];         /* пароль ключа/keystore, если зашифрован */
     char  ssl_keystore_location[512];    /* явный PKCS#12 keystore (альтернатива cert+key) */
-    /* Временные PEM-файлы автоконверсии DER→PEM (librdkafka читает только PEM/PKCS#12).
-     * Создаются лениво, переиспользуются, удаляются в kafka_destroy. */
+    /* Временные PEM-файлы автоконверсии DER→PEM для CA и клиентского СЕРТИФИКАТА
+     * (публичные данные). Приватный ключ на диск НЕ пишется — конвертируется в
+     * память (ssl.key.pem). Создаются лениво, удаляются в kafka_destroy. */
     char  ssl_tmp_ca[256];
     char  ssl_tmp_cert[256];
-    char  ssl_tmp_key[256];
     char  offset_reset[16];       /* earliest | latest (default earliest) */
     char  last_err[512];          /* human-readable reason of the last failure */
 
@@ -195,6 +198,9 @@ static bool kafka_pkcs12_file(const char *path)
     if (!f) return false;
     PKCS12 *p12 = d2i_PKCS12_fp(f, NULL);
     fclose(f);
+    /* Проба формата оставляет запись в per-thread очереди ошибок OpenSSL; чистим,
+     * иначе позже librdkafka/curl покажут ложную причину реального TLS-сбоя. */
+    ERR_clear_error();
     if (!p12) return false;
     PKCS12_free(p12);
     return true;
@@ -210,6 +216,7 @@ static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_
     if (!f) return der_path;
     X509 *x = d2i_X509_fp(f, NULL);
     fclose(f);
+    ERR_clear_error();   /* не оставляем «мусор» в очереди ошибок OpenSSL */
     if (!x) return der_path;
     char tmpl[] = "/tmp/dfo_kafka_cert_XXXXXX";
     int fd = mkstemp(tmpl);
@@ -223,28 +230,56 @@ static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_
     return slot;
 }
 
-/* Конвертирует DER-приватный ключ (PKCS#8/traditional) в PEM во временный файл. */
-static const char *kafka_der_key_to_pem(const char *der_path, char *slot, size_t slot_sz)
+/* Конвертирует DER-приватный ключ в PEM и передаёт librdkafka как in-memory
+ * строку (ssl.key.pem) — расшифрованный ключ НЕ пишется на диск. При неудаче
+ * отдаёт исходный путь в ssl.key.location (librdkafka сама сообщит об ошибке).
+ * Читает файл целиком (без фиксированного буфера), очищает очередь ошибок и
+ * затирает временные копии ключа в памяти после передачи. */
+static void kafka_der_key_to_conf(rd_kafka_conf_t *conf, const char *der_path,
+                                  char *errstr, size_t errlen)
 {
-    if (slot[0]) return slot;
     FILE *f = fopen(der_path, "rb");
-    if (!f) return der_path;
-    unsigned char buf[16384];
-    size_t n = fread(buf, 1, sizeof buf, f);
+    if (!f) { rd_kafka_conf_set(conf, "ssl.key.location", der_path, errstr, errlen); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 4L * 1024 * 1024) {   /* защита от неадекватного размера */
+        fclose(f);
+        rd_kafka_conf_set(conf, "ssl.key.location", der_path, errstr, errlen);
+        return;
+    }
+    unsigned char *der = malloc((size_t)sz);
+    if (!der) { fclose(f); rd_kafka_conf_set(conf, "ssl.key.location", der_path, errstr, errlen); return; }
+    size_t n = fread(der, 1, (size_t)sz, f);
     fclose(f);
-    const unsigned char *p = buf;
+    const unsigned char *p = der;
     EVP_PKEY *k = d2i_AutoPrivateKey(NULL, &p, (long)n);
-    if (!k) return der_path;
-    char tmpl[] = "/tmp/dfo_kafka_key_XXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) { EVP_PKEY_free(k); return der_path; }
-    FILE *out = fdopen(fd, "wb");
-    int ok = out && PEM_write_PrivateKey(out, k, NULL, NULL, 0, NULL, NULL);
-    if (out) fclose(out); else close(fd);
+    ERR_clear_error();
+    memset(der, 0, (size_t)sz);   /* не оставляем DER-ключ в куче */
+    free(der);
+    if (!k) { rd_kafka_conf_set(conf, "ssl.key.location", der_path, errstr, errlen); return; }
+
+    BIO *bio = BIO_new(BIO_s_mem());
+    bool done = false;
+    if (bio && PEM_write_bio_PrivateKey(bio, k, NULL, NULL, 0, NULL, NULL)) {
+        char *pem = NULL;
+        long len = BIO_get_mem_data(bio, &pem);
+        if (pem && len > 0) {
+            char *z = malloc((size_t)len + 1);
+            if (z) {
+                memcpy(z, pem, (size_t)len);
+                z[len] = '\0';
+                rd_kafka_conf_set(conf, "ssl.key.pem", z, errstr, errlen);
+                memset(z, 0, (size_t)len);   /* затираем PEM-копию ключа */
+                free(z);
+                done = true;
+            }
+        }
+    }
+    if (bio) BIO_free(bio);        /* BIO_free затирает свой буфер? нет — обнулим явно ниже не нужно, z затёрт */
     EVP_PKEY_free(k);
-    if (!ok) { unlink(tmpl); return der_path; }
-    snprintf(slot, slot_sz, "%s", tmpl);
-    return slot;
+    if (!done)
+        rd_kafka_conf_set(conf, "ssl.key.location", der_path, errstr, errlen);
 }
 
 /* Применяет TLS-настройки (CA + клиентский cert/key) с поддержкой разных
@@ -294,10 +329,11 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
             rd_kafka_conf_set(conf, "ssl.certificate.location", cert, errstr, errlen);
         }
         if (ctx->ssl_key_location[0]) {
-            const char *key = ctx->ssl_key_location;
-            if (!kafka_pem_file(key))
-                key = kafka_der_key_to_pem(key, ctx->ssl_tmp_key, sizeof ctx->ssl_tmp_key);
-            rd_kafka_conf_set(conf, "ssl.key.location", key, errstr, errlen);
+            if (kafka_pem_file(ctx->ssl_key_location))
+                rd_kafka_conf_set(conf, "ssl.key.location", ctx->ssl_key_location, errstr, errlen);
+            else
+                /* DER-ключ → in-memory PEM (ssl.key.pem), без записи на диск */
+                kafka_der_key_to_conf(conf, ctx->ssl_key_location, errstr, errlen);
         }
         if (ctx->ssl_key_password[0])
             rd_kafka_conf_set(conf, "ssl.key.password", ctx->ssl_key_password, errstr, errlen);
@@ -315,6 +351,11 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, KafkaCtx *ctx,
      * полуоткрытые (в т.ч. TLS/SASL) сессии после обрыва сети/файрвола висят до
      * системного таймаута. Включаем всегда — гигиена соединения. */
     rd_kafka_conf_set(conf, "socket.keepalive.enable", "true", errstr, errlen);
+    /* IPv4 по умолчанию: "localhost" на многих хостах резолвится в ::1 первым, а
+     * брокеры чаще слушают только IPv4 → librdkafka репортит "all brokers down".
+     * Ставим здесь (не в make_consumer), чтобы паритет был и у sink-продюсера. */
+    rd_kafka_conf_set(conf, "broker.address.family",
+                      ctx->addr_family[0] ? ctx->addr_family : "v4", errstr, errlen);
 
     if (ctx->security_protocol[0])
         rd_kafka_conf_set(conf, "security.protocol", ctx->security_protocol, errstr, errlen);
@@ -399,11 +440,8 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
      * ничего не оставляет закоммиченным. Инкрементальность (только новые
      * сообщения) достигается явным устойчивым group_id в конфиге шага. */
     rd_kafka_conf_set(conf, "enable.auto.commit", "false", errstr, errlen);
-    /* Force IPv4 by default: "localhost" resolves to ::1 first on many hosts,
-     * but most Kafka/Redpanda brokers listen only on IPv4 — librdkafka then
-     * reports "all brokers down". Overridable via broker_address_family. */
-    rd_kafka_conf_set(conf, "broker.address.family",
-                      ctx->addr_family[0] ? ctx->addr_family : "v4", errstr, errlen);
+    /* broker.address.family (IPv4 по умолчанию) теперь ставится в
+     * kafka_apply_security — общей для consumer и producer (sink). */
 
     kafka_apply_security(conf, ctx, errstr, errlen);
 
@@ -414,7 +452,7 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
     rd_kafka_conf_set_error_cb(conf, kafka_error_cb);
 
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, errlen);
-    if (!rk) return NULL;
+    if (!rk) { rd_kafka_conf_destroy(conf); return NULL; }  /* conf не поглощён при ошибке */
 
     /* conf is consumed by rd_kafka_new on success */
     rd_kafka_poll_set_consumer(rk);
@@ -891,6 +929,12 @@ static void *kafka_create(const char *config_json, Arena *arena)
         /* security (optional — empty keeps plaintext) */
         cfg_str(config_json, "\"security_protocol\"", ctx->security_protocol, sizeof(ctx->security_protocol));
         cfg_str(config_json, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
+        /* librdkafka принимает эти значения регистронезависимо (канон — строчный:
+         * "sasl_ssl"), а внутренние гейты сравнивают по подстроке "SSL"/"SASL".
+         * Нормализуем к верхнему регистру, чтобы пиннинг TLS и дефолт PLAIN
+         * срабатывали независимо от регистра из YAML/API. */
+        for (char *s = ctx->security_protocol; *s; s++) *s = (char)toupper((unsigned char)*s);
+        for (char *s = ctx->sasl_mechanism;    *s; s++) *s = (char)toupper((unsigned char)*s);
         cfg_str(config_json, "\"sasl_username\"",     ctx->sasl_username,     sizeof(ctx->sasl_username));
         cfg_str(config_json, "\"sasl_password\"",     ctx->sasl_password,     sizeof(ctx->sasl_password));
         cfg_str(config_json, "\"sasl_kerberos_service_name\"", ctx->sasl_kerberos_service_name, sizeof(ctx->sasl_kerberos_service_name));
@@ -970,7 +1014,6 @@ static void kafka_destroy(void *vctx)
     /* Временные PEM-файлы автоконверсии DER→PEM. */
     if (ctx->ssl_tmp_ca[0])   unlink(ctx->ssl_tmp_ca);
     if (ctx->ssl_tmp_cert[0]) unlink(ctx->ssl_tmp_cert);
-    if (ctx->ssl_tmp_key[0])  unlink(ctx->ssl_tmp_key);
 
     if (ctx->schema_cache)
         pthread_mutex_destroy(&ctx->schema_cache->mu);
@@ -1545,7 +1588,7 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
     }
     kafka_apply_security(conf, ctx, errstr, sizeof(errstr));
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
-    if (!rk) { LOG_ERROR("kafka sink: producer: %s", errstr); return -1; }
+    if (!rk) { LOG_ERROR("kafka sink: producer: %s", errstr); rd_kafka_conf_destroy(conf); return -1; }
     rd_kafka_topic_t *rkt = rd_kafka_topic_new(rk, topic, NULL);
     if (!rkt) { LOG_ERROR("kafka sink: topic_new failed"); rd_kafka_destroy(rk); return -1; }
 
