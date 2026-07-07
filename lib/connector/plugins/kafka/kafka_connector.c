@@ -760,17 +760,14 @@ static void *kafka_create(const char *config_json, Arena *arena)
         return ctx;
     }
 
-    /* Subscribe to topic */
+    /* НЕ подписываемся на consumer-группу при создании: разовое чтение
+     * (read_batch/describe) идёт через assign партиций и в группу не вступает,
+     * поэтому подключение НЕ вызывает ребаланс чужих консюмеров на боевом
+     * кластере. Групповую подписку делает только kafka_cdc_start (непрерывный
+     * поток). tplist готовим здесь для этого случая. */
     ctx->tplist = rd_kafka_topic_partition_list_new(1);
     rd_kafka_topic_partition_list_add(ctx->tplist, ctx->topic_name,
                                       RD_KAFKA_PARTITION_UA);
-
-    rd_kafka_resp_err_t err = rd_kafka_subscribe(ctx->rk, ctx->tplist);
-    if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        LOG_ERROR("kafka: subscribe failed: %s", rd_kafka_err2str(err));
-    } else {
-        LOG_INFO("kafka: subscribed to topic=%s brokers=%s", ctx->topic_name, ctx->brokers);
-    }
 
     return ctx;
 }
@@ -815,13 +812,64 @@ static int kafka_list_entities(void *vctx, Arena *a, DfoEntityList *out)
     return 0;
 }
 
+/* Разовое чтение: назначаем все партиции топика ВРУЧНУЮ (assign), НЕ вступая в
+ * consumer-группу. Критично для боевого кластера: subscribe в общую группу
+ * триггерит ребаланс ЧУЖИХ консюмеров банка при каждом подключении. Assign —
+ * без координатора, без rebalance: коннектор читает партиции напрямую и не
+ * влияет на другие приложения (какой бы group_id ни задали). Идемпотентно
+ * (ctx->assigned). earliest→BEGINNING, latest→END. */
+static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
+{
+    if (ctx->assigned) return 0;
+    if (!topic || !topic[0]) topic = ctx->topic_name;
+    rd_kafka_topic_t *rkt = rd_kafka_topic_new(ctx->rk, topic, NULL);
+    const struct rd_kafka_metadata *meta = NULL;
+    rd_kafka_resp_err_t merr = rkt
+        ? rd_kafka_metadata(ctx->rk, 0, rkt, &meta, 5000) : RD_KAFKA_RESP_ERR__FAIL;
+    if (merr != RD_KAFKA_RESP_ERR_NO_ERROR || !meta) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "kafka: metadata for topic '%s' failed: %s", topic, rd_kafka_err2str(merr));
+        LOG_ERROR("%s", ctx->last_err);
+        if (rkt) rd_kafka_topic_destroy(rkt);
+        return -1;
+    }
+    int64_t start_off = (strcasecmp(ctx->offset_reset, "latest") == 0)
+                      ? RD_KAFKA_OFFSET_END : RD_KAFKA_OFFSET_BEGINNING;
+    rd_kafka_topic_partition_list_t *parts = rd_kafka_topic_partition_list_new(4);
+    for (int i = 0; i < meta->topic_cnt; i++) {
+        if (strcmp(meta->topics[i].topic, topic) != 0) continue;
+        for (int p = 0; p < meta->topics[i].partition_cnt; p++) {
+            rd_kafka_topic_partition_t *tp =
+                rd_kafka_topic_partition_list_add(parts, topic, meta->topics[i].partitions[p].id);
+            tp->offset = start_off;
+        }
+    }
+    rd_kafka_metadata_destroy(meta);
+    rd_kafka_topic_destroy(rkt);
+    rd_kafka_resp_err_t aerr = rd_kafka_assign(ctx->rk, parts);
+    rd_kafka_topic_partition_list_destroy(parts);
+    if (aerr != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "kafka: assign failed: %s", rd_kafka_err2str(aerr));
+        LOG_ERROR("%s", ctx->last_err);
+        return -1;
+    }
+    ctx->assigned = true;
+    LOG_INFO("kafka: assigned partitions of topic=%s (offset=%s, без consumer-группы)",
+             topic, start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest");
+    return 0;
+}
+
 /* Выводит схему топика: сэмплирует до 10 сообщений и строит Schema по формату
  * (CSV-заголовок / Avro-схема / ключи JSON); при неудаче — fallback из 2 колонок. */
 static int kafka_describe(void *vctx, Arena *a, const char *entity, Schema **out)
 {
     KafkaCtx *ctx = (KafkaCtx *)vctx;
     if (!ctx->rk) return -1;
-    (void)entity;
+
+    /* Схему тоже сэмплируем через assign, не вступая в группу (см. выше). */
+    if (kafka_assign_all(ctx, (entity && entity[0]) ? entity : ctx->topic_name) != 0)
+        return -1;
 
     /* Sample up to 10 messages for schema inference */
     Schema *schema = NULL;
@@ -1004,45 +1052,7 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
      * Назначаем один раз на инстанс; при пагинации позиция консюмера сама
      * продвигается между вызовами read_batch. earliest → OFFSET_BEGINNING
      * («читать всё каждый раз»), latest → OFFSET_END (только новые). */
-    if (!ctx->assigned) {
-        const char *topic = check_topic;
-        rd_kafka_topic_t *rkt = rd_kafka_topic_new(ctx->rk, topic, NULL);
-        const struct rd_kafka_metadata *meta = NULL;
-        rd_kafka_resp_err_t merr = rkt
-            ? rd_kafka_metadata(ctx->rk, 0, rkt, &meta, 5000) : RD_KAFKA_RESP_ERR__FAIL;
-        if (merr != RD_KAFKA_RESP_ERR_NO_ERROR || !meta) {
-            snprintf(ctx->last_err, sizeof(ctx->last_err),
-                     "kafka: metadata for topic '%s' failed: %s", topic, rd_kafka_err2str(merr));
-            LOG_ERROR("%s", ctx->last_err);
-            if (rkt) rd_kafka_topic_destroy(rkt);
-            *out = NULL; return -1;
-        }
-        int64_t start_off = (strcasecmp(ctx->offset_reset, "latest") == 0)
-                          ? RD_KAFKA_OFFSET_END : RD_KAFKA_OFFSET_BEGINNING;
-        rd_kafka_topic_partition_list_t *parts = rd_kafka_topic_partition_list_new(4);
-        for (int i = 0; i < meta->topic_cnt; i++) {
-            if (strcmp(meta->topics[i].topic, topic) != 0) continue;
-            for (int p = 0; p < meta->topics[i].partition_cnt; p++) {
-                rd_kafka_topic_partition_t *tp =
-                    rd_kafka_topic_partition_list_add(parts, topic, meta->topics[i].partitions[p].id);
-                tp->offset = start_off;
-            }
-        }
-        rd_kafka_metadata_destroy(meta);
-        rd_kafka_topic_destroy(rkt);
-        rd_kafka_unsubscribe(ctx->rk);              /* снять групповую подписку из kafka_create */
-        rd_kafka_resp_err_t aerr = rd_kafka_assign(ctx->rk, parts);
-        rd_kafka_topic_partition_list_destroy(parts);
-        if (aerr != RD_KAFKA_RESP_ERR_NO_ERROR) {
-            snprintf(ctx->last_err, sizeof(ctx->last_err),
-                     "kafka: assign failed: %s", rd_kafka_err2str(aerr));
-            LOG_ERROR("%s", ctx->last_err);
-            *out = NULL; return -1;
-        }
-        ctx->assigned = true;
-        LOG_INFO("kafka: assigned partitions of topic=%s (offset=%s)",
-                 topic, start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest");
-    }
+    if (kafka_assign_all(ctx, check_topic) != 0) { *out = NULL; return -1; }
 
     int64_t limit = (req->limit > 0 && req->limit < BATCH_SIZE) ? req->limit : BATCH_SIZE;
     int64_t last_offset = -1;
@@ -1210,6 +1220,19 @@ static int kafka_cdc_start(void *vctx, DfoCdcHandler handler, void *userdata)
     KafkaCtx *ctx = (KafkaCtx *)vctx;
     if (!ctx->rk) return -1;
     if (atomic_load(&ctx->consumer_running)) return 0; /* already running */
+
+    /* Непрерывный CDC — единственный режим, где consumer-группа уместна
+     * (распределённое отказоустойчивое потоковое чтение). Подписываемся здесь,
+     * а не при создании: разовое чтение/describe в группу не вступают. */
+    rd_kafka_resp_err_t serr = rd_kafka_subscribe(ctx->rk, ctx->tplist);
+    if (serr != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "kafka: CDC subscribe failed: %s", rd_kafka_err2str(serr));
+        LOG_ERROR("%s", ctx->last_err);
+        return -1;
+    }
+    LOG_INFO("kafka: CDC subscribed to topic=%s (consumer group=%s)",
+             ctx->topic_name, ctx->group_id);
 
     ctx->cdc_handler  = handler;
     ctx->cdc_userdata = userdata;
