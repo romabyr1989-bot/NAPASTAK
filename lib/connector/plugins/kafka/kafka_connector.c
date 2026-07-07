@@ -866,17 +866,26 @@ static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
     rd_kafka_metadata_destroy(meta);
     rd_kafka_topic_destroy(rkt);
 
-    /* Явный group_id → инкремент: спрашиваем у координатора закоммиченные
-     * оффсеты этой группы (rd_kafka_committed — обычный OffsetFetch, НЕ join,
-     * НЕ ребаланс). Где есть валидный коммит — стартуем оттуда; где нет
-     * (первый прогон) — от offset_reset. Так group_id работает как курсор без
-     * участия в rebalance-протоколе. */
+    /* Явный group_id → инкремент: РАЗРЕШАЕМ оффсеты в конкретные числа ДО
+     * assign через rd_kafka_committed (OffsetFetch, БЕЗ join/ребаланса; заодно
+     * прогревает координатор). Валидный коммит → стартуем оттуда; нет коммита
+     * или ошибка → start_off (offset_reset). Так assign получает готовые
+     * позиции и чтение НЕ гонится с ленивым OffsetFetch координатора (под
+     * GSSAPI это давало 0 строк на первом прогоне). Таймаут щедрый — GSSAPI-
+     * хендшейк к координатору небыстрый. */
     if (ctx->explicit_group) {
-        if (rd_kafka_committed(ctx->rk, parts, 5000) == RD_KAFKA_RESP_ERR_NO_ERROR) {
-            for (int i = 0; i < parts->cnt; i++)
-                if (parts->elems[i].offset < 0)         /* нет коммита → offset_reset */
-                    parts->elems[i].offset = start_off;
+        /* С assign (без subscribe) координатор группы обнаруживается лениво,
+         * поэтому первый OffsetFetch может вернуть NOT_COORDINATOR — повторяем,
+         * дав librdkafka обновить координатора между попытками. */
+        rd_kafka_resp_err_t ce = RD_KAFKA_RESP_ERR__TIMED_OUT;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            ce = rd_kafka_committed(ctx->rk, parts, 7000);
+            if (ce == RD_KAFKA_RESP_ERR_NO_ERROR) break;
+            rd_kafka_poll(ctx->rk, 400);
         }
+        for (int i = 0; i < parts->cnt; i++)
+            if (ce != RD_KAFKA_RESP_ERR_NO_ERROR || parts->elems[i].offset < 0)
+                parts->elems[i].offset = start_off;
     }
 
     rd_kafka_resp_err_t aerr = rd_kafka_assign(ctx->rk, parts);
@@ -1242,7 +1251,14 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
      * оффсет, но rebalance-протокол НЕ запускается, чужие консюмеры не
      * трогаются. Следующий прогон с тем же group_id продолжит с этой точки. */
     if (ctx->explicit_group && msg_count > 0) {
-        rd_kafka_resp_err_t cerr = rd_kafka_commit(ctx->rk, NULL, 0 /*sync*/);
+        /* NOT_COORDINATOR транзиентен при ленивом обнаружении координатора
+         * (assign без subscribe) — повторяем с обновлением между попытками. */
+        rd_kafka_resp_err_t cerr = RD_KAFKA_RESP_ERR__TIMED_OUT;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            cerr = rd_kafka_commit(ctx->rk, NULL, 0 /*sync*/);
+            if (cerr == RD_KAFKA_RESP_ERR_NO_ERROR || cerr == RD_KAFKA_RESP_ERR__NO_OFFSET) break;
+            rd_kafka_poll(ctx->rk, 400);
+        }
         if (cerr != RD_KAFKA_RESP_ERR_NO_ERROR && cerr != RD_KAFKA_RESP_ERR__NO_OFFSET)
             LOG_WARN("kafka: commit offset failed: %s", rd_kafka_err2str(cerr));
     }
