@@ -2861,6 +2861,8 @@ function makeConnectorConfigHTML(step, idx) {
     const isKerberos = mech === 'GSSAPI';   /* Kerberos: keytab/principal вместо логина/пароля */
     const needsTls  = sec === 'SSL' || sec === 'SASL_SSL';
     const off = cfg.offset_reset || 'earliest';
+    const iso = cfg.isolation_level || 'read_uncommitted';
+    const osm = cfg.offset_start_mode || 'logical';
     return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к Kafka</div>
@@ -2906,6 +2908,20 @@ function makeConnectorConfigHTML(step, idx) {
           <select onchange="pbUpdateConnConfig(${idx},'offset_reset',this.value)">
             <option value="earliest" ${off==='earliest'?'selected':''}>С начала топика</option>
             <option value="latest"   ${off==='latest'  ?'selected':''}>Только новые сообщения</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Режим чтения (isolation)</label>
+          <select onchange="pbUpdateConnConfig(${idx},'isolation_level',this.value)">
+            <option value="read_uncommitted" ${iso==='read_uncommitted'?'selected':''}>read_uncommitted (совместимо со всеми брокерами)</option>
+            <option value="read_committed"   ${iso==='read_committed'  ?'selected':''}>read_committed (только транзакционные источники, Kafka 0.11+)</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Стартовая позиция (совместимость)</label>
+          <select onchange="pbUpdateConnConfig(${idx},'offset_start_mode',this.value)">
+            <option value="logical"  ${osm==='logical' ?'selected':''}>logical (обычные брокеры — резолв через ListOffsets)</option>
+            <option value="absolute" ${osm==='absolute'?'selected':''}>absolute (брокер/прокси без ListOffsets — чтение с offset 0)</option>
           </select>
         </div>`}
       </div>

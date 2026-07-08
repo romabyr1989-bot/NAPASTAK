@@ -100,6 +100,18 @@ typedef struct {
     char  ssl_tmp_cert[256];
     char  offset_reset[16];       /* earliest | latest (default earliest) */
     char  isolation_level[24];    /* read_uncommitted (default) | read_committed */
+    /* offset_start_mode: как задавать стартовую позицию при assign без коммита.
+     * "logical" (дефолт) — RD_KAFKA_OFFSET_BEGINNING/END, librdkafka резолвит их
+     * запросом ListOffsets. "absolute" — числовой offset 0 для earliest: Fetch
+     * стартует напрямую, БЕЗ ListOffsets. Нужно для брокеров/прокси, которые не
+     * объявляют API ListOffsets (симптом: «Failed to query logical offset
+     * BEGINNING: Required feature not supported by broker» при живых Metadata и
+     * SASL). latest числового обхода не имеет (нужен high watermark). */
+    char  offset_start_mode[16];  /* logical (default) | absolute */
+    /* Диагностика по требованию: значение прокидывается в librdkafka debug=
+     * (напр. "broker,feature,protocol,metadata"), чтобы в логе увидеть набор API,
+     * объявляемый брокером ("Broker API support:"). Пусто — debug выключен. */
+    char  librdkafka_debug[64];
     char  last_err[512];          /* human-readable reason of the last failure */
 
     /* Avro / Schema Registry (data_format == "avro") */
@@ -358,6 +370,13 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, KafkaCtx *ctx,
     rd_kafka_conf_set(conf, "broker.address.family",
                       ctx->addr_family[0] ? ctx->addr_family : "v4", errstr, errlen);
 
+    /* Диагностический passthrough в librdkafka debug= (по запросу оператора).
+     * Проверяем return: неизвестная категория debug иначе тихо потерялась бы. */
+    if (ctx->librdkafka_debug[0] &&
+        rd_kafka_conf_set(conf, "debug", ctx->librdkafka_debug, errstr, errlen)
+            != RD_KAFKA_CONF_OK)
+        LOG_WARN("kafka: debug='%s' не принят librdkafka: %s", ctx->librdkafka_debug, errstr);
+
     if (ctx->security_protocol[0])
         rd_kafka_conf_set(conf, "security.protocol", ctx->security_protocol, errstr, errlen);
     if (ctx->sasl_mechanism[0])
@@ -464,6 +483,13 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
 
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, errlen);
     if (!rk) { rd_kafka_conf_destroy(conf); return NULL; }  /* conf не поглощён при ошибке */
+
+    /* Версия транспорта в лог: слинкованная librdkafka зависит от хоста (напр.
+     * homebrew 2.14.x vs системная 1.6.1 на RedOS/EL) и определяет поведение
+     * негоциации версий API — фиксируем её явно для диагностики стенда. */
+    LOG_INFO("kafka: librdkafka %s (0x%08x), offset_start_mode=%s",
+             rd_kafka_version_str(), rd_kafka_version(),
+             ctx->offset_start_mode[0] ? ctx->offset_start_mode : "logical");
 
     /* conf is consumed by rd_kafka_new on success */
     rd_kafka_poll_set_consumer(rk);
@@ -959,6 +985,8 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
         cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
         cfg_str(config_json, "\"isolation_level\"",   ctx->isolation_level,   sizeof(ctx->isolation_level));
+        cfg_str(config_json, "\"offset_start_mode\"", ctx->offset_start_mode, sizeof(ctx->offset_start_mode));
+        cfg_str(config_json, "\"librdkafka_debug\"",  ctx->librdkafka_debug,  sizeof(ctx->librdkafka_debug));
     }
 
     /* «Читать всё каждый раз»: если явный group_id не задан (осталось значение по
@@ -1069,8 +1097,23 @@ static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
         if (rkt) rd_kafka_topic_destroy(rkt);
         return -1;
     }
-    int64_t start_off = (strcasecmp(ctx->offset_reset, "latest") == 0)
-                      ? RD_KAFKA_OFFSET_END : RD_KAFKA_OFFSET_BEGINNING;
+    /* offset_start_mode=absolute: earliest резолвим числовым offset 0 вместо
+     * логического BEGINNING — Fetch стартует напрямую, БЕЗ запроса ListOffsets
+     * (обход брокеров/прокси, не объявляющих этот API). Оговорка: если retention
+     * срезал ранние сегменты (0 < log-start), брокер вернёт OFFSET_OUT_OF_RANGE;
+     * при auto.offset.reset=earliest это уводит обратно в BEGINNING→ListOffsets.
+     * latest числового обхода не имеет (нужен high watermark) — absolute на него
+     * не распространяется, остаётся логический END. */
+    bool absolute = (strcasecmp(ctx->offset_start_mode, "absolute") == 0);
+    int64_t start_off;
+    if (strcasecmp(ctx->offset_reset, "latest") == 0) {
+        if (absolute)
+            LOG_WARN("kafka: offset_start_mode=absolute неприменим к latest "
+                     "(нужен ListOffsets для high watermark) — использую логический END");
+        start_off = RD_KAFKA_OFFSET_END;
+    } else {
+        start_off = absolute ? 0 : RD_KAFKA_OFFSET_BEGINNING;
+    }
     rd_kafka_topic_partition_list_t *parts = rd_kafka_topic_partition_list_new(4);
     for (int i = 0; i < meta->topic_cnt; i++) {
         if (strcmp(meta->topics[i].topic, topic) != 0) continue;
