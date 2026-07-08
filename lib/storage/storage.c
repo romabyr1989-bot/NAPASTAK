@@ -770,6 +770,17 @@ int catalog_load_pipeline(Catalog *c, const char *id, char **out, Arena *a) {
     sqlite3_finalize(st); return 0;
 }
 
+int64_t catalog_pipeline_updated_at(Catalog *c, const char *id) {
+    CAT_GUARD(c);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(c->db,"SELECT updated_at FROM pipelines WHERE id=?",-1,&st,NULL)
+            != SQLITE_OK) return -1;
+    sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
+    int64_t ts = (sqlite3_step(st)==SQLITE_ROW) ? sqlite3_column_int64(st,0) : -1;
+    sqlite3_finalize(st);
+    return ts;
+}
+
 int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;

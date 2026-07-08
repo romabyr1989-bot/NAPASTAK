@@ -117,6 +117,9 @@ int catalog_drop_table(Catalog *c, const char *name);
 /* Pipeline metadata */
 int catalog_save_pipeline(Catalog *c, const char *id, const char *json);
 int catalog_load_pipeline(Catalog *c, const char *id, char **json_out, Arena *a);
+/* updated_at (unix seconds) записи пайплайна в каталоге, либо -1 если записи нет.
+ * Нужно, чтобы GitOps-загрузка YAML не затирала более свежую правку из UI. */
+int64_t catalog_pipeline_updated_at(Catalog *c, const char *id);
 int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a);
 int catalog_delete_pipeline(Catalog *c, const char *id);
 

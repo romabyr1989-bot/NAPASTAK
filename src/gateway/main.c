@@ -519,6 +519,22 @@ void app_init(App *app, const char *config_json) {
                 /* Generate a stable id from the file name if not present */
                 if (!p.id[0])
                     snprintf(p.id, sizeof(p.id), "yaml_%s", de->d_name);
+                /* Last-writer-wins против правок из UI: если версия в каталоге
+                 * (сохранённая через UI) НОВЕЕ самого YAML-файла — не затираем её
+                 * файлом. GitOps сохраняется: обновлённый (git pull / редеплой →
+                 * более свежий mtime) файл снова победит каталог. Без записи в
+                 * каталоге (чистый GitOps) override идёт как раньше. */
+                int64_t cat_ts = catalog_pipeline_updated_at(app->catalog, p.id);
+                struct stat pst;
+                int64_t file_mtime = (stat(path, &pst) == 0) ? (int64_t)pst.st_mtime : 0;
+                if (cat_ts > 0 && cat_ts > file_mtime) {
+                    LOG_INFO("pipelines_dir: %s — оставляю версию из UI "
+                             "(каталог новее файла: %lld > %lld)",
+                             de->d_name, (long long)cat_ts, (long long)file_mtime);
+                    arena_destroy(ya);
+                    free(src);
+                    continue;   /* версия из каталога уже в шедулере — не трогаем */
+                }
                 /* Replace any existing pipeline with the same id */
                 scheduler_remove(app->scheduler, p.id);
                 scheduler_add(app->scheduler, &p);
