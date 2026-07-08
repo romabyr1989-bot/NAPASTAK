@@ -99,6 +99,7 @@ typedef struct {
     char  ssl_tmp_ca[256];
     char  ssl_tmp_cert[256];
     char  offset_reset[16];       /* earliest | latest (default earliest) */
+    char  isolation_level[24];    /* read_uncommitted (default) | read_committed */
     char  last_err[512];          /* human-readable reason of the last failure */
 
     /* Avro / Schema Registry (data_format == "avro") */
@@ -440,6 +441,16 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
      * ничего не оставляет закоммиченным. Инкрементальность (только новые
      * сообщения) достигается явным устойчивым group_id в конфиге шага. */
     rd_kafka_conf_set(conf, "enable.auto.commit", "false", errstr, errlen);
+    /* isolation.level: librdkafka по умолчанию read_committed, а он требует
+     * запроса смещений через ListOffsets v2+ (LSO/транзакции, Kafka 0.11+). На
+     * старых/ограниченных брокерах это падает с «Failed to query logical offset
+     * BEGINNING: Required feature not supported by broker» — консюмер не может
+     * встать на позицию и читает 0 сообщений. Дефолт read_uncommitted (как у
+     * kafka-console-consumer) использует старый ListOffsets и работает на любом
+     * брокере; read_committed доступен явно для источников с транзакциями. */
+    rd_kafka_conf_set(conf, "isolation.level",
+                      ctx->isolation_level[0] ? ctx->isolation_level : "read_uncommitted",
+                      errstr, errlen);
     /* broker.address.family (IPv4 по умолчанию) теперь ставится в
      * kafka_apply_security — общей для consumer и producer (sink). */
 
@@ -947,6 +958,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
         cfg_str(config_json, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
         cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
+        cfg_str(config_json, "\"isolation_level\"",   ctx->isolation_level,   sizeof(ctx->isolation_level));
     }
 
     /* «Читать всё каждый раз»: если явный group_id не задан (осталось значение по
