@@ -1,38 +1,14 @@
-# YAML pipelines + GitOps
+# YAML pipelines
 
-NAPASTAK pipelines can be authored as YAML files and auto-loaded from a
-directory on the gateway host. Combined with `git`, this enables a GitOps
-workflow: pipelines live in version control; the gateway picks up changes
-on restart.
-
-## Setup
-
-1. Pick a directory for pipelines, e.g. `/etc/dataflow/pipelines/`.
-2. Set it in the gateway config:
-
-   ```json
-   {
-     "port": 8080,
-     "data_dir": "./data",
-     "pipelines_dir": "/etc/dataflow/pipelines"
-   }
-   ```
-
-3. Drop `*.yaml` or `*.yml` files into the directory.
-4. Restart the gateway. Pipelines load at startup; their progress is logged:
-
-   ```
-   [INFO] pipelines_dir: loaded 3 YAML pipeline(s) (0 failed) from /etc/dataflow/pipelines
-   ```
-
-YAML pipelines coexist with REST-API pipelines stored in `catalog.db`.
-If a YAML file shares an `id` with an existing pipeline, the YAML
-version replaces it — files are the source of truth in GitOps mode.
+NAPASTAK pipelines can be authored as YAML instead of hand-written JSON.
+YAML is purely an authoring format — pipelines are created via the API/UI
+and persisted only in `catalog.db`; there is no directory the gateway
+watches or auto-loads from.
 
 ## File format
 
 ```yaml
-# pipelines/users_etl.yaml
+# users_etl.yaml
 name: users_etl
 description: Sync users from Postgres to analytics tables
 enabled: true
@@ -93,7 +69,7 @@ syntax — just set them on the step:
   source slice.
 
 ```yaml
-# pipelines/mdm_customer.yaml
+# mdm_customer.yaml
 name: mdm_customer
 enabled: true
 
@@ -164,70 +140,45 @@ pipelines but **not** a full YAML 1.2 implementation:
 If you need features outside the subset, author the pipeline as JSON and
 POST it to `/api/pipelines` — both formats target the same schema.
 
-## Validation API
+## Validate a YAML doc
 
-Before committing a YAML change, validate it against the running gateway:
+Before creating a pipeline, validate it against the running gateway:
 
 ```sh
 curl -X POST http://localhost:8080/api/pipelines/preview-yaml \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: text/yaml" \
-  --data-binary @pipelines/users_etl.yaml
+  --data-binary @users_etl.yaml
 ```
 
 - 200 → returns the parsed JSON pipeline (NOT saved)
 - 400 → `{"error":"yaml parse error","detail":"…","line":N,"col":M}`
 
-## GitOps workflow
+## Create a pipeline from YAML
 
-A typical setup:
+`/api/pipelines/from-template` parses the YAML, expands any `{{ var }}`
+placeholders against `vars`, and saves the result straight to the catalog —
+the pipeline is live (registered with the scheduler) immediately, no restart
+needed:
 
-```
-                    ┌───────────────┐
-                    │ git repo      │
-                    │ pipelines/    │
-                    └──────┬────────┘
-              git push     │
-       ┌─────────────────► │
-       │                   │ git pull (cron / hook)
-       ▼                   ▼
-┌──────────────┐    ┌───────────────────────────┐
-│ developer    │    │ gateway host              │
-│ - edits yaml │    │ /etc/dataflow/pipelines/  │
-│ - runs       │    │ + reload (gateway restart)│
-│   preview    │    └───────────────────────────┘
-└──────────────┘
+```sh
+curl -X POST http://localhost:8080/api/pipelines/from-template \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"template_yaml\": $(python3 -c 'import json,sys;print(json.dumps(open(sys.argv[1]).read()))' users_etl.yaml), \"vars\": {}}"
 ```
 
-Recommended cron entry on the gateway host:
-
-```cron
-# Pull pipeline changes from git every 5 minutes; reload on update
-*/5 * * * * cd /etc/dataflow/pipelines && \
-  test "$(git pull --quiet origin main 2>&1 | head -c1)" \
-       != "" && systemctl restart dataflow-gateway
-```
-
-A future iteration may add an in-process git-pull thread + hot-reload
-via inotify; for now the operator handles refresh.
-
-## Limitations
-
-- **Hot-reload not yet wired.** Edit a YAML file → restart the gateway to
-  pick up changes. (`tests/integration/test_yaml_pipelines.sh` runs the
-  full workflow end-to-end with a restart.)
-- **Single document per file.** `---` separators are skipped, not used to
-  define multiple pipelines per file.
-- **No `default_args`-style merging.** Repeat shared step config across
-  steps; YAML anchors (`&` / `*`) are not supported.
-- **Max file size 1 MiB.** Files larger than this are rejected at load.
-- **No `git pull` thread.** Wrap with cron / systemd timer (see above).
+From then on the pipeline is edited like any other — through the UI or
+`PUT /api/pipelines/:id` — and lives only in `catalog.db`. There is no
+YAML file backing it to fall out of sync with.
 
 ## Test coverage
 
 - `tests/unit/test_yaml.c` — 14 cases: scalars, mappings, sequences,
   block scalars (literal + folded), flow arrays, comments, blank-line
   preservation, error path
-- `tests/integration/test_yaml_pipelines.sh` — 10 e2e cases including
-  preview round-trip, auto-load, webhook fire from auto-loaded pipeline,
-  startup log content
+- `tests/integration/test_yaml_pipelines.sh` — preview-yaml round-trip and
+  parse-error reporting
+- `tests/integration/test_cdi_pipeline.sh`, `test_agr2party.sh`,
+  `test_mdc_pipeline.sh` — exercise real pipeline YAML end-to-end via
+  `from-template`

@@ -4706,8 +4706,8 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
  *               validate YAML before applying.
  * Response 400: {"error": "...", "line": N, "col": M} on parse error.
  *
- * Step 5 entry point for YAML pipeline authoring. Validation re-uses
- * pipeline_from_json so callers see the same fields they'd get from /api/pipelines. */
+ * Validation re-uses pipeline_from_json so callers see the same fields
+ * they'd get from /api/pipelines. */
 static void h_pipeline_preview_yaml(HttpReq *req, HttpResp *resp) {
     if (!req->body || !req->body_len) { http_resp_error(resp, 400, "empty body"); return; }
     Arena *a = req->arena;
@@ -8391,7 +8391,7 @@ void api_register_routes(Router *r) {
     router_add(r,"POST", "/api/ingest/parquet",        h_ingest_parquet);
     router_add(r,"GET",  "/api/pipelines",           h_pipelines_list);
     router_add(r,"POST", "/api/pipelines",           h_pipeline_create);
-    router_add(r,"POST", "/api/pipelines/preview-yaml", h_pipeline_preview_yaml); /* Step 5 */
+    router_add(r,"POST", "/api/pipelines/preview-yaml", h_pipeline_preview_yaml);
     router_add(r,"POST", "/api/pipelines/preview-step", h_pipeline_preview_step);
     router_add(r,"POST", "/api/pipelines/from-template", h_pipeline_from_template);
     router_add(r,"GET",  "/api/pipelines/:id",       h_pipeline_get);

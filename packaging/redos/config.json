@@ -1,7 +1,6 @@
 {
   "port": 8080,
   "data_dir": "/var/lib/dataflow-os/data",
-  "pipelines_dir": "/var/lib/dataflow-os/pipelines",
   "plugins_dir": "/opt/dataflow-os/lib",
   "connector_dir": "/opt/dataflow-os/lib",
   "auth_enabled": true,

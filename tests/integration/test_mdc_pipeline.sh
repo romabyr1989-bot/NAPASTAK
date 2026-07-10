@@ -28,10 +28,9 @@ s=b(hmac.new('$SECRET'.encode(),f'{h}.{p}'.encode(),hashlib.sha256).digest())
 print(f'{h}.{p}.{s}')")
 
 # Point python_file at the repo's tools/ (the YAML uses the prod /opt path).
-mkdir -p "$DATA/pipes"
-sed "s|/opt/tsmdm/scripts|$ROOT/tools|g" "$ROOT/pipelines/mdc_pipeline.yaml" > "$DATA/pipes/mdc_pipeline.yaml"
+sed "s|/opt/tsmdm/scripts|$ROOT/tools|g" "$ROOT/pipelines/mdc_pipeline.yaml" > "$DATA/mdc_pipeline.yaml"
 cat > "$DATA/cfg.json" <<EOF
-{"port":$PORT,"data_dir":"$DATA","auth_enabled":true,"jwt_secret":"$SECRET","admin_password":"admin","pipelines_dir":"$DATA/pipes"}
+{"port":$PORT,"data_dir":"$DATA","auth_enabled":true,"jwt_secret":"$SECRET","admin_password":"admin"}
 EOF
 "$GW_BIN" -c "$DATA/cfg.json" > "$DATA/gw.log" 2>&1 &
 GW_PID=$!
@@ -57,6 +56,10 @@ curl -sf -X POST "$GW/api/ingest/csv?table=cdi_physical_party" "${AUTH[@]}" -H '
 curl -sf -X POST "$GW/api/ingest/csv?table=cdi_id_doc" "${AUTH[@]}" -H 'Content-Type: text/csv' \
   --data-binary $'source_id,person_source_id,category,src_number\nD1,S1,21,4500 123456\nD2,S2,21,4500 123456' >/dev/null
 
+# Pipelines now live only in the catalog — register it via from-template
+# instead of pipelines_dir auto-load.
+curl -sf -X POST "$GW/api/pipelines/from-template" "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"template_yaml\":$(python3 -c 'import json,sys;print(json.dumps(open(sys.argv[1]).read()))' "$DATA/mdc_pipeline.yaml")}" >/dev/null
 PID=$(curl -sf "$GW/api/pipelines" "${AUTH[@]}" | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin) if p['name']=='mdc_pipeline']" | head -1)
 curl -sf -X POST "$GW/api/pipelines/$PID/run?wait=true" "${AUTH[@]}" >/dev/null
 

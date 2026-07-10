@@ -17,10 +17,8 @@ check() { if eval "$2"; then echo "PASS: $1"; PASS=$((PASS+1)); else echo "FAIL:
 [[ -x "$GW_BIN" ]] || { echo "missing $GW_BIN"; exit 1; }
 python3 -c 'import json' 2>/dev/null || { echo "SKIP: python3 missing"; exit 0; }
 
-mkdir -p "$DATA/pipes"
-cp "$ROOT/pipelines/master_assembly.yaml" "$ROOT/pipelines/hfl_collector.yaml" "$ROOT/pipelines/hfl_joker.yaml" "$DATA/pipes/"
 cat > "$DATA/cfg.json" <<EOF
-{"port":$PORT,"data_dir":"$DATA","auth_enabled":true,"jwt_secret":"$SECRET","admin_password":"admin","pipelines_dir":"$DATA/pipes"}
+{"port":$PORT,"data_dir":"$DATA","auth_enabled":true,"jwt_secret":"$SECRET","admin_password":"admin"}
 EOF
 "$GW_BIN" -c "$DATA/cfg.json" > "$DATA/gw.log" 2>&1 &
 GW_PID=$!
@@ -44,7 +42,13 @@ for f in master_assembly hfl_collector hfl_joker; do
        -H 'Content-Type: text/yaml' --data-binary @"$ROOT/pipelines/$f.yaml")
   check "$f.yaml validates via preview-yaml (HTTP 200)" "[[ '$C' == '200' ]]"
 done
-check "master_assembly loaded from pipelines_dir" \
+# Pipelines now live only in the catalog — create master_assembly via
+# from-template instead of relying on pipelines_dir auto-load.
+C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/api/pipelines/from-template" "${AUTH[@]}" \
+     -H 'Content-Type: application/json' \
+     -d "{\"template_yaml\":$(python3 -c 'import json,sys;print(json.dumps(open(sys.argv[1]).read()))' "$ROOT/pipelines/master_assembly.yaml")}")
+check "master_assembly created via from-template (HTTP 201)" "[[ '$C' == '201' ]]"
+check "master_assembly present in pipeline list" \
   "curl -sf '$GW/api/pipelines' \"\${AUTH[@]}\" | grep -q master_assembly"
 
 # ── 2. Seed CDI entities (non-empty fields — DFO collapses empty CSV cells) ──

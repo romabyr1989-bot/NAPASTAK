@@ -29,10 +29,9 @@ s=b(hmac.new('$SECRET'.encode(),f'{h}.{p}'.encode(),hashlib.sha256).digest())
 print(f'{h}.{p}.{s}')")
 
 # Point python_file at the repo's tools/ (the YAML uses the prod /opt path).
-mkdir -p "$DATA/pipes"
-sed "s|/opt/tsmdm/scripts|$ROOT/tools|g" "$ROOT/pipelines/agr2party.yaml" > "$DATA/pipes/agr2party.yaml"
+sed "s|/opt/tsmdm/scripts|$ROOT/tools|g" "$ROOT/pipelines/agr2party.yaml" > "$DATA/agr2party.yaml"
 cat > "$DATA/cfg.json" <<EOF
-{"port":$PORT,"data_dir":"$DATA","auth_enabled":true,"jwt_secret":"$SECRET","admin_password":"admin","pipelines_dir":"$DATA/pipes"}
+{"port":$PORT,"data_dir":"$DATA","auth_enabled":true,"jwt_secret":"$SECRET","admin_password":"admin"}
 EOF
 # export so python_file subprocesses (connector/resync) inherit them.
 # MASTER_API_URL → a dead port so the external CDI lookup fails fast (UNDEFINED).
@@ -66,7 +65,10 @@ curl -sf -X POST "$GW/api/ingest/csv?table=cdi_physical_party" "${AUTH[@]}" -H '
 curl -sf -X POST "$GW/api/ingest/csv?table=crm_key_updates" "${AUTH[@]}" -H 'Content-Type: text/csv' \
   --data-binary $'old_id,new_id,last_upd\nOLD-X,NEW-X,2024-01-16' >/dev/null
 
-# ── 3. Run agr2party ──
+# ── 3. Create + run agr2party (pipelines now live only in the catalog —
+#       register it via from-template instead of pipelines_dir auto-load) ──
+curl -sf -X POST "$GW/api/pipelines/from-template" "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"template_yaml\":$(python3 -c 'import json,sys;print(json.dumps(open(sys.argv[1]).read()))' "$DATA/agr2party.yaml")}" >/dev/null
 PID=$(curl -sf "$GW/api/pipelines" "${AUTH[@]}" | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin) if p['name']=='agr2party']" | head -1)
 curl -sf -X POST "$GW/api/pipelines/$PID/run?wait=true" "${AUTH[@]}" >/dev/null
 
