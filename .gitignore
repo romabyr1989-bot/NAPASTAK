@@ -17,3 +17,6 @@ __pycache__/
 
 # RedOS/Linux deploy bundles (make dist)
 /dist/
+
+# Локальные оверрайды конфига с дев-секретами — не трекаем (эталон: config.template.json)
+config.local.json
