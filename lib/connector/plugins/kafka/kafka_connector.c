@@ -67,6 +67,7 @@ typedef struct {
     rd_kafka_topic_partition_list_t   *tplist;
     bool  assigned;          /* read_batch: партиции уже назначены (assign) — не переназначаем при пагинации */
     bool  explicit_group;    /* задан явный group_id → инкремент (committed offset + commit), иначе read-all */
+    bool  offset_fallback_tried; /* см. kafka_reassign_to_end: один авто-фоллбэк на latest при OFFSET_OUT_OF_RANGE */
     char  brokers[512];
     char  group_id[128];
     char  topic_name[128];
@@ -106,8 +107,12 @@ typedef struct {
      * стартует напрямую, БЕЗ ListOffsets. Нужно для брокеров/прокси, которые не
      * объявляют API ListOffsets (симптом: «Failed to query logical offset
      * BEGINNING: Required feature not supported by broker» при живых Metadata и
-     * SASL). latest числового обхода не имеет (нужен high watermark). */
-    char  offset_start_mode[16];  /* logical (default) | absolute */
+     * SASL). latest числового обхода не имеет (нужен high watermark) — при
+     * OFFSET_OUT_OF_RANGE есть автофоллбэк на него (kafka_reassign_to_end).
+     * Буквальное неотрицательное число (например "15230") — ручной пин точного
+     * offset, минуя ListOffsets полностью в ОБЕ стороны; последний рубеж, если
+     * брокер не резолвит ни BEGINNING, ни END. */
+    char  offset_start_mode[24];  /* logical (default) | absolute | <неотрицательное число> — точный ручной offset */
     /* Диагностика по требованию: значение прокидывается в librdkafka debug=
      * (напр. "broker,feature,protocol,metadata"), чтобы в логе увидеть набор API,
      * объявляемый брокером ("Broker API support:"). Пусто — debug выключен. */
@@ -1100,13 +1105,30 @@ static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
     /* offset_start_mode=absolute: earliest резолвим числовым offset 0 вместо
      * логического BEGINNING — Fetch стартует напрямую, БЕЗ запроса ListOffsets
      * (обход брокеров/прокси, не объявляющих этот API). Оговорка: если retention
-     * срезал ранние сегменты (0 < log-start), брокер вернёт OFFSET_OUT_OF_RANGE;
-     * при auto.offset.reset=earliest это уводит обратно в BEGINNING→ListOffsets.
+     * срезал ранние сегменты (0 < log-start), брокер вернёт OFFSET_OUT_OF_RANGE —
+     * см. авто-фоллбэк на latest в kafka_read_batch/kafka_reassign_to_end.
      * latest числового обхода не имеет (нужен high watermark) — absolute на него
-     * не распространяется, остаётся логический END. */
+     * не распространяется, остаётся логический END.
+     *
+     * Последний рубеж — если брокер не резолвит ListOffsets вообще ни в одну
+     * сторону (ни BEGINNING, ни END), ни один автоматический путь не сработает:
+     * клиент физически не может узнать текущий offset без кооперации брокера.
+     * В этом случае offset_start_mode принимает буквальное неотрицательное число
+     * (например "15230") — Fetch стартует ровно с него, минуя ListOffsets
+     * полностью. Число берётся у владельца брокера напрямую (его инструментами),
+     * раз наш клиент дистанционно спросить не может. */
+    char *num_end = NULL;
+    long long manual_off = ctx->offset_start_mode[0]
+        ? strtoll(ctx->offset_start_mode, &num_end, 10) : -1;
+    bool is_manual_numeric = ctx->offset_start_mode[0] && num_end && *num_end == '\0'
+        && manual_off >= 0;
     bool absolute = (strcasecmp(ctx->offset_start_mode, "absolute") == 0);
     int64_t start_off;
-    if (strcasecmp(ctx->offset_reset, "latest") == 0) {
+    if (is_manual_numeric) {
+        start_off = (int64_t)manual_off;
+        LOG_INFO("kafka: offset_start_mode=%lld — ручной старт, ListOffsets не используется",
+                 manual_off);
+    } else if (strcasecmp(ctx->offset_reset, "latest") == 0) {
         if (absolute)
             LOG_WARN("kafka: offset_start_mode=absolute неприменим к latest "
                      "(нужен ListOffsets для high watermark) — использую логический END");
@@ -1159,7 +1181,46 @@ static int kafka_assign_all(KafkaCtx *ctx, const char *topic)
     ctx->assigned = true;
     LOG_INFO("kafka: assigned partitions of topic=%s (%s, без consumer-группы/ребаланса)",
              topic, ctx->explicit_group ? "инкремент по committed offset group_id"
-                                        : (start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest"));
+                     : (is_manual_numeric ? "ручной offset"
+                        : (start_off == RD_KAFKA_OFFSET_END ? "latest" : "earliest")));
+    return 0;
+}
+
+/* Автовосстановление после OFFSET_OUT_OF_RANGE в offset_start_mode=absolute:
+ * числовой offset 0 больше не валиден (retention его срезал), а брокер не умеет
+ * ListOffsets, чтобы сам найти актуальное начало — значит earliest в принципе
+ * недостижим без ручного вмешательства. Вместо того чтобы требовать от оператора
+ * руками переключить offset_reset на latest (через UI/каталог — при обрыве этой
+ * цепочки чтение так и останется падать в 0), переназначаем партиции на
+ * RD_KAFKA_OFFSET_END сами: теряем более раннюю историю, но начинаем получать
+ * новые сообщения без участия человека. Однократно за жизнь ctx — если latest
+ * тоже не резолвится на этом брокере, дальше падаем с настоящей ошибкой. */
+static int kafka_reassign_to_end(KafkaCtx *ctx, const char *topic)
+{
+    rd_kafka_topic_t *rkt = rd_kafka_topic_new(ctx->rk, topic, NULL);
+    const struct rd_kafka_metadata *meta = NULL;
+    rd_kafka_resp_err_t merr = rkt
+        ? rd_kafka_metadata(ctx->rk, 0, rkt, &meta, 5000) : RD_KAFKA_RESP_ERR__FAIL;
+    if (merr != RD_KAFKA_RESP_ERR_NO_ERROR || !meta) {
+        if (rkt) rd_kafka_topic_destroy(rkt);
+        return -1;
+    }
+    rd_kafka_topic_partition_list_t *parts = rd_kafka_topic_partition_list_new(4);
+    for (int i = 0; i < meta->topic_cnt; i++) {
+        if (strcmp(meta->topics[i].topic, topic) != 0) continue;
+        for (int p = 0; p < meta->topics[i].partition_cnt; p++) {
+            rd_kafka_topic_partition_t *tp =
+                rd_kafka_topic_partition_list_add(parts, topic, meta->topics[i].partitions[p].id);
+            tp->offset = RD_KAFKA_OFFSET_END;
+        }
+    }
+    rd_kafka_metadata_destroy(meta);
+    rd_kafka_topic_destroy(rkt);
+    rd_kafka_resp_err_t aerr = rd_kafka_assign(ctx->rk, parts);
+    rd_kafka_topic_partition_list_destroy(parts);
+    if (aerr != RD_KAFKA_RESP_ERR_NO_ERROR) return -1;
+    LOG_WARN("kafka: offset 0 unreachable on topic=%s (retention/no ListOffsets) — "
+             "auto-fell-back to latest, earlier backlog on this topic is skipped", topic);
     return 0;
 }
 
@@ -1405,7 +1466,67 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         rd_kafka_message_t *msg = rd_kafka_consumer_poll(ctx->rk, 500 /*ms*/);
         if (!msg) { if (got_any) break; else continue; }  /* drained after first msg */
         if (msg->err) {
-            if (msg->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
+            /* ACL/authorization failures are permanent — no amount of waiting
+             * fixes them. Left alongside PARTITION_EOF (benign, "nothing new
+             * right now") they used to fall through to the same "0 rows,
+             * caller may retry" path below, so a topic the SASL user has no
+             * READ grant on looked identical to a genuinely empty topic. */
+            rd_kafka_resp_err_t e = msg->err;
+            if (e == RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED ||
+                e == RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED ||
+                e == RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED) {
+                snprintf(ctx->last_err, sizeof(ctx->last_err),
+                         "kafka: not authorized to read topic '%s': %s",
+                         check_topic, rd_kafka_message_errstr(msg));
+                LOG_ERROR("%s", ctx->last_err);
+                rd_kafka_message_destroy(msg);
+                *out = NULL;
+                return -1;
+            }
+            /* offset_start_mode=absolute starts the fetch at the literal offset 0
+             * (see kafka_assign_all). If retention has since trimmed the log
+             * (log-start-offset > 0), the broker answers OFFSET_OUT_OF_RANGE;
+             * auto.offset.reset would normally recover by re-resolving the
+             * logical BEGINNING — but that needs ListOffsets, which is exactly
+             * the API this broker doesn't support (that's why absolute mode
+             * exists), so recovery itself fails with __UNSUPPORTED_FEATURE. The
+             * net effect used to be identical to "topic genuinely empty": same
+             * account, same topic, other (non-absolute-mode) consumers read it
+             * fine, we silently got 0 rows every time. */
+            if (e == RD_KAFKA_RESP_ERR_OFFSET_OUT_OF_RANGE ||
+                (e == RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE &&
+                 strcasecmp(ctx->offset_start_mode, "absolute") == 0)) {
+                char errbuf[256];
+                snprintf(errbuf, sizeof(errbuf), "%s", rd_kafka_message_errstr(msg));
+                bool first_time = !ctx->offset_fallback_tried;
+                rd_kafka_message_destroy(msg);
+                /* Try once, automatically: re-assign to the current tail (latest)
+                 * instead of requiring the operator to hand-edit offset_reset and
+                 * hope the change round-trips through UI/restart correctly. Loses
+                 * whatever backlog sits before the current tail, but gets the
+                 * connector receiving live messages without a human in the loop. */
+                if (first_time) {
+                    ctx->offset_fallback_tried = true;
+                    if (kafka_reassign_to_end(ctx, check_topic) == 0)
+                        continue;
+                    snprintf(ctx->last_err, sizeof(ctx->last_err),
+                             "kafka: offset 0 no longer valid for topic '%s' (retention "
+                             "trimmed it), broker can't auto-recover via ListOffsets, and "
+                             "the automatic fallback to latest also failed — ask the broker "
+                             "owner for the current log-start-offset: %s",
+                             check_topic, errbuf);
+                } else {
+                    snprintf(ctx->last_err, sizeof(ctx->last_err),
+                             "kafka: offset 0 no longer valid for topic '%s' (retention "
+                             "trimmed it) and broker can't auto-recover via ListOffsets — "
+                             "already fell back to latest automatically, still failing: %s",
+                             check_topic, errbuf);
+                }
+                LOG_ERROR("%s", ctx->last_err);
+                *out = NULL;
+                return -1;
+            }
+            if (e != RD_KAFKA_RESP_ERR__PARTITION_EOF)
                 LOG_WARN("kafka: poll error: %s", rd_kafka_message_errstr(msg));
             rd_kafka_message_destroy(msg);
             if (got_any) break;   /* EOF after reading messages → done */

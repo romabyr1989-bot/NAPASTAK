@@ -1048,7 +1048,10 @@ async function showPipelineRuns(id, name) {
         <td>${statusLabel}</td>
         <td>${dur}</td>
         <td>${typeof r.retry_count === 'number' ? r.retry_count : 0}</td>
-        <td title="${escAttr(r.error || '')}" style="${r.error ? 'color:var(--red)' : ''}">${escHtml(humanizeError(r.error))}</td>
+        <td style="${r.error ? 'color:var(--red)' : ''}">${r.error ? `
+          <div>${escHtml(humanizeError(r.error))}</div>
+          <div style="margin-top:.25rem;font-family:monospace;font-size:.78rem;white-space:pre-wrap;word-break:break-word;opacity:.85">${escHtml(r.error)}</div>
+        ` : ''}</td>
       </tr>`;
     });
     html += '</tbody></table>';
@@ -1406,6 +1409,16 @@ function pbSetKafkaSecurity(idx, val) {
   if (el) el.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
 }
 
+/* Смена «Стартовой позиции». 'numeric' — не литеральное значение бэкенда, а
+ * UI-состояние: реальный offset_start_mode должен быть конкретным числом
+ * (строкой), поэтому сразу подставляем "0" и перерисовываем форму, чтобы
+ * появилось поле ввода точного offset. */
+function pbSetKafkaOffsetStartMode(idx, val) {
+  pbUpdateConnConfig(idx, 'offset_start_mode', val === 'numeric' ? '0' : val);
+  const el = document.getElementById('step-conn-cfg-' + idx);
+  if (el) el.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
+}
+
 /* Preflight-проверка конфига Kafka до обращения к брокеру: ловим очевидные
  * пропуски (адрес, парная mTLS, логин/пароль SASL) и отдаём понятную причину
  * с указанием поля, а не сырую ошибку librdkafka после таймаута. Возвращает
@@ -1451,6 +1464,11 @@ function kafkaFriendlyError(err) {
      * «sasl» (напр. "sasl_cyrus: GSSAPI Error"), иначе маршрутизируется в
      * подсказку про логин/пароль, которых для GSSAPI нет. */
     [/Kerberos|GSSAPI|krb5|keytab|kinit|gss/i,                              'Ошибка Kerberos/GSSAPI — проверьте krb5.conf и keytab/ccache на сервере gateway.'],
+    /* Authorization (ACL) — ВЫШЕ общей SASL-аутентификации: креды верны, залогинились
+     * успешно, но брокер не даёт READ на конкретный топик/группу. Другая причина, другое
+     * лечение (ACL у администратора кластера, не пароль/механизм). */
+    [/not authorized|AUTHORIZATION_FAILED|TOPIC_AUTHORIZATION|GROUP_AUTHORIZATION|CLUSTER_AUTHORIZATION/i,
+                                                                            'Учётные данные верны, но нет прав (ACL) на этот топик/группу — обратитесь к администратору кластера Kafka.'],
     [/authentication failed|SASL|sasl|Authentication|SaslAuthentication|invalid credentials/i,
                                                                             'Аутентификация не прошла — проверьте механизм SASL, «Пользователь» и «Пароль».'],
     [/resolve|nodename|Name or service|getaddrinfo/i,                       'Не удалось разрешить адрес брокера — проверьте host в поле «Брокеры».'],
@@ -2919,10 +2937,20 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Стартовая позиция (совместимость)</label>
-          <select onchange="pbUpdateConnConfig(${idx},'offset_start_mode',this.value)">
-            <option value="logical"  ${osm==='logical' ?'selected':''}>logical (обычные брокеры — резолв через ListOffsets)</option>
-            <option value="absolute" ${osm==='absolute'?'selected':''}>absolute (брокер/прокси без ListOffsets — чтение с offset 0)</option>
+          ${(() => {
+            const isNumeric = /^\d+$/.test(osm);
+            const sel = isNumeric ? 'numeric' : osm;
+            return `
+          <select onchange="pbSetKafkaOffsetStartMode(${idx},this.value)">
+            <option value="logical"  ${sel==='logical' ?'selected':''}>logical (обычные брокеры — резолв через ListOffsets)</option>
+            <option value="absolute" ${sel==='absolute'?'selected':''}>absolute (брокер/прокси без ListOffsets — чтение с offset 0, автопереход на latest при OFFSET_OUT_OF_RANGE)</option>
+            <option value="numeric"  ${sel==='numeric' ?'selected':''}>точный offset вручную (ни earliest, ни latest не резолвятся — offset берётся у владельца брокера)</option>
           </select>
+          ${isNumeric ? `
+          <input type="number" min="0" step="1" value="${escAttr(osm)}" style="margin-top:.35rem"
+                 placeholder="например 15230"
+                 oninput="pbUpdateConnConfig(${idx},'offset_start_mode',this.value)">` : ''}`;
+          })()}
         </div>`}
       </div>
       ${needsSasl ? `
@@ -3335,7 +3363,10 @@ async function showMatviewMetrics(name) {
             <td>${st}</td>
             <td>${fmtNum(r.row_count || 0)}</td>
             <td>${r.duration_ms ?? 0}</td>
-            <td title="${escAttr(r.error || '')}" style="${r.error ? 'color:var(--red)' : ''}">${escHtml(humanizeError(r.error))}</td>
+            <td style="${r.error ? 'color:var(--red)' : ''}">${r.error ? `
+              <div>${escHtml(humanizeError(r.error))}</div>
+              <div style="margin-top:.25rem;font-family:monospace;font-size:.78rem;white-space:pre-wrap;word-break:break-word;opacity:.85">${escHtml(r.error)}</div>
+            ` : ''}</td>
           </tr>`;
         }).join('')
       + '</tbody></table>';
