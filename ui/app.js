@@ -1438,7 +1438,10 @@ const CONN_REQUEST_KEYS = {
   postgresql: ['read_mode','table','query','cursor_column','cdc_slot','primary_key'],
   greenplum:  ['read_mode','table','query','cursor_column','primary_key'],
   oracle:     ['read_mode','table','query','cursor_column','primary_key'],
-  kafka:      ['topic','group_id','offset_reset','offset_start_mode','isolation_level','data_format'],
+  /* data_format — в ДОСТУПЕ: им раскрывается блок Schema Registry, который
+   * тоже относится к доступу. Оставь его в запросе — реестр стало бы негде
+   * настроить. При необходимости формат переопределяется в конфиге шага. */
+  kafka:      ['topic','group_id','offset_reset','offset_start_mode','isolation_level'],
   json_http:  ['data_path','post_body','page_param','page_type','page_size','total_field'],
   xml:        ['row_tag','root_tag','data_path','post_body','page_param','page_size'],
   soap:       ['soap_action','operation','request_template','row_tag','sink_row_tag','data_path','page_size'],
@@ -1509,12 +1512,26 @@ function applyConnFieldFilter(containerId, type, mode) {
   });
 }
 
+/* Конфиг для ОТРИСОВКИ формы в карточке шага: база из подключения, поверх —
+ * ключи шага. Без слияния поля, которые форма раскрывает по переключателю из
+ * подключения (например «Тело запроса» появляется только при method=POST),
+ * в шаге не рисовались бы никогда: у шага этого переключателя нет.
+ * Правки по-прежнему уходят в конфиг ШАГА — pbUpdateConnConfig не меняется. */
+function stepRenderView(step) {
+  if (!step || !step.connection_id) return step;
+  const rec = (connCache || []).find(c => c.id === step.connection_id);
+  if (!rec) return step;
+  const merged = Object.assign({}, rec.config || {}, safeParse(step.connector_config, {}));
+  return Object.assign({}, step, { connector_config: JSON.stringify(merged) });
+}
+
 /* Единая точка перерисовки формы запроса в карточке шага. */
 function pbRerenderStepCfg(idx) {
   const el = document.getElementById('step-conn-cfg-' + idx);
   if (!el) return;
   const step = pbStep(idx);
-  el.innerHTML = makeConnectorConfigHTML(step, idx);
+  el.innerHTML = makeConnectorConfigHTML(
+    idx === CONN_FORM_IDX ? step : stepRenderView(step), idx);
   /* Фильтр обязателен и после ЧАСТИЧНОЙ перерисовки (смена защиты Kafka, режима
    * чтения и т.п.): без него в редакторе подключения всплывали бы поля запроса
    * (топик, группа консьюмера), попадали в конфиг подключения и становились
@@ -2633,7 +2650,7 @@ function makeStepCard(step, idx) {
       ${/* Параметры доступа задаются в подключении, а ЗАПРОС к данным — здесь:
             он свой у каждого конвейера. Ниже та же форма коннектора, из которой
             фильтр оставляет только поля запроса (см. applyConnFieldFilter). */''}
-      <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(step, idx)}</div>
+      <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(stepRenderView(step), idx)}</div>
       ${t.startsWith('sink:') ? makeSinkFieldsHTML(step, idx) : ''}
       ${t === 'scd2'  ? makeScd2FieldsHTML(step, idx)  : ''}
       ${t === 'match' ? makeMatchFieldsHTML(step, idx) : ''}
