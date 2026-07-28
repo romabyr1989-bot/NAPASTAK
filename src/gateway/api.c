@@ -8576,7 +8576,7 @@ static void h_cluster_status(HttpReq *req, HttpResp *resp) {
 static bool conn_key_is_secret(const char *k) {
     static const char *SECRETS[] = {
         "password", "siebel_password", "auth_token", "sasl_password",
-        "ssl_key_password", "schema_registry_auth", NULL
+        "ssl_key_password", "ssl_truststore_password", "schema_registry_auth", NULL
     };
     for (int i = 0; SECRETS[i]; i++) if (!strcmp(k, SECRETS[i])) return true;
     return false;

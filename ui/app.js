@@ -1719,7 +1719,7 @@ function kafkaCfgProblems(cfg) {
      * Только мягко предупреждаем. */
     if (cert && !hasKey && !looksP12)
       warn.push('Клиентский сертификат указан без ключа: если это не PKCS#12-контейнер (cert+key одним файлом), заполните «Клиентский ключ».');
-    if (!(cfg.ssl_ca_location || '').trim())
+    if (!(cfg.ssl_ca_location || '').trim() && !(cfg.ssl_truststore_location || '').trim())
       warn.push('CA‑сертификат не задан — проверка брокера пойдёт по системному хранилищу (частный банковский CA обычно нужно указать явно).');
   }
   return { block, warn };
@@ -1731,9 +1731,14 @@ function kafkaFriendlyError(err) {
   const e = String(err || '');
   const m = [
     [/unknown topic|does not exist|UNKNOWN_TOPIC/i,                         'Топик не найден на брокере — проверьте имя топика.'],
+    /* ВЫШЕ общего правила про сертификат брокера: если truststore не открылся
+     * (обычно неверный пароль), плагин отдаёт исходный .p12 в ssl.ca.location, и
+     * OpenSSL сообщает про «no certificate», что уводит не туда. */
+    [/ssl\.ca\.location failed|no certificate or crl found/i,
+                                                                            'Не удалось прочитать доверенные сертификаты — проверьте «Пароль truststore» и путь к файлу (.p12/.pfx или PEM).'],
     [/certificate verify|verify failed|broker certificate|SSL handshake|ssl handshake|CERTIFICATE_VERIFY|unable to get local issuer|self.signed/i,
                                                                             'Сертификат брокера не прошёл проверку — проверьте «CA‑сертификат» и соответствие имени хоста в сертификате.'],
-    [/PKCS12|keystore|private key|bad decrypt|key values mismatch|ssl.key/i,'Проблема с клиентским сертификатом/ключом — проверьте пути и «Пароль ключа / keystore».'],
+    [/PKCS12|keystore|private key|bad decrypt|key values mismatch|ssl.key/i,'Проблема с клиентским сертификатом/ключом — проверьте пути и «Пароль keystore / ключа».'],
     /* Kerberos/GSSAPI — ВЫШЕ общего SASL: текст ошибок GSSAPI часто содержит
      * «sasl» (напр. "sasl_cyrus: GSSAPI Error"), иначе маршрутизируется в
      * подсказку про логин/пароль, которых для GSSAPI нет. */
@@ -3314,6 +3319,18 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
       </div>
       <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+        <div class="form-group" style="margin:0;flex:2">
+          <label>Truststore PKCS#12 (вместо CA‑файла)</label>
+          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="truststore.p12 / .pfx — распакуется в PEM автоматически"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_truststore_location',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пароль truststore</label>
+          <input type="password" value="${escAttr(cfg.ssl_truststore_password || '')}" placeholder="" autocomplete="off"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_truststore_password',this.value)">
+        </div>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Клиентский сертификат (mTLS, необяз.)</label>
           <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="client.pem / client.p12"
@@ -3325,7 +3342,7 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Пароль ключа / keystore</label>
+          <label>Пароль keystore / ключа</label>
           <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>

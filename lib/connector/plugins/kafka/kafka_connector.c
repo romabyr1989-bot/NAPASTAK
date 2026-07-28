@@ -94,6 +94,12 @@ typedef struct {
     char  ssl_key_location[512];         /* клиентский приватный ключ (PEM); для PKCS#12 не нужен */
     char  ssl_key_password[256];         /* пароль ключа/keystore, если зашифрован */
     char  ssl_keystore_location[512];    /* явный PKCS#12 keystore (альтернатива cert+key) */
+    /* Truststore в формате PKCS#12 (.p12/.pfx) с паролем — так его выдают
+     * администраторы Kafka, привыкшие к Java-клиенту. У librdkafka понятия
+     * truststore НЕТ: доверенные корни она принимает только PEM-ом через
+     * ssl.ca.location. Поэтому распаковываем хранилище сами. */
+    char  ssl_truststore_location[512];
+    char  ssl_truststore_password[256];
     /* Временные PEM-файлы автоконверсии DER→PEM для CA и клиентского СЕРТИФИКАТА
      * (публичные данные). Приватный ключ на диск НЕ пишется — конвертируется в
      * память (ssl.key.pem). Создаются лениво, удаляются в kafka_destroy. */
@@ -248,6 +254,56 @@ static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_
     return slot;
 }
 
+
+/* Распаковывает PKCS#12-truststore в PEM с доверенными сертификатами.
+ * librdkafka не умеет truststore (это понятие Java-клиента) и принимает только
+ * ssl.ca.location в PEM, поэтому конвертируем сами: администраторы выдают
+ * хранилище в .p12/.pfx с паролем, и заставлять руками звать openssl неверно.
+ * Пишем ТОЛЬКО публичные сертификаты — приватных ключей в truststore нет.
+ * При неудаче возвращаем исходный путь: librdkafka сообщит об ошибке сама. */
+static const char *kafka_p12_truststore_to_pem(const char *p12_path, const char *pass,
+                                               char *slot, size_t slot_sz)
+{
+    if (slot[0]) return slot;                    /* уже сконвертировано */
+    FILE *f = fopen(p12_path, "rb");
+    if (!f) return p12_path;
+    PKCS12 *p12 = d2i_PKCS12_fp(f, NULL);
+    fclose(f);
+    ERR_clear_error();
+    if (!p12) return p12_path;                   /* не PKCS#12 — отдадим как есть */
+
+    EVP_PKEY *pkey = NULL; X509 *cert = NULL; STACK_OF(X509) *chain = NULL;
+    int ok = PKCS12_parse(p12, pass ? pass : "", &pkey, &cert, &chain);
+    PKCS12_free(p12);
+    ERR_clear_error();
+    if (!ok) {
+        LOG_WARN("kafka: не удалось открыть truststore %s — неверный пароль?", p12_path);
+        return p12_path;
+    }
+    /* Приватный ключ в truststore не нужен ни нам, ни файлу назначения. */
+    if (pkey) EVP_PKEY_free(pkey);
+
+    char tmpl[] = "/tmp/dfo_kafka_truststore_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { if (cert) X509_free(cert); if (chain) sk_X509_pop_free(chain, X509_free); return p12_path; }
+    FILE *out = fdopen(fd, "wb");
+    int written = 0;
+    if (out) {
+        if (cert && PEM_write_X509(out, cert)) written++;
+        if (chain)
+            for (int i = 0; i < sk_X509_num(chain); i++)
+                if (PEM_write_X509(out, sk_X509_value(chain, i))) written++;
+        fclose(out);
+    } else close(fd);
+    if (cert)  X509_free(cert);
+    if (chain) sk_X509_pop_free(chain, X509_free);
+
+    if (!written) { unlink(tmpl); return p12_path; }
+    snprintf(slot, slot_sz, "%s", tmpl);
+    LOG_INFO("kafka: truststore PKCS#12 распакован в PEM (%d сертификат(ов))", written);
+    return slot;
+}
+
 /* Конвертирует DER-приватный ключ в PEM и передаёт librdkafka как in-memory
  * строку (ssl.key.pem) — расшифрованный ключ НЕ пишется на диск. При неудаче
  * отдаёт исходный путь в ssl.key.location (librdkafka сама сообщит об ошибке).
@@ -316,8 +372,16 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
         rd_kafka_conf_set(conf, "ssl.endpoint.identification.algorithm", "https", errstr, errlen);
     }
 
-    /* CA брокера: PEM — как есть; DER — конвертируем в PEM. */
-    if (ctx->ssl_ca_location[0]) {
+    /* Доверенные корни брокера. Приоритет — у явного truststore (.p12/.pfx с
+     * паролем, как выдают администраторы): распаковываем его в PEM, потому что
+     * librdkafka понимает только ssl.ca.location. Иначе берём ssl_ca_location:
+     * PEM — как есть, DER — конвертируем. */
+    if (ctx->ssl_truststore_location[0]) {
+        const char *ca = kafka_p12_truststore_to_pem(ctx->ssl_truststore_location,
+                                                     ctx->ssl_truststore_password,
+                                                     ctx->ssl_tmp_ca, sizeof ctx->ssl_tmp_ca);
+        rd_kafka_conf_set(conf, "ssl.ca.location", ca, errstr, errlen);
+    } else if (ctx->ssl_ca_location[0]) {
         const char *ca = ctx->ssl_ca_location;
         if (!kafka_pem_file(ca))
             ca = kafka_der_cert_to_pem(ca, ctx->ssl_tmp_ca, sizeof ctx->ssl_tmp_ca);
@@ -987,7 +1051,9 @@ static void *kafka_create(const char *config_json, Arena *arena)
         cfg_str(config_json, "\"ssl_certificate_location\"", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));
         cfg_str(config_json, "\"ssl_key_location\"",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
         cfg_str(config_json, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
-        cfg_str(config_json, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
+        cfg_str(config_json, "\"ssl_truststore_location\"", ctx->ssl_truststore_location, sizeof(ctx->ssl_truststore_location));
+    cfg_str(config_json, "\"ssl_truststore_password\"", ctx->ssl_truststore_password, sizeof(ctx->ssl_truststore_password));
+    cfg_str(config_json, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
         cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
         cfg_str(config_json, "\"isolation_level\"",   ctx->isolation_level,   sizeof(ctx->isolation_level));
         cfg_str(config_json, "\"offset_start_mode\"", ctx->offset_start_mode, sizeof(ctx->offset_start_mode));
