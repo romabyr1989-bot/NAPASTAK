@@ -98,6 +98,10 @@ typedef struct {
      * администраторы Kafka, привыкшие к Java-клиенту. У librdkafka понятия
      * truststore НЕТ: доверенные корни она принимает только PEM-ом через
      * ssl.ca.location. Поэтому распаковываем хранилище сами. */
+    /* Признак того, что librdkafka отвергла значение из конфига. Молча
+     * проглотить его нельзя: опечатка в security.protocol раньше означала
+     * подключение ОТКРЫТЫМ ТЕКСТОМ вместо SASL_SSL. */
+    bool  cfg_invalid;
     char  ssl_truststore_location[512];
     char  ssl_truststore_password[256];
     /* Временные PEM-файлы автоконверсии DER→PEM для CA и клиентского СЕРТИФИКАТА
@@ -255,6 +259,22 @@ static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_
 }
 
 
+
+/* Обёртка над rd_kafka_conf_set для настроек безопасности. librdkafka на
+ * неизвестное значение возвращает ошибку и НЕ применяет свойство: без проверки
+ * опечатка в security.protocol или sasl.mechanism тихо оставляла соединение
+ * незащищённым. Помечаем контекст как непригодный, чтобы создание клиента
+ * упало с внятной причиной вместо мнимого успеха. */
+static void kset_sec(rd_kafka_conf_t *conf, KafkaCtx *ctx, const char *key,
+                     const char *val, char *errstr, size_t errlen)
+{
+    if (rd_kafka_conf_set(conf, key, val, errstr, errlen) == RD_KAFKA_CONF_OK) return;
+    ctx->cfg_invalid = true;
+    snprintf(ctx->last_err, sizeof(ctx->last_err),
+             "librdkafka отвергла %s=\"%s\": %s", key, val ? val : "", errstr);
+    LOG_ERROR("kafka: %s", ctx->last_err);
+}
+
 /* Распаковывает PKCS#12-truststore в PEM с доверенными сертификатами.
  * librdkafka не умеет truststore (это понятие Java-клиента) и принимает только
  * ssl.ca.location в PEM, поэтому конвертируем сами: администраторы выдают
@@ -380,12 +400,12 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
         const char *ca = kafka_p12_truststore_to_pem(ctx->ssl_truststore_location,
                                                      ctx->ssl_truststore_password,
                                                      ctx->ssl_tmp_ca, sizeof ctx->ssl_tmp_ca);
-        rd_kafka_conf_set(conf, "ssl.ca.location", ca, errstr, errlen);
+        kset_sec(conf, ctx, "ssl.ca.location", ca, errstr, errlen);
     } else if (ctx->ssl_ca_location[0]) {
         const char *ca = ctx->ssl_ca_location;
         if (!kafka_pem_file(ca))
             ca = kafka_der_cert_to_pem(ca, ctx->ssl_tmp_ca, sizeof ctx->ssl_tmp_ca);
-        rd_kafka_conf_set(conf, "ssl.ca.location", ca, errstr, errlen);
+        kset_sec(conf, ctx, "ssl.ca.location", ca, errstr, errlen);
     }
 
     /* Клиентский сертификат для mTLS. Приоритет:
@@ -399,9 +419,9 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
         keystore = ctx->ssl_certificate_location;
 
     if (keystore) {
-        rd_kafka_conf_set(conf, "ssl.keystore.location", keystore, errstr, errlen);
+        kset_sec(conf, ctx, "ssl.keystore.location", keystore, errstr, errlen);
         if (ctx->ssl_key_password[0])
-            rd_kafka_conf_set(conf, "ssl.keystore.password", ctx->ssl_key_password, errstr, errlen);
+            kset_sec(conf, ctx, "ssl.keystore.password", ctx->ssl_key_password, errstr, errlen);
         LOG_INFO("kafka: клиентский сертификат в формате PKCS#12 (keystore)");
     } else {
         if (ctx->ssl_certificate_location[0]) {
@@ -447,9 +467,9 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, KafkaCtx *ctx,
         LOG_WARN("kafka: debug='%s' не принят librdkafka: %s", ctx->librdkafka_debug, errstr);
 
     if (ctx->security_protocol[0])
-        rd_kafka_conf_set(conf, "security.protocol", ctx->security_protocol, errstr, errlen);
+        kset_sec(conf, ctx, "security.protocol", ctx->security_protocol, errstr, errlen);
     if (ctx->sasl_mechanism[0])
-        rd_kafka_conf_set(conf, "sasl.mechanism", ctx->sasl_mechanism, errstr, errlen);
+        kset_sec(conf, ctx, "sasl.mechanism", ctx->sasl_mechanism, errstr, errlen);
     else if (strncmp(ctx->security_protocol, "SASL", 4) == 0)
         /* SASL-протокол выбран, но механизм не задан. У librdkafka дефолт
          * sasl.mechanism = GSSAPI (Kerberos) → без keytab она сразу падает с
@@ -492,9 +512,9 @@ static void kafka_apply_security(rd_kafka_conf_t *conf, KafkaCtx *ctx,
     } else {
         /* PLAIN/SCRAM — по логину/паролю. */
         if (ctx->sasl_username[0])
-            rd_kafka_conf_set(conf, "sasl.username", ctx->sasl_username, errstr, errlen);
+            kset_sec(conf, ctx, "sasl.username", ctx->sasl_username, errstr, errlen);
         if (ctx->sasl_password[0])
-            rd_kafka_conf_set(conf, "sasl.password", ctx->sasl_password, errstr, errlen);
+            kset_sec(conf, ctx, "sasl.password", ctx->sasl_password, errstr, errlen);
     }
     /* TLS: CA брокера + клиентский cert/key для mTLS. Форматы читаются разные —
      * см. kafka_apply_tls (PEM раздельно ИЛИ PKCS#12 одним файлом). */
@@ -543,6 +563,14 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
      * kafka_apply_security — общей для consumer и producer (sink). */
 
     kafka_apply_security(conf, ctx, errstr, errlen);
+    /* Хоть одно значение из настроек безопасности отвергнуто — прекращаем.
+     * Иначе клиент поднялся бы с «дырой»: например при опечатке в
+     * security.protocol пошёл бы к брокеру открытым текстом. */
+    if (ctx->cfg_invalid) {
+        snprintf(errstr, errlen, "%s", ctx->last_err);
+        rd_kafka_conf_destroy(conf);
+        return NULL;
+    }
 
     /* Latch cluster-level errors (all-brokers-down) into ctx via the opaque so a
      * read can fail instead of silently returning 0 rows. ctx is the connector's
@@ -1829,6 +1857,11 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
         LOG_ERROR("kafka sink: conf: %s", errstr); rd_kafka_conf_destroy(conf); return -1;
     }
     kafka_apply_security(conf, ctx, errstr, sizeof(errstr));
+    if (ctx->cfg_invalid) {
+        LOG_ERROR("kafka: %s", ctx->last_err);
+        rd_kafka_conf_destroy(conf);
+        return -1;
+    }
     rd_kafka_t *rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (!rk) { LOG_ERROR("kafka sink: producer: %s", errstr); rd_kafka_conf_destroy(conf); return -1; }
     rd_kafka_topic_t *rkt = rd_kafka_topic_new(rk, topic, NULL);
