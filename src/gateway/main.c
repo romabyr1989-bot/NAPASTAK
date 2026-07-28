@@ -72,6 +72,17 @@ static char *expand_env_vars(const char *input) {
 }
 
 
+/* Булев ключ конфига. json_int понимает только числа и на JSON-булевом молча
+ * отдаёт значение по умолчанию — из-за этого "auth_enabled": false
+ * игнорировалось, и аутентификация оставалась включённой вопреки конфигу.
+ * Принимаем обе записи: true/false и 1/0. */
+static bool cfg_flag(JVal *v, bool def) {
+    if (!v) return def;
+    if (v->type == JV_BOOL)   return v->b;
+    if (v->type == JV_NUMBER) return v->n != 0;
+    return def;
+}
+
 /* Глобальный экземпляр приложения — нужен обработчику сигналов. */
 App g_app;
 
@@ -269,6 +280,41 @@ static void *mv_ticker_loop(void *arg) {
     return NULL;
 }
 
+/* Поток обслуживания постоянных подключений: поднимает сессии к системам из
+ * справочника и держит их живыми, чтобы соединение существовало постоянно, а не
+ * только на время запуска конвейера. Отдельный поток, потому что открытие
+ * сессии к недоступной системе упирается в таймаут — старт гейтвея и работа
+ * конвейеров из-за этого тормозить не должны. */
+static pthread_t    g_conn_ticker;
+static volatile int g_conn_ticker_run = 0;
+
+static void *conn_ticker_loop(void *arg) {
+    App *app = (App *)arg;
+    (void)app;
+    /* Небольшая пауза на старте: даём подсистемам подняться. */
+    for (int i = 0; i < 3 && g_conn_ticker_run; i++) sleep(1);
+    while (g_conn_ticker_run) {
+        api_conn_pool_maintain();
+        for (int i = 0; i < 20 && g_conn_ticker_run; i++) sleep(1);
+    }
+    return NULL;
+}
+
+/* Остановка потока прогрева с пределом ожидания. Обход может сидеть в коннекте
+ * к недоступной системе (таймаут драйвера — секунды), и безусловный join
+ * подвешивал бы завершение гейтвея. Не дождавшись, поток бросаем: процесс всё
+ * равно завершается, а пул при остановке занятые сессии не трогает. */
+static void conn_ticker_stop(void) {
+    if (!g_conn_ticker_run) return;
+    g_conn_ticker_run = 0;
+    for (int i = 0; i < 60; i++) {          /* до ~6 секунд */
+        if (pthread_kill(g_conn_ticker, 0) != 0) return;   /* поток уже вышел */
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    LOG_WARN("поток обслуживания подключений не завершился за 6 с — не ждём дальше");
+}
+
 /* Инициализация приложения: дефолты, разбор JSON-конфига, создание всех
  * подсистем (catalog/auth/scheduler/matviews/RBAC/audit/cluster), загрузка
  * таблиц и пайплайнов из каталога, запуск HTTP-сервера,
@@ -298,7 +344,7 @@ void app_init(App *app, const char *config_json) {
             }
             int port=(int)json_int(json_get(cfg,"port"),0);
             if(port>0) app->port=port;
-            app->auth_enabled = json_int(json_get(cfg,"auth_enabled"),1);  // default true
+            app->auth_enabled = cfg_flag(json_get(cfg,"auth_enabled"), true);   /* принимает и true/false, и 1/0 */
             const char *js=json_str(json_get(cfg,"jwt_secret"),NULL);
             if(js) {
                 char *expanded = expand_env_vars(js);
@@ -325,12 +371,12 @@ void app_init(App *app, const char *config_json) {
                 if (expanded) { strncpy(app->plugins_dir,expanded,sizeof(app->plugins_dir)-1); free(expanded); }
             }
             /* RBAC */
-            app->rbac_enabled = (bool)json_int(json_get(cfg,"rbac_enabled"), 0);
+            app->rbac_enabled = cfg_flag(json_get(cfg,"rbac_enabled"), false);
             /* audit */
             const char *alf = json_str(json_get(cfg,"audit_log_file"), NULL);
             if (alf) strncpy(app->audit_log_file, alf, sizeof(app->audit_log_file)-1);
             /* cluster */
-            app->cluster_mode = (bool)json_int(json_get(cfg,"cluster_mode"), 0);
+            app->cluster_mode = cfg_flag(json_get(cfg,"cluster_mode"), false);
             /* SQL templates base directory */
             const char *std_ = json_str(json_get(cfg,"sql_templates_dir"), NULL);
             if (std_) {
@@ -396,6 +442,10 @@ void app_init(App *app, const char *config_json) {
     }
     app->metrics  = calloc(1, sizeof(Metrics)); metrics_init(app->metrics);
     app->workers  = tp_create(WORKER_THREADS, 256);
+    /* Пул постоянных сессий к системам-источникам/приёмникам. До 4 одновременных
+     * экземпляров на подключение (контексты плагинов не потокобезопасны, а
+     * конвейеры идут параллельно на воркерах); простаивающие пингуются раз в 60 с. */
+    app->conn_pool = conn_pool_create(4, 60);
     app->scheduler= scheduler_create(on_pipeline_run, app);
     app->txn_mgr  = txn_manager_create();
 
@@ -455,6 +505,7 @@ void app_init(App *app, const char *config_json) {
         }
     }
     LOG_INFO("loaded %d pipelines", pn);
+    api_connections_migrate();   /* привести справочник подключений к текущей модели */
 
     arena_destroy(la);
 
@@ -487,6 +538,15 @@ void app_init(App *app, const char *config_json) {
     pthread_attr_setstacksize(&mv_attr, 16 * 1024 * 1024);
     pthread_create(&g_mv_ticker, &mv_attr, mv_ticker_loop, app);
     pthread_attr_destroy(&mv_attr);
+
+    /* Поток постоянных подключений: прогрев сессий + keepalive.
+     * Стек как у matview-тикера: внутри идут те же арены и JSON-разбор. */
+    g_conn_ticker_run = 1;
+    pthread_attr_t cp_attr;
+    pthread_attr_init(&cp_attr);
+    pthread_attr_setstacksize(&cp_attr, 8 * 1024 * 1024);
+    pthread_create(&g_conn_ticker, &cp_attr, conn_ticker_loop, app);
+    pthread_attr_destroy(&cp_attr);
 
     /* Step 4: file_arrival trigger watcher.
      * Returns NULL if no file_arrival triggers exist or platform unsupported. */
@@ -521,10 +581,13 @@ void app_stop(App *app) {
     if (app->pgwire) { pgwire_destroy(app->pgwire); app->pgwire = NULL; }
     if (app->file_watcher) { file_watcher_destroy(app->file_watcher); app->file_watcher = NULL; }
     if (g_mv_ticker_run) { g_mv_ticker_run = 0; pthread_join(g_mv_ticker, NULL); }
+    conn_ticker_stop();
     scheduler_stop(app->scheduler);
     http_server_stop(app->server);
     tp_destroy(app->workers);
     txn_manager_destroy(app->txn_mgr);
+    /* После остановки воркеров и тикеров: арендованных сессий уже нет. */
+    if (app->conn_pool) { conn_pool_destroy(app->conn_pool); app->conn_pool = NULL; }
     if (app->replicator) replicator_destroy(app->replicator);
     mvs_destroy(app->matviews);
     audit_log_destroy(app->audit);

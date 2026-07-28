@@ -17,6 +17,7 @@
 #include "../../lib/auth/audit.h"
 #include "../../lib/matview/matview.h"
 #include "../../lib/cluster/replicator.h"
+#include "../../lib/connector/conn_pool.h"
 #include <pthread.h>
 
 #define DATA_DIR_DEFAULT "./data"
@@ -69,6 +70,10 @@ typedef struct {
     /* materialized views */
     MatViewStore *matviews;
 
+    /* Пул ПОСТОЯННЫХ сессий к внешним системам для подключений из справочника:
+     * сессия живёт между запусками конвейеров, keepalive держит её живой. */
+    ConnPool    *conn_pool;
+
     /* cluster / replication */
     Replicator  *replicator;
     bool         cluster_mode;
@@ -110,6 +115,13 @@ void app_ws_broadcast(App *app, const char *json_msg);
 
 /* route registration */
 void api_register_routes(Router *r);
+
+/* Обслуживание пула постоянных сессий: keepalive уже открытых + прогрев тех
+ * подключений, у которых сессии ещё нет. Вызывается фоновым потоком гейтвея. */
+void api_conn_pool_maintain(void);
+
+/* Разовая миграция справочника подключений при старте (упразднённые поля). */
+void api_connections_migrate(void);
 
 /* pipeline step execution (runs transform_sql → target_table for each step) */
 void pipeline_execute_steps(Pipeline *p, App *app);

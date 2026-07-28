@@ -4072,6 +4072,7 @@ static void h_table_schema(HttpReq *req, HttpResp *resp) {
     jb_arr_end(&jb);
     jb_obj_end(&jb);
     http_resp_json(resp,200,jb_done(&jb));
+    arena_destroy(a);   /* http_resp_json копирует тело, арена больше не нужна */
 }
 
 /* ── GET /api/tables/:name/compression ── */
@@ -4511,6 +4512,7 @@ static void h_pipeline_create(HttpReq *req, HttpResp *resp) {
     char *pj=pipeline_to_json(&p,a);
     catalog_save_pipeline(g_app.catalog,p.id,pj);
     http_resp_json(resp,201,pj);
+    arena_destroy(a);   /* тело уже скопировано в ответ */
     Arena *ba=arena_create(256);
     app_ws_broadcast(&g_app,arena_sprintf(ba,"{\"event\":\"pipeline_created\",\"id\":\"%s\"}",p.id));
     arena_destroy(ba);
@@ -4807,6 +4809,7 @@ static void h_pipeline_get(HttpReq *req, HttpResp *resp) {
     }
     Arena *a=arena_create(4096);
     http_resp_json(resp,200,pipeline_to_json(p,a));
+    arena_destroy(a);
 }
 
 /* ── Drop and recreate a target table, return open Table* ── */
@@ -4939,6 +4942,146 @@ static const char *connector_so_name(const char *conn) {
     return conn;
 }
 
+/* Заглушка, которую UI получает вместо непустого секрета. Она же, присланная
+ * обратно, означает «значение не меняли»: наложить её поверх настоящего пароля
+ * нельзя ни при сохранении, ни при пробе связи. */
+#define CONN_SECRET_MASK "********"
+
+static void jval_serialize(JBuf *jb, JVal *v);   /* реализация ниже, рядом с пробами */
+
+/* Накладывает over поверх base и возвращает слитый JSON-объект в арене.
+ * base — параметры подключения из справочника, over — пошаговые ключи
+ * (query / table / cursor_column / topic / group_id …), которые всегда
+ * перебивают базу. Любой из аргументов может быть NULL или не-объектом. */
+/* Значение-заглушка вместо секрета: клиент видит только её и, отправляя конфиг
+ * обратно, шлёт её же. Наложить такую «маску» поверх настоящего пароля нельзя —
+ * иначе коннектор получил бы строку "********" и не аутентифицировался. */
+static bool conn_val_is_mask(JVal *v) {
+    return v && v->type == JV_STRING && !strcmp(v->s, CONN_SECRET_MASK);
+}
+
+static const char *conn_merge_config(Arena *a, JVal *base, JVal *over) {
+    if (base && base->type != JV_OBJECT) base = NULL;
+    if (over && over->type != JV_OBJECT) over = NULL;
+
+    JBuf jb; jb_init(&jb, a, 1024);
+    jb_obj_begin(&jb);
+    if (base) {
+        for (size_t i = 0; i < base->nkeys; i++) {
+            JVal *ov = over ? json_get(over, base->keys[i]) : NULL;
+            /* Маска сверху = «значение не присылали»: оставляем базовое. */
+            if (ov && !conn_val_is_mask(ov)) continue;
+            jb_key(&jb, base->keys[i]);
+            jval_serialize(&jb, base->vals[i]);
+        }
+    }
+    if (over) {
+        for (size_t i = 0; i < over->nkeys; i++) {
+            if (conn_val_is_mask(over->vals[i])) continue;   /* маска — не значение */
+            jb_key(&jb, over->keys[i]);
+            jval_serialize(&jb, over->vals[i]);
+        }
+    }
+    jb_obj_end(&jb);
+    return jb_done(&jb);
+}
+
+/* Коннектор на время шага. Для подключения из справочника это АРЕНДА постоянной
+ * сессии из пула (сессия переживает прогон и живёт дальше), для шага с
+ * инлайновым конфигом — как раньше, разовый экземпляр на прогон. */
+typedef struct {
+    ConnLease     *lease;      /* != NULL → сессия взята из пула */
+    ConnectorInst *inst;
+} StepConn;
+
+/* Держать сессию между прогонами имеет смысл только там, где она вообще есть:
+ * сетевой сеанс к СУБД или брокеру. Файловые и HTTP-коннекторы сессии не имеют,
+ * зато ЗАПОМИНАЮТ состояние в момент create() — например csv снимает схему по
+ * заголовку файла. Вечный контекст такого плагина читал бы завтрашний файл по
+ * вчерашним колонкам и молча раскладывал значения не в те поля. Поэтому для них
+ * экземпляр создаётся на прогон, как и раньше. */
+static bool connector_keeps_session(const char *type) {
+    return !strcmp(type, "postgresql") || !strcmp(type, "postgres")
+        || !strcmp(type, "greenplum")  || !strcmp(type, "oracle")
+        || !strcmp(type, "kafka");
+}
+
+static bool step_conn_open(StepConn *sc, const PipelineStep *st, const char *type,
+                           const char *so_path, const char *cfg, Arena *a,
+                           char *err, size_t errsz) {
+    sc->lease = NULL;
+    sc->inst  = NULL;
+    if (st->connection_id[0] && g_app.conn_pool && connector_keeps_session(type)) {
+        /* Для приёмника связь не проверяем: писать можно в ещё не созданный
+         * файл или таблицу, и ping там закономерно не проходит. */
+        sc->lease = conn_pool_acquire(g_app.conn_pool, st->connection_id,
+                                      so_path, cfg, !st->is_sink, err, errsz);
+        if (!sc->lease) return false;
+        sc->inst = conn_lease_inst(sc->lease);
+        if (!sc->inst) { conn_pool_release(sc->lease, false); sc->lease = NULL; return false; }
+        return true;
+    }
+    sc->inst = connector_load(so_path, cfg, a);
+    if (!sc->inst) { snprintf(err, errsz, "connector_load(%s) failed", so_path); return false; }
+    return true;
+}
+
+/* healthy=false после ошибки чтения/записи: постоянная сессия закрывается,
+ * чтобы следующий прогон не унаследовал неизвестное состояние. */
+static void step_conn_close(StepConn *sc, bool healthy) {
+    if (sc->lease) { conn_pool_release(sc->lease, healthy); sc->lease = NULL; sc->inst = NULL; return; }
+    if (sc->inst)  { connector_unload(sc->inst); sc->inst = NULL; }
+}
+
+/* ── Разрешение ссылки шага на подключение из справочника ────────────────────
+ * Когда у шага задан connection_id, тип и параметры доступа берутся из
+ * справочника, а инлайновый connector_config шага накладывается СВЕРХУ. Так
+ * пошаговые ключи (query / table / cursor_column / group_id …) остаются на шаге,
+ * а host/port/user/password живут в одном месте: смена пароля в справочнике
+ * подхватывается всеми конвейерами со следующего запуска.
+ *
+ * Пустой connection_id → возвращаются поля шага как есть (старое поведение,
+ * на нём работают YAML-конвейеры, MCP-сервер и интеграционные тесты).
+ *
+ * Результат живёт в арене прогона, поэтому слитый конфиг НЕ упирается в
+ * connector_config[1024] — а именно там длинные конфиги Kafka с TLS/SASL
+ * молча обрезались до битого JSON. */
+static int step_effective_connector(App *app, Arena *a, const PipelineStep *st,
+                                    const char **out_type, const char **out_cfg,
+                                    char *errbuf, size_t errsz) {
+    *out_type = st->connector_type;
+    *out_cfg  = st->connector_config;
+    if (!st->connection_id[0]) return 0;
+
+    char *raw = NULL;
+    if (catalog_load_connection(app->catalog, st->connection_id, &raw, a) != 0) {
+        snprintf(errbuf, errsz, "шаг %s: подключение '%s' не найдено в справочнике",
+                 st->id, st->connection_id);
+        return -1;
+    }
+    JVal *rec = json_parse(a, raw, strlen(raw));
+    if (!rec || rec->type != JV_OBJECT) {
+        snprintf(errbuf, errsz, "шаг %s: запись подключения '%s' повреждена",
+                 st->id, st->connection_id);
+        return -1;
+    }
+    const char *ctype = json_str(json_get(rec, "type"), "");
+    if (!ctype[0]) {
+        snprintf(errbuf, errsz, "шаг %s: у подключения '%s' не задан тип коннектора",
+                 st->id, st->connection_id);
+        return -1;
+    }
+    /* Тип берём из справочника: параметры и тип обязаны быть согласованы, а
+     * источник истины для пары «тип + параметры» — само подключение. */
+    *out_type = ctype;
+
+    JVal *over = st->connector_config[0]
+               ? json_parse(a, st->connector_config, strlen(st->connector_config))
+               : NULL;
+    *out_cfg = conn_merge_config(a, json_get(rec, "config"), over);
+    return 0;
+}
+
 /* ── SQL templates (see docs/SQL_TEMPLATES.md) ── */
 
 /* The effective SQL of a step: the resolved template/substituted SQL if present,
@@ -4955,13 +5098,44 @@ static const char *step_output(const PipelineStep *st) {
 
 /* A valid table name (keep [A-Za-z0-9_], drop the rest) from a pipeline name —
  * used to name the final result table when no target_table is given. */
+/* Кириллица → латиница (UTF-8, две байты на букву: 0xD0/0xD1 + хвост).
+ * Без этого русское название конвейера теряло ВСЕ символы, имя схлопывалось в
+ * пустое, и данные уходили в общую таблицу "result" — где следующий такой же
+ * конвейер их затирал. Возвращает длину записанного или 0, если это не буква. */
+static size_t translit_cyr(unsigned char b1, unsigned char b2, char *out) {
+    static const char *L[64] = {  /* А..Я  для 0xD0 0x90..0xBF */
+        "A","B","V","G","D","E","Zh","Z","I","J","K","L","M","N","O","P",
+        "R","S","T","U","F","H","Cz","Ch","Sh","Sch","","Y","","E","Yu","Ya",
+        "a","b","v","g","d","e","zh","z","i","j","k","l","m","n","o","p" };
+    static const char *L2[16] = { /* р..я для 0xD1 0x80..0x8F */
+        "r","s","t","u","f","h","cz","ch","sh","sch","","y","","e","yu","ya" };
+    const char *s = NULL;
+    if (b1 == 0xD0 && b2 >= 0x90 && b2 <= 0xBF)      s = L[b2 - 0x90];
+    else if (b1 == 0xD1 && b2 >= 0x80 && b2 <= 0x8F) s = L2[b2 - 0x80];
+    else if (b1 == 0xD0 && b2 == 0x81)               s = "E";   /* Ё */
+    else if (b1 == 0xD1 && b2 == 0x91)               s = "e";   /* ё */
+    if (!s) return 0;
+    size_t n = strlen(s);
+    memcpy(out, s, n);
+    return n;
+}
+
 static const char *sanitize_table_name(Arena *a, const char *name) {
-    char *out = arena_alloc(a, strlen(name ? name : "") + 1);
+    const char *src = name ? name : "";
+    /* Запас ×3: одна кириллическая буква даёт до трёх латинских (Sch). */
+    char *out = arena_alloc(a, strlen(src) * 3 + 1);
     size_t o = 0;
-    for (const char *p = name ? name : ""; *p; p++) {
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
         if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
-            (*p >= '0' && *p <= '9') || *p == '_')
-            out[o++] = *p;
+            (*p >= '0' && *p <= '9') || *p == '_') {
+            out[o++] = (char)*p;
+            continue;
+        }
+        if (*p >= 0xD0 && *p <= 0xD1 && p[1]) {      /* кириллица в UTF-8 */
+            size_t n = translit_cyr(p[0], p[1], out + o);
+            o += n;
+            p++;                                      /* второй байт пары */
+        }
     }
     out[o] = '\0';
     return o ? out : "result";
@@ -5175,8 +5349,13 @@ static void cursor_state_save(App *app, const char *pipeline_id, const char *ste
  * загруженных строк или -1 (ошибка read_batch — с причиной коннектора). */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *pipeline_id,
                               char *errbuf, size_t errsz) {
+    /* Тип и базовый конфиг — из справочника подключений, если шаг на него ссылается. */
+    const char *eff_type = NULL, *eff_cfg = NULL;
+    if (step_effective_connector(app, a, st, &eff_type, &eff_cfg, errbuf, errsz) != 0)
+        return -1;
+
     char so_path[1024];
-    const char *conn = connector_so_name(st->connector_type);
+    const char *conn = connector_so_name(eff_type);
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
              app->plugins_dir, conn);
 
@@ -5185,10 +5364,10 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
      * independently. A single shared default consumer group let the first reader
      * commit the topic's offsets and the next read 0 already-consumed messages
      * with a silent green success (S18). An explicit group_id still wins. */
-    const char *load_cfg = st->connector_config;
-    if (!strcmp(conn, "kafka") && st->connector_config[0]
-        && !strstr(st->connector_config, "group_id")) {
-        const char *cc = st->connector_config;
+    const char *load_cfg = eff_cfg;
+    if (!strcmp(conn, "kafka") && eff_cfg[0]
+        && !strstr(eff_cfg, "group_id")) {
+        const char *cc = eff_cfg;
         const char *close = strrchr(cc, '}');
         if (close) {
             size_t n = strlen(cc) + 160;
@@ -5199,19 +5378,17 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
         }
     }
 
-    ConnectorInst *inst = connector_load(so_path, load_cfg, a);
-    if (!inst) {
-        snprintf(errbuf, errsz, "connector_load(%s) failed", so_path);
-        return -1;
-    }
+    StepConn sc;
+    if (!step_conn_open(&sc, st, eff_type, so_path, load_cfg, a, errbuf, errsz)) return -1;
+    ConnectorInst *inst = sc.inst;
     const DfoConnector *api = connector_api(inst);
     void *ctx = connector_ctx(inst);
 
     /* Source: prefer the connector config's "query"/"table" (the «Запрос к
      * источнику»); fall back to the step's transform_sql for older pipelines. */
     const char *src = step_sql(st);
-    if (st->connector_config[0]) {
-        JVal *cc = json_parse(a, st->connector_config, strlen(st->connector_config));
+    if (eff_cfg[0]) {
+        JVal *cc = json_parse(a, eff_cfg, strlen(eff_cfg));
         if (cc && cc->type == JV_OBJECT) {
             const char *q = json_str(json_get(cc, "query"), "");
             const char *t = json_str(json_get(cc, "table"), "");
@@ -5230,8 +5407,8 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
      * must reuse that value for the next page AND persist it across runs so the
      * next run starts where this one stopped, rather than re-reading everything. */
     bool incremental = false;
-    if (st->connector_config[0]) {
-        JVal *cc2 = json_parse(a, st->connector_config, strlen(st->connector_config));
+    if (eff_cfg[0]) {
+        JVal *cc2 = json_parse(a, eff_cfg, strlen(eff_cfg));
         if (cc2 && cc2->type == JV_OBJECT) {
             const char *ccol = json_str(json_get(cc2, "cursor_column"), "");
             if (ccol[0]) incremental = true;
@@ -5277,7 +5454,7 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
             snprintf(errbuf, errsz, "connector step %s: read_batch failed%s%s", st->id,
                      (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
             arena_destroy(pa);
-            connector_unload(inst);
+            step_conn_close(&sc, false);   /* ошибка чтения → сессию не переиспользуем */
             return -1;
         }
         if (!batch || batch->nrows == 0) {
@@ -5383,15 +5560,15 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
         cursor_state_save(app, pipeline_id, st->id, step_output(st), cursor_buf);
 
     if (table_created)
-        catalog_update_table_meta(app->catalog, step_output(st), st->connector_type, (int64_t)total_rows);
+        catalog_update_table_meta(app->catalog, step_output(st), eff_type, (int64_t)total_rows);
 
-    connector_unload(inst);
+    step_conn_close(&sc, true);    /* успех → постоянная сессия остаётся жить в пуле */
     /* Count rows ingested from a source into "Строк загружено" + the per-minute ring. */
     if (app->metrics && total_rows > 0) {
         app->metrics->total_rows += total_rows;
         metrics_push(&app->metrics->rows_ingested, (double)total_rows);
     }
-    LOG_INFO("connector step '%s' → %s: %d rows", st->connector_type, step_output(st), total_rows);
+    LOG_INFO("connector step '%s' → %s: %d rows", eff_type, step_output(st), total_rows);
     return total_rows;
 }
 
@@ -5407,21 +5584,26 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         return -1;
     }
     /* 1. Load the sink connector (once per step; moved before the read loop). */
-    const char *conn = connector_so_name(st->connector_type);
+    const char *eff_type = NULL, *eff_cfg = NULL;
+    if (step_effective_connector(app, a, st, &eff_type, &eff_cfg, errbuf, errsz) != 0)
+        return -1;
+    const char *conn = connector_so_name(eff_type);
     char so_path[1024];
     snprintf(so_path, sizeof(so_path), "%s/%s_connector.so", app->plugins_dir, conn);
-    ConnectorInst *inst = connector_load(so_path, st->connector_config, a);
-    if (!inst) {
-        snprintf(errbuf, errsz, "sink step %s: connector_load(%s) failed — проверьте connector_config",
-                 st->id, so_path);
+    StepConn sc;
+    if (!step_conn_open(&sc, st, eff_type, so_path, eff_cfg, a, errbuf, errsz)) {
+        if (!errbuf[0])
+            snprintf(errbuf, errsz, "sink step %s: connector_load(%s) failed — проверьте connector_config",
+                     st->id, so_path);
         return -1;
     }
+    ConnectorInst *inst = sc.inst;
     const DfoConnector *api = connector_api(inst);
     void *ctx = connector_ctx(inst);
     if (api->abi_version < 2 || !api->write_batch) {
-        connector_unload(inst);
+        step_conn_close(&sc, false);
         snprintf(errbuf, errsz, "sink step %s: коннектор '%s' не поддерживает запись (write_batch)",
-                 st->id, st->connector_type);
+                 st->id, eff_type);
         return -1;
     }
 
@@ -5480,7 +5662,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     Stmt *stmt = sql_parse(pa, psql, strlen(psql));
     if (stmt->error) {
         snprintf(errbuf, errsz, "sink step %s: parse: %s", st->id, stmt->error);
-        arena_destroy(pa); connector_unload(inst);
+        arena_destroy(pa); step_conn_close(&sc, false);
         return -1;
     }
     tl_exec_error[0] = '\0';
@@ -5491,12 +5673,12 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
          * source, which yields a valid 0-row rs and takes the success path. */
         snprintf(errbuf, errsz, "sink step %s: %s", st->id, tl_exec_error);
         tl_exec_error[0] = '\0';
-        arena_destroy(pa); connector_unload(inst);
+        arena_destroy(pa); step_conn_close(&sc, false);
         return -1;
     }
     if (!rs) {
         snprintf(errbuf, errsz, "sink step %s: исходный SELECT вернул NULL", st->id);
-        arena_destroy(pa); connector_unload(inst);
+        arena_destroy(pa); step_conn_close(&sc, false);
         return -1;
     }
     if (rs->truncated) {
@@ -5507,7 +5689,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         snprintf(errbuf, errsz, "sink step %s: запрос с сортировкой/агрегацией на > %d строк "
                  "не может быть выгружен полностью — уберите ORDER BY/DISTINCT или сузьте выборку.",
                  st->id, MAX_RS_ROWS);
-        arena_destroy(pa); connector_unload(inst);
+        arena_destroy(pa); step_conn_close(&sc, false);
         return -1;
     }
 
@@ -5534,7 +5716,11 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     batch.schema = schema; batch.ncols = rs->ncols;
     for (int c = 0; c < rs->ncols; c++) batch.values[c] = cv[c];
 
-    int total = 0, first = 1;
+    /* ВНИМАНИЕ: здесь НЕЛЬЗЯ заводить свои total/first — они объявлены снаружи
+     * страничного цикла. Локальные копии перекрывали внешние, из-за чего
+     * шаг-приёмник всегда возвращал 0 строк, а флаг first сбрасывался на каждой
+     * странице: в режиме overwrite каждая следующая страница затирала
+     * предыдущую, и от выгрузки больше SINK_PAGE строк оставался только хвост. */
     for (int r = 0; r < rs->nrows; r++) {
         for (int c = 0; c < rs->ncols; c++) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
@@ -5558,7 +5744,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
                 const char *why = api->last_error ? api->last_error(ctx) : NULL;
                 snprintf(errbuf, errsz, "sink step %s: write_batch failed%s%s", st->id,
                          (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
-                arena_destroy(pa); connector_unload(inst); return -1; }
+                arena_destroy(pa); step_conn_close(&sc, false); return -1; }
             total += batch.nrows; batch.nrows = 0; first = 0;
         }
     }
@@ -5570,7 +5756,7 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
             const char *why = api->last_error ? api->last_error(ctx) : NULL;
             snprintf(errbuf, errsz, "sink step %s: write_batch failed%s%s", st->id,
                      (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
-            arena_destroy(pa); connector_unload(inst); return -1; }
+            arena_destroy(pa); step_conn_close(&sc, false); return -1; }
         total += batch.nrows; first = 0;
     }
 
@@ -5579,8 +5765,8 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     if (user_limited || (long long)page_rows < page_lim) break;
     }  /* конец страничного цикла */
 
-    connector_unload(inst);
-    LOG_INFO("sink step '%s' → %s:%s: %d rows (%s)", st->id, st->connector_type,
+    step_conn_close(&sc, true);   /* успех → постоянная сессия остаётся жить */
+    LOG_INFO("sink step '%s' → %s:%s: %d rows (%s)", st->id, eff_type,
              entity, total, st->sink_mode[0] ? st->sink_mode : "append");
     return total;
 }
@@ -7042,7 +7228,9 @@ static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, 
                     total_rows += n;
                     st->status = STEP_SUCCESS;
                 }
-            } else if (st->connector_type[0]) {
+            } else if (st->connector_type[0] || st->connection_id[0]) {
+                /* connection_id без connector_type — шаг, целиком опирающийся на
+                 * справочник подключений: тип возьмётся оттуда при запуске. */
                 int n = run_connector_step(app, a, st, p->id, p->error_msg, sizeof(p->error_msg));
                 if (n < 0) {
                     st->status = STEP_FAILED;
@@ -7665,35 +7853,53 @@ static ConnectorInst *load_connector_by_type(Arena *a, const char *type,
 
 /* POST /api/connector/probe/entities — грузит коннектор по type+config и
  * возвращает список доступных сущностей (таблиц/потоков). */
+/* Извлекает из тела пробы эффективные тип и конфиг. Тело может нести:
+ *   {"type":…, "config":{…}}           — всё пришло от UI (старая форма);
+ *   {"connection_id":…, "config":{…}}  — параметры доступа берутся из
+ *                                        справочника, config кладётся сверху.
+ * Вторая форма обязательна: UI видит секреты только как "********" и физически
+ * не может прислать настоящий пароль обратно, поэтому проба подключения,
+ * выбранного из справочника, работает лишь при слиянии на сервере.
+ * Побочно чинит старую беду проб: раньше вложенные объекты/массивы в config
+ * превращались в null, теперь сериализация рекурсивная. */
+static int probe_effective(Arena *a, JVal *root, const char **out_type,
+                           const char **out_cfg, const char **err) {
+    JVal *cfg_v = json_get(root, "config");
+    if (cfg_v && cfg_v->type == JV_STRING)
+        cfg_v = json_parse(a, cfg_v->s, strlen(cfg_v->s));
+
+    const char *cid = json_str(json_get(root, "connection_id"), "");
+    if (cid[0]) {
+        char *raw = NULL;
+        if (catalog_load_connection(g_app.catalog, cid, &raw, a) != 0) {
+            *err = "подключение не найдено в справочнике"; return -1;
+        }
+        JVal *rec = json_parse(a, raw, strlen(raw));
+        if (!rec || rec->type != JV_OBJECT) {
+            *err = "запись подключения повреждена"; return -1;
+        }
+        const char *t = json_str(json_get(rec, "type"), "");
+        if (!t[0]) { *err = "у подключения не задан тип коннектора"; return -1; }
+        *out_type = t;
+        *out_cfg  = conn_merge_config(a, json_get(rec, "config"), cfg_v);
+        return 0;
+    }
+
+    const char *t = json_str(json_get(root, "type"), "");
+    if (!t[0]) { *err = "missing type"; return -1; }
+    *out_type = t;
+    *out_cfg  = conn_merge_config(a, NULL, cfg_v);
+    return 0;
+}
+
 static void h_connector_probe_entities(HttpReq *req, HttpResp *resp) {
     Arena *a = arena_create(65536);
     JVal *root = json_parse(a, req->body, req->body_len);
     if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
 
-    const char *type = json_str(json_get(root,"type"), "");
-    if (!type[0]) { http_resp_error(resp,400,"missing type"); arena_destroy(a); return; }
-
-    /* config may be object or string */
-    JVal *cfg_v = json_get(root,"config");
-    const char *cfg_json = "{}";
-    if (cfg_v) {
-        if (cfg_v->type == JV_STRING) {
-            cfg_json = json_str(cfg_v, "{}");
-        } else if (cfg_v->type == JV_OBJECT) {
-            /* Serialize object back to JSON string */
-            JBuf jb; jb_init(&jb, a, 512);
-            jb_obj_begin(&jb);
-            for (size_t i = 0; i < cfg_v->nkeys; i++) {
-                jb_key(&jb, cfg_v->keys[i]);
-                JVal *vv = cfg_v->vals[i];
-                if (vv->type == JV_STRING)       jb_strn(&jb, vv->s, vv->len);
-                else if (vv->type == JV_NUMBER)  jb_double(&jb, vv->n);
-                else if (vv->type == JV_BOOL)    jb_bool(&jb, vv->b);
-                else                             jb_null(&jb);
-            }
-            jb_obj_end(&jb);
-            cfg_json = jb_done(&jb);
-        }
+    const char *type = NULL, *cfg_json = NULL, *perr = NULL;
+    if (probe_effective(a, root, &type, &cfg_json, &perr) != 0) {
+        http_resp_error(resp,400,perr); arena_destroy(a); return;
     }
 
     ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
@@ -7727,25 +7933,15 @@ static void h_connector_probe_ping(HttpReq *req, HttpResp *resp) {
     Arena *a = arena_create(16384);
     JVal *root = json_parse(a, req->body, req->body_len);
     if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
-    const char *type = json_str(json_get(root,"type"), "");
-    if (!type[0]) { http_resp_error(resp,400,"missing type"); arena_destroy(a); return; }
-
-    /* config may be object or string */
-    JVal *cfg_v = json_get(root,"config");
-    const char *cfg_json = "{}";
-    if (cfg_v && cfg_v->type == JV_STRING) {
-        cfg_json = json_str(cfg_v, "{}");
-    } else if (cfg_v && cfg_v->type == JV_OBJECT) {
-        JBuf jb; jb_init(&jb, a, 512); jb_obj_begin(&jb);
-        for (size_t i = 0; i < cfg_v->nkeys; i++) {
-            jb_key(&jb, cfg_v->keys[i]);
-            JVal *vv = cfg_v->vals[i];
-            if (vv->type == JV_STRING)      jb_strn(&jb, vv->s, vv->len);
-            else if (vv->type == JV_NUMBER) jb_double(&jb, vv->n);
-            else if (vv->type == JV_BOOL)   jb_bool(&jb, vv->b);
-            else                            jb_null(&jb);
-        }
-        jb_obj_end(&jb); cfg_json = jb_done(&jb);
+    const char *type = NULL, *cfg_json = NULL, *perr = NULL;
+    if (probe_effective(a, root, &type, &cfg_json, &perr) != 0) {
+        JBuf eb; jb_init(&eb, a, 256);
+        jb_obj_begin(&eb);
+        jb_key(&eb,"ok");    jb_bool(&eb, false);
+        jb_key(&eb,"error"); jb_str(&eb, perr);
+        jb_obj_end(&eb);
+        http_resp_json(resp, 200, (char *)jb_done(&eb));
+        arena_destroy(a); return;
     }
 
     ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
@@ -7782,25 +7978,25 @@ static void h_connector_probe_preview(HttpReq *req, HttpResp *resp) {
     Arena *a = arena_create(1<<20);
     JVal *root = json_parse(a, req->body, req->body_len);
     if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
-    const char *type  = json_str(json_get(root,"type"), "");
     const char *query = json_str(json_get(root,"query"), "");
-    if (!type[0]) { http_resp_error(resp,400,"missing type"); arena_destroy(a); return; }
     int limit = (int)json_int(json_get(root,"limit"), 100);
     if (limit <= 0 || limit > 1000) limit = 100;
 
-    JVal *cfg_v = json_get(root,"config");
-    const char *cfg_json = "{}";
-    if (cfg_v && cfg_v->type == JV_STRING) cfg_json = json_str(cfg_v, "{}");
-    else if (cfg_v && cfg_v->type == JV_OBJECT) {
-        JBuf jb; jb_init(&jb, a, 512); jb_obj_begin(&jb);
-        for (size_t i = 0; i < cfg_v->nkeys; i++) {
-            jb_key(&jb, cfg_v->keys[i]); JVal *vv = cfg_v->vals[i];
-            if (vv->type == JV_STRING)      jb_strn(&jb, vv->s, vv->len);
-            else if (vv->type == JV_NUMBER) jb_double(&jb, vv->n);
-            else if (vv->type == JV_BOOL)   jb_bool(&jb, vv->b);
-            else                            jb_null(&jb);
+    const char *type = NULL, *cfg_json = NULL, *perr = NULL;
+    if (probe_effective(a, root, &type, &cfg_json, &perr) != 0) {
+        http_resp_error(resp,400,perr); arena_destroy(a); return;
+    }
+
+    /* Запрос не прислали — берём его из слитого конфига, как это делает шаг при
+     * запуске (query/table). Иначе предпросмотр по одному connection_id не знал
+     * бы, что читать, хотя в подключении это задано. */
+    if (!query[0]) {
+        JVal *mc = json_parse(a, cfg_json, strlen(cfg_json));
+        if (mc && mc->type == JV_OBJECT) {
+            const char *q = json_str(json_get(mc, "query"), "");
+            const char *t = json_str(json_get(mc, "table"), "");
+            query = q[0] ? q : t;
         }
-        jb_obj_end(&jb); cfg_json = jb_done(&jb);
     }
 
     ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
@@ -7867,29 +8063,14 @@ static void h_connector_probe_schema(HttpReq *req, HttpResp *resp) {
     JVal *root = json_parse(a, req->body, req->body_len);
     if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
 
-    const char *type   = json_str(json_get(root,"type"), "");
     const char *entity = json_str(json_get(root,"entity"), "");
-    if (!type[0] || !entity[0]) {
-        http_resp_error(resp,400,"missing type or entity"); arena_destroy(a); return;
+    if (!entity[0]) {
+        http_resp_error(resp,400,"missing entity"); arena_destroy(a); return;
     }
 
-    JVal *cfg_v = json_get(root,"config");
-    const char *cfg_json = "{}";
-    if (cfg_v && cfg_v->type == JV_OBJECT) {
-        JBuf jb; jb_init(&jb, a, 512);
-        jb_obj_begin(&jb);
-        for (size_t i = 0; i < cfg_v->nkeys; i++) {
-            jb_key(&jb, cfg_v->keys[i]);
-            JVal *vv = cfg_v->vals[i];
-            if (vv->type == JV_STRING)       jb_strn(&jb, vv->s, vv->len);
-            else if (vv->type == JV_NUMBER)  jb_double(&jb, vv->n);
-            else if (vv->type == JV_BOOL)    jb_bool(&jb, vv->b);
-            else                             jb_null(&jb);
-        }
-        jb_obj_end(&jb);
-        cfg_json = jb_done(&jb);
-    } else if (cfg_v && cfg_v->type == JV_STRING) {
-        cfg_json = json_str(cfg_v, "{}");
+    const char *type = NULL, *cfg_json = NULL, *perr = NULL;
+    if (probe_effective(a, root, &type, &cfg_json, &perr) != 0) {
+        http_resp_error(resp,400,perr); arena_destroy(a); return;
     }
 
     ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
@@ -8374,6 +8555,354 @@ static void h_cluster_status(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, buf);
 }
 
+/* ══ Справочник подключений к внешним системам ═══════════════════════════════
+ * Подключение — именованная пара «тип коннектора + параметры доступа», на
+ * которую шаг конвейера ссылается через connection_id. Запись хранится целиком
+ * как JSON в таблице connections каталога:
+ *   {id,name,type,config,created_at,updated_at}
+ *
+ * Роли у подключения НЕТ: это просто доступ к системе. Будет она источником или
+ * приёмником — решает шаг конвейера, он же задаёт запрос к данным (что читать
+ * или куда писать). Раньше здесь хранилось поле direction; оно убрано, а из
+ * старых записей вычищается миграцией при старте.
+ *
+ * config тут без потолка (TEXT в SQLite), в отличие от
+ * PipelineStep.connector_config[1024], который на длинных конфигах Kafka с
+ * TLS/SASL молча обрезается.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Ключи конфига, значения которых нельзя отдавать в UI открытым текстом
+ * (см. схемы плагинов в каталоге lib/connector/plugins). */
+static bool conn_key_is_secret(const char *k) {
+    static const char *SECRETS[] = {
+        "password", "siebel_password", "auth_token", "sasl_password",
+        "ssl_key_password", "schema_registry_auth", NULL
+    };
+    for (int i = 0; SECRETS[i]; i++) if (!strcmp(k, SECRETS[i])) return true;
+    return false;
+}
+
+/* jb_key не экранирует имя ключа (lib/core/json.c), поэтому ключи конфига
+ * ограничиваем безопасным алфавитом — иначе имя с кавычкой ломает JSON. */
+static bool conn_key_is_safe(const char *k) {
+    if (!k || !k[0] || strlen(k) > 64) return false;
+    for (const char *p = k; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '.' && *p != '-')
+            return false;
+    return true;
+}
+
+static bool conn_type_is_known(const char *t) {
+    static const char *TYPES[] = {
+        "csv", "parquet", "json_http", "postgresql", "postgres", "greenplum",
+        "oracle", "kafka", "siebel", "soap", "xml", NULL
+    };
+    for (int i = 0; TYPES[i]; i++) if (!strcmp(t, TYPES[i])) return true;
+    return false;
+}
+
+
+/* Пишет config, подменяя НЕПУСТЫЕ секреты на CONN_SECRET_MASK. Пустой секрет
+ * остаётся пустым, чтобы UI отличал «пароль задан» от «пароля нет». */
+static void conn_write_config_masked(JBuf *jb, JVal *cfg) {
+    if (!cfg || cfg->type != JV_OBJECT) { jb_raw(jb, "{}"); return; }
+    jb_obj_begin(jb);
+    for (size_t i = 0; i < cfg->nkeys; i++) {
+        jb_key(jb, cfg->keys[i]);
+        JVal *v = cfg->vals[i];
+        if (conn_key_is_secret(cfg->keys[i])) {
+            const char *s = (v && v->type == JV_STRING) ? v->s : "";
+            jb_str(jb, (s && s[0]) ? CONN_SECRET_MASK : "");
+        } else {
+            jval_serialize(jb, v);
+        }
+    }
+    jb_obj_end(jb);
+}
+
+/* Отдаёт запись наружу: всё как в хранилище, но config замаскирован. */
+static void conn_write_public(JBuf *jb, JVal *rec) {
+    jb_obj_begin(jb);
+    for (size_t i = 0; i < rec->nkeys; i++) {
+        if (!strcmp(rec->keys[i], "direction")) continue;   /* поле упразднено */
+        jb_key(jb, rec->keys[i]);
+        if (!strcmp(rec->keys[i], "config")) conn_write_config_masked(jb, rec->vals[i]);
+        else                                 jval_serialize(jb, rec->vals[i]);
+    }
+    /* Живое состояние постоянной сессии из пула — чтобы в разделе «Подключения»
+     * было видно, подключено сейчас или нет, а не только в момент прогона. */
+    const char *state = NULL, *lerr = NULL; int64_t lok = 0;
+    int live = conn_pool_status(g_app.conn_pool, json_str(json_get(rec, "id"), ""),
+                                &state, &lok, &lerr);
+    jb_key(jb, "status");   jb_str(jb, state ? state : "idle");
+    jb_key(jb, "sessions"); jb_int(jb, live);
+    jb_key(jb, "last_ok");  jb_int(jb, lok);
+    if (lerr && lerr[0]) { jb_key(jb, "last_error"); jb_str(jb, lerr); }
+    jb_obj_end(jb);
+}
+
+/* Склеивает присланный config с сохранённым: секрет, пришедший пустым или
+ * равным маске, берётся из прежней записи («поле не трогали»). */
+static void conn_write_config_merged(JBuf *jb, JVal *incoming, JVal *stored_cfg) {
+    jb_obj_begin(jb);
+    if (incoming && incoming->type == JV_OBJECT) {
+        for (size_t i = 0; i < incoming->nkeys; i++) {
+            const char *k = incoming->keys[i];
+            JVal *v = incoming->vals[i];
+            jb_key(jb, k);
+            if (conn_key_is_secret(k)) {
+                const char *s = (v && v->type == JV_STRING) ? v->s : "";
+                if (!s[0] || !strcmp(s, CONN_SECRET_MASK)) {
+                    JVal *old = stored_cfg ? json_get(stored_cfg, k) : NULL;
+                    const char *os = (old && old->type == JV_STRING) ? old->s : "";
+                    jb_str(jb, os);
+                    continue;
+                }
+            }
+            jval_serialize(jb, v);
+        }
+    }
+    jb_obj_end(jb);
+}
+
+/* Общая часть POST и PUT: валидация тела, слияние с прежней записью, запись в
+ * каталог. Возвращает 0 и кладёт в *out_public замаскированный JSON ответа;
+ * при ошибке возвращает HTTP-код и текст в *err. */
+static int conn_save(Arena *a, const char *id, JVal *body, JVal *stored,
+                     char **out_public, const char **err) {
+    const char *name = json_str(json_get(body, "name"), "");
+    const char *type = json_str(json_get(body, "type"), "");
+    if (!name[0]) { *err = "missing name"; return 400; }
+    if (!type[0]) { *err = "missing type"; return 400; }
+    if (!conn_type_is_known(type)) { *err = "unknown connector type"; return 400; }
+
+    JVal *cfg = json_get(body, "config");
+    if (cfg && cfg->type == JV_OBJECT) {
+        for (size_t i = 0; i < cfg->nkeys; i++)
+            if (!conn_key_is_safe(cfg->keys[i])) { *err = "invalid config key"; return 400; }
+    }
+
+    JVal *stored_cfg = stored ? json_get(stored, "config") : NULL;
+    int64_t now = (int64_t)time(NULL);
+    int64_t created = stored ? (int64_t)json_int(json_get(stored, "created_at"), now) : now;
+
+    /* Полная запись — уходит в каталог как есть, с настоящими секретами. */
+    JBuf full; jb_init(&full, a, 1024);
+    jb_obj_begin(&full);
+    jb_key(&full, "id");         jb_str(&full, id);
+    jb_key(&full, "name");       jb_str(&full, name);
+    jb_key(&full, "type");       jb_str(&full, type);
+    jb_key(&full, "config");     conn_write_config_merged(&full, cfg, stored_cfg);
+    jb_key(&full, "created_at"); jb_int(&full, created);
+    jb_key(&full, "updated_at"); jb_int(&full, now);
+    jb_obj_end(&full);
+    const char *full_json = jb_done(&full);
+
+    if (catalog_save_connection(g_app.catalog, id, full_json) != 0) {
+        *err = "save failed"; return 500;
+    }
+    /* Параметры доступа могли измениться — рвём постоянные сессии, иначе
+     * прежний пароль/адрес «залипнет» в живом соединении. */
+    conn_pool_invalidate(g_app.conn_pool, id);
+
+    /* Ответ — та же запись, но с замаскированными секретами. */
+    JVal *rec = json_parse(a, full_json, strlen(full_json));
+    JBuf pub; jb_init(&pub, a, 1024);
+    if (rec && rec->type == JV_OBJECT) conn_write_public(&pub, rec);
+    else                               jb_raw(&pub, "{}");
+    *out_public = (char *)jb_done(&pub);
+    return 0;
+}
+
+/* Разовая миграция справочника: вычистить упразднённое поле direction из
+ * сохранённых записей. Идемпотентна — записи без поля не трогает. Вызывается
+ * один раз при старте гейтвея. */
+void api_connections_migrate(void) {
+    if (!g_app.catalog) return;
+    Arena *a = arena_create(65536);
+    char *raw = NULL;
+    if (catalog_list_connections(g_app.catalog, &raw, a) != 0 || !raw) {
+        arena_destroy(a); return;
+    }
+    JVal *arr = json_parse(a, raw, strlen(raw));
+    if (!arr || arr->type != JV_ARRAY) { arena_destroy(a); return; }
+
+    int fixed = 0;
+    for (size_t i = 0; i < arr->nitems; i++) {
+        JVal *rec = arr->items[i];
+        if (!rec || rec->type != JV_OBJECT) continue;
+        if (!json_get(rec, "direction")) continue;          /* уже чистая */
+        const char *id = json_str(json_get(rec, "id"), "");
+        if (!id[0]) continue;
+
+        JBuf jb; jb_init(&jb, a, 1024);
+        jb_obj_begin(&jb);
+        for (size_t k = 0; k < rec->nkeys; k++) {
+            if (!strcmp(rec->keys[k], "direction")) continue;
+            jb_key(&jb, rec->keys[k]);
+            jval_serialize(&jb, rec->vals[k]);
+        }
+        jb_obj_end(&jb);
+        if (catalog_save_connection(g_app.catalog, id, jb_done(&jb)) == 0) fixed++;
+    }
+    if (fixed)
+        LOG_INFO("справочник подключений: убрано упразднённое поле direction в %d записях", fixed);
+    arena_destroy(a);
+}
+
+/* Обслуживание пула постоянных сессий: пинг простаивающих + ПРОГРЕВ — открытие
+ * сессии для подключений, у которых её ещё нет. Благодаря прогреву соединение
+ * существует постоянно, а не только на время запуска конвейера. Вызывается
+ * фоновым потоком гейтвея (см. main.c), поэтому недоступная система задерживает
+ * только этот поток, а не старт и не конвейеры. */
+void api_conn_pool_maintain(void) {
+    if (!g_app.conn_pool || !g_app.catalog) return;
+
+    conn_pool_tick(g_app.conn_pool);      /* keepalive уже открытых */
+
+    Arena *a = arena_create(65536);
+    char *raw = NULL;
+    if (catalog_list_connections(g_app.catalog, &raw, a) != 0 || !raw) {
+        arena_destroy(a); return;
+    }
+    JVal *arr = json_parse(a, raw, strlen(raw));
+    if (!arr || arr->type != JV_ARRAY) { arena_destroy(a); return; }
+
+    /* Обход ограничен по числу попыток за тик: подключений может быть много, а
+     * коннект к недоступной системе упирается в таймаут. Без предела один тик
+     * растягивался бы на минуты, и статусы остальных подключений не обновлялись
+     * бы вовсе. Остальные проверятся на следующем тике. */
+    const int MAX_WARMUP_PER_TICK = 8;
+    int attempts = 0;
+
+    for (size_t i = 0; i < arr->nitems && attempts < MAX_WARMUP_PER_TICK; i++) {
+        JVal *rec = arr->items[i];
+        if (!rec || rec->type != JV_OBJECT) continue;
+        const char *id   = json_str(json_get(rec, "id"), "");
+        const char *type = json_str(json_get(rec, "type"), "");
+        if (!id[0] || !type[0]) continue;
+
+        const char *state = NULL;
+        conn_pool_status(g_app.conn_pool, id, &state, NULL, NULL);
+        if (state && !strcmp(state, "ok")) continue;   /* сессия уже живая */
+        attempts++;
+
+        char so_path[1024];
+        snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
+                 g_app.plugins_dir, connector_so_name(type));
+        const char *cfg = conn_merge_config(a, json_get(rec, "config"), NULL);
+
+        char err[256] = {0};
+        ConnLease *l = conn_pool_acquire(g_app.conn_pool, id, so_path, cfg, true, err, sizeof(err));
+        if (l) conn_pool_release(l, true);       /* сразу вернули — сессия осталась жить */
+    }
+    arena_destroy(a);
+}
+
+/* GET /api/connections — весь справочник одним массивом, секреты замаскированы. */
+static void h_connections_list(HttpReq *req, HttpResp *resp) {
+    (void)req;
+    Arena *a = arena_create(65536);
+    char *raw = NULL;
+    if (catalog_list_connections(g_app.catalog, &raw, a) != 0 || !raw) {
+        http_resp_error(resp, 500, "list failed"); arena_destroy(a); return;
+    }
+    JVal *arr = json_parse(a, raw, strlen(raw));
+    JBuf jb; jb_init(&jb, a, 4096);
+    jb_arr_begin(&jb);
+    if (arr && arr->type == JV_ARRAY)
+        for (size_t i = 0; i < arr->nitems; i++)
+            if (arr->items[i] && arr->items[i]->type == JV_OBJECT)
+                conn_write_public(&jb, arr->items[i]);
+    jb_arr_end(&jb);
+    http_resp_json(resp, 200, (char *)jb_done(&jb));
+    arena_destroy(a);
+}
+
+/* GET /api/connections/:id */
+static void h_connection_get(HttpReq *req, HttpResp *resp) {
+    const char *id = hm_get(&req->params, "id");
+    if (!id || !id[0]) { http_resp_error(resp, 400, "missing id"); return; }
+    Arena *a = arena_create(16384);
+    char *raw = NULL;
+    if (catalog_load_connection(g_app.catalog, id, &raw, a) != 0) {
+        http_resp_error(resp, 404, "connection not found"); arena_destroy(a); return;
+    }
+    JVal *rec = json_parse(a, raw, strlen(raw));
+    if (!rec || rec->type != JV_OBJECT) {
+        http_resp_error(resp, 500, "corrupt record"); arena_destroy(a); return;
+    }
+    JBuf jb; jb_init(&jb, a, 1024);
+    conn_write_public(&jb, rec);
+    http_resp_json(resp, 200, (char *)jb_done(&jb));
+    arena_destroy(a);
+}
+
+/* POST /api/connections — создание. id можно передать свой, иначе генерится. */
+static void h_connection_create(HttpReq *req, HttpResp *resp) {
+    if (!req->body || !req->body_len) { http_resp_error(resp, 400, "empty body"); return; }
+    Arena *a = arena_create(32768);
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) {
+        http_resp_error(resp, 400, "invalid json"); arena_destroy(a); return;
+    }
+    char id[64];
+    const char *want = json_str(json_get(body, "id"), "");
+    if (want[0]) {
+        if (!conn_key_is_safe(want)) {
+            http_resp_error(resp, 400, "invalid id"); arena_destroy(a); return;
+        }
+        snprintf(id, sizeof(id), "%s", want);
+    } else {
+        static volatile int _cid_seq = 0;
+        int seq = __atomic_fetch_add(&_cid_seq, 1, __ATOMIC_RELAXED);
+        snprintf(id, sizeof(id), "c_%lld_%d", (long long)time(NULL), seq);
+    }
+
+    char *pub = NULL; const char *err = NULL;
+    int rc = conn_save(a, id, body, NULL, &pub, &err);
+    if (rc != 0) { http_resp_error(resp, rc, err); arena_destroy(a); return; }
+    http_resp_json(resp, 201, pub);
+    arena_destroy(a);
+}
+
+/* PUT /api/connections/:id — идемпотентное обновление (без DELETE+POST, чтобы
+ * ссылающиеся конвейеры ни на мгновение не оставались с битой ссылкой). */
+static void h_connection_update(HttpReq *req, HttpResp *resp) {
+    const char *id = hm_get(&req->params, "id");
+    if (!id || !id[0]) { http_resp_error(resp, 400, "missing id"); return; }
+    if (!req->body || !req->body_len) { http_resp_error(resp, 400, "empty body"); return; }
+    Arena *a = arena_create(32768);
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) {
+        http_resp_error(resp, 400, "invalid json"); arena_destroy(a); return;
+    }
+    char *raw = NULL;
+    if (catalog_load_connection(g_app.catalog, id, &raw, a) != 0) {
+        http_resp_error(resp, 404, "connection not found"); arena_destroy(a); return;
+    }
+    JVal *stored = json_parse(a, raw, strlen(raw));
+
+    char *pub = NULL; const char *err = NULL;
+    int rc = conn_save(a, id, body, stored, &pub, &err);
+    if (rc != 0) { http_resp_error(resp, rc, err); arena_destroy(a); return; }
+    http_resp_json(resp, 200, pub);
+    arena_destroy(a);
+}
+
+/* DELETE /api/connections/:id. Шаги, ссылавшиеся на удалённое подключение, при
+ * запуске упадут с внятной ошибкой (см. step_resolve_connection) — молча
+ * подставлять пустой конфиг и лезть в localhost:5432 хуже. */
+static void h_connection_delete(HttpReq *req, HttpResp *resp) {
+    const char *id = hm_get(&req->params, "id");
+    if (!id || !id[0]) { http_resp_error(resp, 400, "missing id"); return; }
+    if (catalog_delete_connection(g_app.catalog, id) != 0) {
+        http_resp_error(resp, 500, "delete failed"); return;
+    }
+    conn_pool_invalidate(g_app.conn_pool, id);   /* закрыть постоянные сессии */
+    http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
 /* Регистрирует все HTTP-маршруты гейтвея в роутере (UI, таблицы, запросы,
  * пайплайны, коннекторы, auth/RBAC/audit, matview, кластер). */
 void api_register_routes(Router *r) {
@@ -8413,6 +8942,13 @@ void api_register_routes(Router *r) {
     router_add(r,"POST",  "/api/connector/probe/ping",     h_connector_probe_ping);
     router_add(r,"POST",  "/api/connector/probe/preview",  h_connector_probe_preview);
     router_add(r,"POST",  "/api/connector/probe/schema",   h_connector_probe_schema);
+    /* Справочник подключений. Статические пути — до :id (route_match берёт
+     * первый подошедший маршрут в порядке регистрации). */
+    router_add(r,"GET",   "/api/connections",      h_connections_list);
+    router_add(r,"POST",  "/api/connections",      h_connection_create);
+    router_add(r,"GET",   "/api/connections/:id",  h_connection_get);
+    router_add(r,"PUT",   "/api/connections/:id",  h_connection_update);
+    router_add(r,"DELETE","/api/connections/:id",  h_connection_delete);
     // Auth endpoints
     router_add(r,"POST", "/api/auth/token",    h_auth_token);
     router_add(r,"POST", "/api/auth/apikeys",  h_auth_apikey_create);

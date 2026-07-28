@@ -42,6 +42,7 @@
     <nav>
       <a class="nav-item active" data-view="pipelines" href="#pipelines">Конвейеры</a>
       <a class="nav-item nav-builder" data-view="builder" href="#builder" id="nav-builder">Конструктор</a>
+      <a class="nav-item"        data-view="connections" href="#connections">Подключения</a>
       <a class="nav-item"        data-view="matviews"  href="#matviews">Витрины</a>
       <a class="nav-item"        data-view="analytics" href="#analytics">Аналитика</a>
       <a class="nav-item"        data-view="metrics"   href="#metrics">Метрики</a>
@@ -440,6 +441,45 @@
       <div id="matviews-list"></div>
     </section>
 
+    <!-- ═══ Connections (справочник подключений к источникам/приёмникам) ═══ -->
+    <section id="view-connections" class="view">
+      <h1 style="display:flex;justify-content:flex-end;align-items:center">
+        <button class="btn btn-primary btn-sm" style="justify-content:center" onclick="openConnectionEditor(null)" title="Добавить подключение к внешней системе">+ Подключение</button>
+      </h1>
+
+      <!-- Создание/редактирование — панель над списком -->
+      <div id="conn-editor" class="builder-settings" style="display:none;margin-bottom:1rem">
+        <h2 id="conn-form-title" style="margin:0;font-size:1.05rem">Новое подключение</h2>
+        <div class="builder-settings-row">
+          <div class="bsr-field" style="flex:1 1 100%;max-width:none">
+            <label>Название <span class="required">*</span></label>
+            <input id="conn-name" type="text" placeholder="Прод Oracle — витрина клиентов">
+          </div>
+        </div>
+
+        <!-- Тип системы — те же кнопки, что в конструкторе -->
+        <div class="bsr-field" style="flex:1 1 100%;max-width:none">
+          <label>Тип системы <span class="required">*</span></label>
+          <div id="conn-type-buttons" style="display:flex;gap:.4rem;flex-wrap:wrap"></div>
+        </div>
+
+        <!-- Форма коннектора — ТА ЖЕ САМАЯ, что в карточке шага
+             (makeConnectorConfigHTML с виртуальным индексом CONN_FORM_IDX = -1;
+             id контейнера должен совпадать с шаблоном step-conn-cfg-${idx}) -->
+        <div id="step-conn-cfg--1" style="margin-top:.75rem"></div>
+
+        <div class="builder-settings-row" style="margin-top:.2rem;align-items:center">
+          <!-- Кнопка «Подключиться» не дублируется здесь: она есть в самой форме
+               коннектора выше (у всех 10 типов), перенесённой из конструктора. -->
+          <button class="btn btn-primary btn-sm" style="min-width:120px;justify-content:center" onclick="saveConnection()">Сохранить</button>
+          <button class="btn btn-sm" style="min-width:120px;justify-content:center" onclick="closeConnectionEditor()">Отмена</button>
+          <span id="conn-status" class="query-stat" style="margin-left:.5rem"></span>
+        </div>
+      </div>
+
+      <div id="connections-list"></div>
+    </section>
+
     <!-- ═══ Security (RBAC + Audit) ═══ -->
     <section id="view-security" class="view">
 
@@ -717,7 +757,7 @@
 </div>
 
 <div id="toast-container"></div>
-<script src="app.js?v=35"></script>
+<script src="app.js?v=53"></script>
 
 <div id="save-result-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeSaveModal()">
   <div class="modal-box">

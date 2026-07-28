@@ -254,6 +254,7 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             strncpy(st->name,json_str(json_get(s,"name"),""),sizeof(st->name)-1);
             strncpy(st->connector_type, json_str(json_get(s,"connector_type"),""), sizeof(st->connector_type)-1);
             copy_jval_str(json_get(s,"connector_config"), st->connector_config, sizeof(st->connector_config), a);
+            strncpy(st->connection_id, json_str(json_get(s,"connection_id"),""), sizeof(st->connection_id)-1);
             strncpy(st->transform_sql,   json_str(json_get(s,"transform_sql"),""),   sizeof(st->transform_sql)-1);
             strncpy(st->target_table,    json_str(json_get(s,"target_table"),""),    sizeof(st->target_table)-1);
             /* SQL templates (optional) */
@@ -331,6 +332,8 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
         jb_key(&jb,"name");             jb_str(&jb,st->name);
         jb_key(&jb,"connector_type");   jb_str(&jb,st->connector_type);
         jb_key(&jb,"connector_config"); jb_str(&jb,st->connector_config);
+        /* Только когда задано — шаги без справочного подключения round-trip'ятся без изменений */
+        if (st->connection_id[0])      { jb_key(&jb,"connection_id");      jb_str(&jb, st->connection_id); }
         jb_key(&jb,"transform_sql");    jb_str(&jb,st->transform_sql);
         jb_key(&jb,"target_table");     jb_str(&jb,st->target_table);
         if (st->sql_template[0])       { jb_key(&jb,"sql_template");       jb_str(&jb, st->sql_template); }

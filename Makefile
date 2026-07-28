@@ -36,7 +36,7 @@ SCHED_SRCS= lib/scheduler/scheduler.c lib/scheduler/file_watcher.c
 YAML_SRCS = lib/yaml/yaml_loader.c lib/yaml/yaml_template.c
 PG_SRCS   = lib/pgwire/pgwire.c
 OBS_SRCS  = lib/observ/observ.c
-CONN_SRCS = lib/connector/connector.c
+CONN_SRCS = lib/connector/connector.c lib/connector/conn_pool.c
 MV_SRCS   = lib/matview/matview.c
 CL_SRCS   = lib/cluster/proto.c lib/cluster/storage_client.c lib/cluster/replicator.c
 

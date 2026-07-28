@@ -44,6 +44,11 @@ typedef struct {
     char        name[128];
     char        connector_type[64];
     char        connector_config[1024];
+    /* Ссылка на именованное подключение из справочника (lib/connection).
+     * Когда непусто — connector_type/connector_config берутся из подключения
+     * в момент ЗАПУСКА, а не из шага: смена пароля в справочнике подхватывается
+     * всеми конвейерами сразу. Пусто → работает старый инлайновый режим. */
+    char        connection_id[64];
     char        transform_sql[4096];
     char        target_table[128];
     int         deps[MAX_STEPS];

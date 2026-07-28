@@ -171,6 +171,16 @@ Table *table_open(const char *name, const char *dir) {
     Table *t = calloc(1, sizeof(Table));
     strncpy(t->name, name, sizeof(t->name)-1);
     snprintf(t->dir, sizeof(t->dir), "%s/%s", dir, name);
+    /* Каталог таблицы может отсутствовать: запись есть в catalog.db, а данные
+     * удалены мимо гейтвея. Раньше это давало ERROR «wal_open … No such file or
+     * directory» на КАЖДУЮ такую таблицу при старте, а сама таблица оставалась
+     * без WAL — то есть молча непригодной для записи. Создаём каталог и
+     * сообщаем об этом один раз: таблица открывается пустой и снова рабочей. */
+    struct stat dst;
+    if (stat(t->dir, &dst) != 0) {
+        if (mkdir(t->dir, 0755) == 0)
+            LOG_WARN("таблица '%s': каталог данных отсутствовал, создан заново — таблица пуста", name);
+    }
     char wal_path[600]; snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
     t->wal = wal_open(wal_path);
     if (t->wal) strncpy(t->wal->table_name, name, sizeof(t->wal->table_name)-1);
@@ -534,6 +544,8 @@ static const char *CATALOG_SCHEMA =
     "  name TEXT PRIMARY KEY, schema_json TEXT, created_at INTEGER);"
     "CREATE TABLE IF NOT EXISTS pipelines("
     "  id TEXT PRIMARY KEY, json TEXT, updated_at INTEGER);"
+    "CREATE TABLE IF NOT EXISTS connections("
+    "  id TEXT PRIMARY KEY, json TEXT, updated_at INTEGER);"
     "CREATE TABLE IF NOT EXISTS pipeline_runs("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  pipeline_id TEXT, started_at INTEGER, finished_at INTEGER,"
@@ -794,6 +806,58 @@ int catalog_delete_pipeline(Catalog *c, const char *id) {
         sqlite3_bind_text(rd,1,id,-1,SQLITE_STATIC);
         sqlite3_step(rd); sqlite3_finalize(rd);
     }
+    return rc==SQLITE_DONE?0:-1;
+}
+
+/* ─── Справочник подключений к внешним системам (источники/приёмники) ─────
+ * Хранятся как конвейеры: id + JSON целиком, вида
+ *   {id,name,type,config,created_at,updated_at}
+ * config лежит в TEXT без потолка — в отличие от PipelineStep.connector_config[1024],
+ * который молча обрезается на длинных конфигах Kafka с TLS/SASL. */
+
+int catalog_save_connection(Catalog *c, const char *id, const char *json) {
+    CAT_GUARD(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,
+        "INSERT OR REPLACE INTO connections(id,json,updated_at) VALUES(?,?,?)",-1,&st,NULL);
+    sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
+    sqlite3_bind_text(st,2,json,-1,SQLITE_STATIC);
+    sqlite3_bind_int64(st,3,(int64_t)time(NULL));
+    int rc=sqlite3_step(st); sqlite3_finalize(st);
+    return rc==SQLITE_DONE?0:-1;
+}
+
+int catalog_load_connection(Catalog *c, const char *id, char **out, Arena *a) {
+    CAT_GUARD(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,"SELECT json FROM connections WHERE id=?",-1,&st,NULL);
+    sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
+    if (sqlite3_step(st)!=SQLITE_ROW){sqlite3_finalize(st);return -1;}
+    *out = arena_strdup(a,(const char*)sqlite3_column_text(st,0));
+    sqlite3_finalize(st); return 0;
+}
+
+/* Весь справочник одним JSON-массивом — UI забирает его одним запросом. */
+int catalog_list_connections(Catalog *c, char **out, Arena *a) {
+    CAT_GUARD(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,
+        "SELECT json FROM connections ORDER BY updated_at DESC",-1,&st,NULL);
+    JBuf jb; jb_init(&jb,a,4096); jb_arr_begin(&jb);
+    while(sqlite3_step(st)==SQLITE_ROW){
+        const char *j=(const char*)sqlite3_column_text(st,0);
+        if (j && j[0]) jb_raw(&jb, j);
+    }
+    jb_arr_end(&jb); sqlite3_finalize(st);
+    *out=(char*)jb_done(&jb); return 0;
+}
+
+int catalog_delete_connection(Catalog *c, const char *id) {
+    CAT_GUARD(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,"DELETE FROM connections WHERE id=?",-1,&st,NULL);
+    sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
+    int rc=sqlite3_step(st); sqlite3_finalize(st);
     return rc==SQLITE_DONE?0:-1;
 }
 

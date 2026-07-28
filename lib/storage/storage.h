@@ -120,6 +120,12 @@ int catalog_load_pipeline(Catalog *c, const char *id, char **json_out, Arena *a)
 int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a);
 int catalog_delete_pipeline(Catalog *c, const char *id);
 
+/* Справочник подключений к системам-источникам и системам-приёмникам */
+int catalog_save_connection(Catalog *c, const char *id, const char *json);
+int catalog_load_connection(Catalog *c, const char *id, char **json_out, Arena *a);
+int catalog_list_connections(Catalog *c, char **json_out, Arena *a);
+int catalog_delete_connection(Catalog *c, const char *id);
+
 /* Run history */
 int catalog_log_run(Catalog *c, const char *pipeline_id,
                     int64_t started_at, int64_t finished_at,

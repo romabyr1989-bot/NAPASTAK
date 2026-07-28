@@ -42,6 +42,24 @@ function applyRoleVisibility() {
 /* Pipeline builder */
 const pb = { steps: [], editId: null, max_retries: 3, retry_delay_sec: 30, webhook_url: '', webhook_on: 'failure' };
 
+/* ── Форма коннектора, общая для конструктора и раздела «Подключения» ─────────
+ * makeConnectorConfigHTML и её обработчики адресуют шаг по индексу в pb.steps.
+ * Чтобы ТУ ЖЕ САМУЮ форму (все 10 типов, селектор защиты Kafka, блоки TLS,
+ * Avro-реестр, кнопки «Подключиться»/предпросмотра) показать в редакторе
+ * подключения, вводим виртуальный индекс: CONN_FORM_IDX адресует не шаг
+ * конвейера, а временный объект редактора. Разметка формы при этом не меняется
+ * ни на строку. */
+/* Заглушка секрета: сервер отдаёт её вместо непустого пароля. */
+const CONN_SECRET_MASK = '********';
+
+const CONN_FORM_IDX = -1;
+let _connFormStep = null;
+
+/* Единственная точка разыменования индекса шага для формы коннектора. */
+function pbStep(idx) {
+  return (idx === CONN_FORM_IDX) ? _connFormStep : pb.steps[idx];
+}
+
 /* User preferences */
 let prefs = {};
 
@@ -84,7 +102,7 @@ document.querySelectorAll('.nav-item').forEach(a => {
   a.addEventListener('click', e => { e.preventDefault(); switchView(a.dataset.view); });
 });
 
-const VALID_VIEWS = new Set(['pipelines','builder','analytics','matviews','security','metrics','settings','admin']);
+const VALID_VIEWS = new Set(['pipelines','builder','analytics','matviews','connections','security','metrics','settings','admin']);
 const ADMIN_TABS  = ['settings','security'];   /* grouped under «Администрирование» (порядок вкладок) */
 let _adminTab = 'settings';                    /* какая вкладка открывается при входе */
 
@@ -120,6 +138,7 @@ function switchView(name, { pushState = true } = {}) {
   if (name === 'pipelines') loadPipelinesView();
   if (name === 'analytics') loadAnalyticsModule();
   if (name === 'matviews')  loadMatviews();
+  if (name === 'connections') loadConnectionsView();
   if (name === 'security')  restoreSecTab();
   if (name === 'metrics')   loadMetrics();
   if (name === 'settings')  loadSettings();
@@ -503,6 +522,7 @@ async function runStepPreview(idx, opts = {}) {
     name:               s.name || `step ${i + 1}`,
     connector_type:     s.connector_type || '',
     connector_config:   s.connector_config || '',
+    connection_id:      s.connection_id || '',
     transform_sql:      s.transform_sql || '',
     python_code:        s.python_code || '',
     python_timeout_sec: s.python_timeout_sec || 300,
@@ -801,7 +821,7 @@ function sizeListRows(listId, opts) {
 /* Пересчёт для активной формы (ресайз/переключение). Скрытые отсеются по offsetParent,
  * видимый список выставит min-height (и высоту строк) под свою область. */
 function sizeActiveList() {
-  ['pipelines-list', 'metrics-pipelines-list', 'metrics-matviews-list', 'matviews-list', 'an-saved-list']
+  ['pipelines-list', 'metrics-pipelines-list', 'metrics-matviews-list', 'matviews-list', 'connections-list', 'an-saved-list']
     .forEach(id => sizeListRows(id));
   sizeListRows('audit-log-list', { cards: false });   /* аудит — таблица, высоту строк не трогаем */
 }
@@ -1123,6 +1143,14 @@ function openPipelineBuilder(pipeline) {
   renderTriggers();
   pbRestoreSections();   /* применить сохранённое сворачивание секций */
 
+  /* Справочник подключений нужен селектору в карточке шага. Функция синхронная,
+   * поэтому подтягиваем кэш вторым проходом и перерисовываем шаги — иначе при
+   * заходе по прямой ссылке «#builder/<id>» список подключений будет пуст. */
+  loadConnectionsCache().then(() => {
+    if (document.getElementById('view-builder').classList.contains('active'))
+      renderBuilderSteps();
+  });
+
   /* Push a pipeline-specific URL so F5 can restore the same builder context.
    * Use switchView with pushState:false so it doesn't push generic '#builder'
    * that would lose the id. */
@@ -1302,6 +1330,7 @@ function pbAddStep() {
     name: '',
     connector_type: 'postgresql',   /* по умолчанию новый шаг — Источник */
     connector_config: '{}',
+    connection_id: '',              /* пусто = параметры доступа заданы в самом шаге */
     transform_sql: '',
     target_table: '',
     deps: [],
@@ -1389,10 +1418,255 @@ function pbChangeConnType(idx, type) {
 }
 
 function pbUpdateConnConfig(idx, field, val) {
-  const cfg = safeParse(pb.steps[idx].connector_config, {});
+  const cfg = safeParse(pbStep(idx).connector_config, {});
   cfg[field] = val;
-  pb.steps[idx].connector_config = JSON.stringify(cfg);
+  pbStep(idx).connector_config = JSON.stringify(cfg);
   if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
+}
+
+
+/* ── Запрос к данным против параметров доступа ────────────────────────────────
+ * Подключение — это только «как попасть в систему»: адрес, учётные данные, TLS.
+ * ЧТО именно читать — свойство конкретного конвейера, поэтому запрос живёт в
+ * шаге. Ниже перечислены ключи запроса по типам; всё остальное в форме
+ * коннектора считается параметрами доступа.
+ *
+ * Таблица одна, а применяется зеркально: в карточке шага прячем доступ, в
+ * редакторе подключения — запрос. Благодаря этому обе формы остаются той же
+ * самой makeConnectorConfigHTML и не расходятся между собой. */
+const CONN_REQUEST_KEYS = {
+  postgresql: ['read_mode','table','query','cursor_column','cdc_slot','primary_key'],
+  greenplum:  ['read_mode','table','query','cursor_column','primary_key'],
+  oracle:     ['read_mode','table','query','cursor_column','primary_key'],
+  kafka:      ['topic','group_id','offset_reset','offset_start_mode','isolation_level','data_format'],
+  json_http:  ['data_path','post_body','page_param','page_type','page_size','total_field'],
+  xml:        ['row_tag','root_tag','data_path','post_body','page_param','page_size'],
+  soap:       ['soap_action','operation','request_template','row_tag','sink_row_tag','data_path','page_size'],
+  siebel:     ['io_name','eim_object','data_path','read_body','page_param','size_param','page_size'],
+  csv:        [],   /* сам файл и есть источник — запрашивать нечего */
+  parquet:    [],
+};
+
+/* Обработчики, правящие конфиг не через pbUpdateConnConfig. */
+const CONN_HANDLER_KEYS = {
+  pbSetKafkaSecurity: 'security_protocol',
+  pbSetKafkaOffsetStartMode: 'offset_start_mode',
+};
+
+/* Прячет в отрисованной форме половину полей. mode='request' оставляет только
+ * запрос (карточка шага), mode='access' — только параметры доступа (редактор
+ * подключения). Работает по готовой разметке, поэтому саму форму править не
+ * пришлось. */
+function applyConnFieldFilter(containerId, type, mode) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const req = CONN_REQUEST_KEYS[type];
+  if (!req) return;                       /* незнакомый тип — показываем всё */
+
+  el.querySelectorAll('[oninput],[onchange],[onclick]').forEach(node => {
+    const h = (node.getAttribute('oninput') || '') + ';' +
+              (node.getAttribute('onchange') || '') + ';' +
+              (node.getAttribute('onclick') || '');
+    let key = null;
+    const m = h.match(/pbUpdateConnConfig\(\s*-?\d+\s*,\s*'([a-zA-Z_0-9]+)'/);
+    if (m) key = m[1];
+    else for (const fn in CONN_HANDLER_KEYS)
+      if (h.indexOf(fn + '(') >= 0) { key = CONN_HANDLER_KEYS[fn]; break; }
+    if (!key) return;
+    const isRequest = req.indexOf(key) >= 0;
+    if (mode === 'request' ? !isRequest : isRequest) {
+      const box = node.closest('.form-group') || node.parentElement;
+      if (box) box.style.display = 'none';
+    }
+  });
+
+  /* Кнопки, относящиеся к другой половине: «Подключиться» — это про доступ,
+   * предпросмотр — про запрос. Каждая остаётся только на своей форме. */
+  const foreignBtn = mode === 'request'
+    ? 'pbTestConnection('
+    : null;   /* в редакторе подключения предпросмотр оставляем: им удобно
+                 проверить, что креды верные и данные вообще читаются */
+  if (foreignBtn) {
+    el.querySelectorAll('button[onclick]').forEach(bt => {
+      if (bt.getAttribute('onclick').indexOf(foreignBtn) >= 0) {
+        const box = bt.closest('.form-group') || bt.parentElement;
+        if (box) box.style.display = 'none';
+      }
+    });
+  }
+
+  /* Заголовок секции («Подключение к Oracle») — часть блока параметров доступа. */
+  if (mode === 'request')
+    el.querySelectorAll('.conn-group-title').forEach(t => { t.style.display = 'none'; });
+
+  /* Схлопнуть контейнеры без единого видимого поля, чтобы не зияли пустоты. */
+  el.querySelectorAll('div').forEach(d => {
+    const groups = d.querySelectorAll('.form-group');
+    if (!groups.length) return;
+    let visible = false;
+    groups.forEach(g => { if (g.style.display !== 'none') visible = true; });
+    if (!visible && !d.querySelector('button:not([style*="display:none"]), textarea')) d.style.display = 'none';
+  });
+}
+
+/* Единая точка перерисовки формы запроса в карточке шага. */
+function pbRerenderStepCfg(idx) {
+  const el = document.getElementById('step-conn-cfg-' + idx);
+  if (!el) return;
+  const step = pbStep(idx);
+  el.innerHTML = makeConnectorConfigHTML(step, idx);
+  /* Фильтр обязателен и после ЧАСТИЧНОЙ перерисовки (смена защиты Kafka, режима
+   * чтения и т.п.): без него в редакторе подключения всплывали бы поля запроса
+   * (топик, группа консьюмера), попадали в конфиг подключения и становились
+   * базой сразу для всех конвейеров. */
+  applyConnFieldFilter('step-conn-cfg-' + idx,
+                       idx === CONN_FORM_IDX ? _connFormStep.connector_type : stepConnType(step),
+                       idx === CONN_FORM_IDX ? 'access' : 'request');
+}
+
+/* Привязать шаг к подключению из справочника (или отвязать при пустом id). */
+function pbSetStepConnection(idx, connId) {
+  const s = pb.steps[idx];
+  s.connection_id = connId || '';
+  if (connId) {
+    const rec = connCache.find(c => c.id === connId);
+    /* connector_type обязателен: stepType() определяет вид шага по нему, и без
+     * него карточка перестанет считаться источником/приёмником. */
+    if (rec && rec.type) s.connector_type = rec.type;
+    /* Из шага убираем параметры доступа (их даёт подключение), но СОХРАНЯЕМ
+     * запрос: он принадлежит этому конвейеру и при смене подключения не теряется. */
+    const req = CONN_REQUEST_KEYS[rec ? rec.type : s.connector_type] || [];
+    const cfg = safeParse(s.connector_config, {});
+    const kept = {};
+    req.forEach(k => { if (cfg[k] !== undefined) kept[k] = cfg[k]; });
+    s.connector_config = JSON.stringify(kept);
+  }
+  s._dbok = false;             /* прежняя отметка «✓ Подключено» больше не про этот адрес */
+  renderBuilderSteps();
+  if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
+}
+
+/* Селектор подключения в карточке шага. dir — 'source' или 'sink': список
+ * фильтруется по НАПРАВЛЕНИЮ ЗАПИСИ справочника, а не по типу коннектора
+ * (все плагины умеют и читать, и писать, поэтому по типу отфильтровать нельзя). */
+/* Убирает из конфига значения-заглушки секретов. Отправлять их обратно нельзя:
+ * на сервере они легли бы ПОВЕРХ настоящего пароля, и коннектор получил бы
+ * строку "********". Сервер такие значения тоже отбрасывает, но чинить надо с
+ * обеих сторон — иначе проба связи для сохранённого подключения всегда врёт. */
+function stripMaskedSecrets(cfg) {
+  const out = {};
+  Object.keys(cfg || {}).forEach(k => { if (cfg[k] !== CONN_SECRET_MASK) out[k] = cfg[k]; });
+  return out;
+}
+
+function makeConnectionPickerHTML(step, idx, dir) {
+  /* Подключение не привязано к роли шага: это просто система, куда мы ходим.
+   * Показываем весь справочник и для источника, и для приёмника. */
+  const list = (connCache || []);
+  const cur  = step.connection_id || '';
+  const missing = cur && !list.some(c => c.id === cur);
+  const rec = list.find(c => c.id === cur) || null;
+  /* Старый шаг: параметры заданы внутри него, подключение не выбрано. Форму мы
+   * из конвейера убрали, поэтому предлагаем перенести их в справочник. */
+  const inlineCfg = safeParse(step.connector_config, {});
+  const hasInline = !cur && Object.keys(inlineCfg).length > 0;
+  /* Живое состояние постоянной сессии — видно прямо в шаге, что источник на связи. */
+  const st = rec ? (rec.status || 'idle') : null;
+  const dot = st === 'ok' ? '<span class="badge badge-ok">● на связи</span>'
+            : st === 'error' ? '<span class="badge badge-err">● нет связи</span>'
+            : (rec ? '<span class="badge">○ подключается…</span>' : '');
+  const opts = [`<option value="">— выберите подключение —</option>`]
+    .concat(list.map(c =>
+      `<option value="${escAttr(c.id)}" ${c.id === cur ? 'selected' : ''}>${escHtml(c.name)} · ${escHtml(CONN_TYPE_LABELS[c.type] || c.type)}</option>`))
+    .concat(missing ? [`<option value="${escAttr(cur)}" selected>подключение удалено (${escHtml(cur)})</option>`] : [])
+    .join('');
+  return `
+    <div class="builder-settings-row" style="margin-bottom:.5rem">
+      <div class="bsr-field" style="flex:1 1 60%;max-width:none">
+        <label>Подключение <span class="label-hint" style="text-transform:none;font-weight:400">${dir === 'sink' ? 'система-приёмник' : 'система-источник'}</span></label>
+        <select onchange="pbSetStepConnection(${idx}, this.value)">${opts}</select>
+      </div>
+      <div class="bsr-field" style="flex:0 0 auto;justify-content:flex-end">
+        <label>&nbsp;</label>
+        <div style="display:flex;gap:.35rem;align-items:center">
+          ${dot}
+          ${cur && !missing
+            ? `<button class="btn btn-sm" onclick="pbOpenConnection(${idx})" title="Открыть подключение в разделе «Подключения»">✎ Редактировать</button>`
+            : (hasInline
+              ? `<button class="btn btn-sm btn-primary" onclick="pbConnectionFromStep(${idx}, '${dir}')" title="Перенести параметры, заданные внутри шага, в справочник подключений">↗ Перенести в подключения</button>`
+              : `<button class="btn btn-sm" onclick="pbCreateConnectionFor(${idx}, '${dir}')" title="Создать подключение и привязать к шагу">＋ Создать подключение</button>`)}
+        </div>
+      </div>
+    </div>
+    ${missing ? `<div style="color:var(--red);font-size:.75rem;margin:-.25rem 0 .5rem">Подключение больше не существует — выберите другое, иначе шаг не запустится.</div>` : ''}
+    ${hasInline ? `<div style="font-size:.74rem;color:var(--muted);border-left:2px solid var(--border);padding:.3rem .5rem;margin:-.15rem 0 .5rem">
+        Старый формат: параметры доступа (${escHtml(CONN_TYPE_LABELS[step.connector_type] || step.connector_type)}) заданы внутри шага.
+        Конвейер работает, но настроить их здесь больше нельзя — перенесите в подключения.
+      </div>` : ''}
+    ${/* Предпросмотр остаётся в конвейере: видно, какие данные реально придут из
+          выбранной системы. Читает по эффективному конфигу — параметры берутся
+          из подключения, секреты подставляет сервер по connection_id. */
+      (cur || hasInline) ? `
+    <div style="display:flex;justify-content:flex-end;margin:-.15rem 0 .35rem">
+      <button type="button" class="btn btn-primary btn-sm" style="min-width:200px;justify-content:center"
+              onclick="event.stopPropagation();${stepConnType(step) === 'kafka' && !step.is_sink ? `pbPreviewKafka(${idx})` : `pbPreviewSource(${idx})`}"
+              title="${dir === 'sink' ? 'Показать, что сейчас лежит в приёмнике' : 'Прочитать пробную порцию данных из источника'}">${
+                dir === 'sink' ? '▶ Что сейчас в приёмнике'
+                : (stepConnType(step) === 'kafka' ? '▶ Показать сообщения' : '▶ Показать данные')}</button>
+    </div>
+    ${/* Свой контейнер вывода с ОТДЕЛЬНЫМ id. Одноимённый с формой давал бы два
+         элемента с одинаковым id, и getElementById возвращал бы первый попавшийся —
+         результат уходил бы не в тот блок. При этом форма рисует свой контейнер не
+         для всех типов (у CSV его нет), поэтому просто убрать этот нельзя. */''}
+    <div id="pb-steppreview-${idx}"></div>` : ''}`;
+}
+
+/* Переход из шага к редактированию его подключения. Возврат в конструктор — по
+ * пункту меню «Конструктор»; состояние конвейера живёт в pb и не теряется. */
+function pbOpenConnection(idx) {
+  const id = pbStep(idx).connection_id;
+  if (!id) return;
+  openConnectionEditor(id, null, async () => {
+    await loadConnectionsCache();
+    switchView('builder');
+    renderBuilderSteps();
+  });
+}
+
+/* Перенос старого шага в справочник: открываем редактор подключения, заранее
+ * заполненный параметрами из самого шага, и по сохранении привязываем шаг к
+ * созданному подключению (pbSetStepConnection очистит инлайновый конфиг). */
+function pbConnectionFromStep(idx, dir) {
+  const s = pbStep(idx);
+  const type = s.connector_type || 'postgresql';
+  const cfg  = s.connector_config || '{}';
+  const name = (s.name && s.name.trim())
+    ? s.name.trim()
+    : `${CONN_TYPE_LABELS[type] || type} — из шага ${idx + 1}`;
+
+  openConnectionEditor(null, dir, async (newId) => {
+    await loadConnectionsCache();
+    switchView('builder');
+    pbSetStepConnection(idx, newId);
+    showToast('Параметры перенесены в подключение', 'ok');
+  });
+  /* openConnectionEditor уже создал пустой _connFormStep — подменяем его
+   * параметрами шага и перерисовываем форму. */
+  _connFormStep.connector_type   = type;
+  _connFormStep.connector_config = cfg;
+  document.getElementById('conn-name').value = name;
+  renderConnEditorForm();
+}
+
+/* «＋ Создать» из карточки шага: открыть редактор и по сохранении привязать. */
+function pbCreateConnectionFor(idx, dir) {
+  const back = pb.editId;
+  openConnectionEditor(null, dir, async (newId) => {
+    await loadConnectionsCache();
+    switchView('builder');
+    if (back !== undefined) { /* конструктор уже держит состояние в pb */ }
+    pbSetStepConnection(idx, newId);
+  });
 }
 
 /* Смена «Защиты соединения» в форме Kafka. При выборе SASL-протокола сразу
@@ -1402,11 +1676,11 @@ function pbUpdateConnConfig(idx, field, val) {
 function pbSetKafkaSecurity(idx, val) {
   pbUpdateConnConfig(idx, 'security_protocol', val);
   if (val.indexOf('SASL') === 0) {
-    const cfg = safeParse(pb.steps[idx].connector_config, {});
+    const cfg = safeParse(pbStep(idx).connector_config, {});
     if (!cfg.sasl_mechanism) pbUpdateConnConfig(idx, 'sasl_mechanism', 'PLAIN');
   }
   const el = document.getElementById('step-conn-cfg-' + idx);
-  if (el) el.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
+  if (el) pbRerenderStepCfg(idx);
 }
 
 /* Смена «Стартовой позиции». 'numeric' — не литеральное значение бэкенда, а
@@ -1416,7 +1690,7 @@ function pbSetKafkaSecurity(idx, val) {
 function pbSetKafkaOffsetStartMode(idx, val) {
   pbUpdateConnConfig(idx, 'offset_start_mode', val === 'numeric' ? '0' : val);
   const el = document.getElementById('step-conn-cfg-' + idx);
-  if (el) el.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
+  if (el) pbRerenderStepCfg(idx);
 }
 
 /* Preflight-проверка конфига Kafka до обращения к брокеру: ловим очевидные
@@ -1485,7 +1759,7 @@ function kafkaFriendlyError(err) {
 async function pbTestConnection(idx) {
   const btn = document.getElementById(`pb-dbtest-${idx}`);
   if (!btn) return;
-  const step = pb.steps[idx];
+  const step = pbStep(idx);
   const set = (bg, fg, txt) => {
     btn.style.background = bg; btn.style.borderColor = bg; btn.style.color = fg; btn.textContent = txt;
   };
@@ -1509,7 +1783,10 @@ async function pbTestConnection(idx) {
     ? kafkaFriendlyError((r && r.error) || e) : ((r && r.error) || e || 'неизвестная причина');
   set('', '', 'Проверка…'); btn.disabled = true;
   try {
-    const r = await apiPost('/api/connector/probe/ping', { type: step.connector_type, config: cfg });
+    /* connection_id — чтобы сервер подставил настоящие секреты: UI их не видит. */
+    const r = await apiPost('/api/connector/probe/ping',
+      { type: stepConnType(step), config: stripMaskedSecrets(cfg),
+        connection_id: step.connection_id || '' });
     if (r && r.ok) {
       step._dbok = true;
       set('var(--green)', '#fff', '✓ Подключено');
@@ -1529,12 +1806,17 @@ async function pbTestConnection(idx) {
 /* Preview recent messages from a Kafka topic. Reads from the start under a
  * throwaway consumer group so it doesn't disturb the pipeline's real group. */
 async function pbPreviewKafka(idx) {
-  const step = pb.steps[idx];
-  const out  = document.getElementById(`pb-dbpreview-${idx}`);
+  const step = pbStep(idx);
+  const out  = document.getElementById(`pb-steppreview-${idx}`)
+            || document.getElementById(`pb-dbpreview-${idx}`);
   if (!out) return;
-  const cfg = safeParse(step.connector_config, {});
+  /* Как и в pbPreviewSource: база из подключения + оверлей шага. */
+  const stepCfg = safeParse(step.connector_config, {});
+  const linked  = step.connection_id
+    ? (connCache || []).find(c => c.id === step.connection_id) : null;
+  const cfg = Object.assign({}, linked ? (linked.config || {}) : {}, stepCfg);
   if (!cfg.topic) {
-    out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи топик</div>';
+    out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи топик в подключении</div>';
     return;
   }
   /* preflight: понятные пропуски до чтения (адрес, mTLS-пара, логин/пароль SASL) */
@@ -1549,7 +1831,8 @@ async function pbPreviewKafka(idx) {
   out.innerHTML = '<div style="padding:.4rem;color:var(--muted);font-size:.8rem">Читаю сообщения…</div>';
   try {
     const r = await apiPost('/api/connector/probe/preview',
-      { type: 'kafka', config: previewCfg, query: cfg.topic, limit: 50 });
+      { type: 'kafka', config: stripMaskedSecrets(previewCfg), query: cfg.topic, limit: 50,
+        connection_id: step.connection_id || '' });
     if (!r) { out.innerHTML = '<div style="padding:.4rem;color:var(--red);font-size:.8rem">Пустой ответ</div>'; return; }
     if (r.error) {
       out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem;white-space:pre-wrap">${escHtml(kafkaFriendlyError(r.error))}</div>`;
@@ -1572,14 +1855,33 @@ async function pbPreviewKafka(idx) {
    БД-источники — таблицу/SQL. Результат запоминается в step._lastPreview (для
    модалки-обозревателя); по клику на таблицу БД открывается SQL-модалка. */
 async function pbPreviewSource(idx) {
-  const step = pb.steps[idx];
-  const out  = document.getElementById(`pb-dbpreview-${idx}`);
+  const step = pbStep(idx);
+  const out  = document.getElementById(`pb-steppreview-${idx}`)
+            || document.getElementById(`pb-dbpreview-${idx}`);
   if (!out) return;
-  const cfg = safeParse(step.connector_config, {});
+  /* Эффективный конфиг: база из подключения, поверх — инлайновые ключи шага.
+   * Ровно так же слияние делает сервер при запуске (conn_merge_config), поэтому
+   * предпросмотр показывает то же, что увидит конвейер. Секреты в конфиге
+   * подключения замаскированы, но адрес/путь/запрос — нет, а настоящие пароли
+   * сервер подставит сам по connection_id. */
+  const stepCfg = safeParse(step.connector_config, {});
+  const linked  = step.connection_id
+    ? (connCache || []).find(c => c.id === step.connection_id) : null;
+  const cfg = Object.assign({}, linked ? (linked.config || {}) : {}, stepCfg);
   /* file/HTTP sources have no SQL — the source is in their own config */
-  const isHttp = ['json_http','csv','parquet','siebel','xml','soap'].includes(step.connector_type);
-  const query = (cfg.query || cfg.table || '').trim();
-  if (isHttp) {
+  const effType = stepConnType(step);
+  const isHttp = ['json_http','csv','parquet','siebel','xml','soap'].includes(effType);
+  /* У приёмника «что читать» — это его НАЗНАЧЕНИЕ: смотрим, что уже лежит там,
+   * куда шаг собирается писать. Полезно перед режимом «перезаписать». */
+  const query = step.is_sink
+    ? (step.sink_entity || cfg.topic || cfg.table || step.target_table || '').trim()
+    : (cfg.query || cfg.table || '').trim();
+  if (step.is_sink) {
+    if (!query && !cfg.url && !cfg.path) {
+      out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи назначение — таблицу, топик или путь файла</div>';
+      return;
+    }
+  } else if (isHttp) {
     if (!cfg.url && !cfg.path) { out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи адрес (URL) или путь к файлу</div>'; return; }
   } else if (!query) {
     out.innerHTML = '<div style="padding:.4rem;color:var(--amber);font-size:.8rem">Укажи таблицу или SQL источника</div>';
@@ -1588,7 +1890,8 @@ async function pbPreviewSource(idx) {
   out.innerHTML = '<div style="padding:.4rem;color:var(--muted);font-size:.8rem">Выполняется…</div>';
   try {
     const r = await apiPost('/api/connector/probe/preview',
-      { type: step.connector_type, config: cfg, query: query || '', limit: 200 });
+      { type: effType, config: stripMaskedSecrets(cfg), query: query || '', limit: 200,
+        connection_id: step.connection_id || '' });
     if (!r) { out.innerHTML = '<div style="padding:.4rem;color:var(--red);font-size:.8rem">Пустой ответ</div>'; return; }
     if (r.error) {
       out.innerHTML = `<div style="padding:.4rem;color:var(--red);font-size:.8rem;white-space:pre-wrap">${escHtml(r.error)}</div>`;
@@ -1624,7 +1927,7 @@ async function pbPreviewSource(idx) {
 let sdmIdx = -1;
 function openSrcDataModal(idx) {
   sdmIdx = idx;
-  const step = pb.steps[idx];
+  const step = pbStep(idx);
   const cfg  = safeParse(step.connector_config, {});
   document.getElementById('sdm-sql').value = cfg.query || cfg.table || '';
   const res = step._lastPreview;
@@ -1649,7 +1952,8 @@ async function sdmRun() {
   status.style.color = 'var(--muted)'; status.textContent = 'Выполняется…'; out.innerHTML = '';
   try {
     const r = await apiPost('/api/connector/probe/preview',
-      { type: step.connector_type, config: cfg, query, limit: 200 });
+      { type: step.connector_type, config: cfg, query, limit: 200,
+        connection_id: step.connection_id || '' });
     if (!r) { status.textContent = 'Пустой ответ'; return; }
     if (r.error) {
       status.style.color = 'var(--red)'; status.textContent = 'Ошибка';
@@ -1754,8 +2058,28 @@ const SINK_OPTIONS = [
 /* Определяет тип шага для UI: явный s._ui_type имеет приоритет, иначе выводится
    из заполненных полей (sink → 'sink:<коннектор>', match_rules, scd2, python, scala,
    connector_type или по умолчанию 'sql'). */
+/* Эффективный тип коннектора шага: свой, либо из привязанного подключения.
+ * Шаг может быть задан одной ссылкой (connector_type пуст) — тогда тип знает
+ * только справочник. */
+function stepConnType(step) {
+  if (step.connector_type) return step.connector_type;
+  const rec = step.connection_id ? (connCache || []).find(c => c.id === step.connection_id) : null;
+  return rec ? rec.type : '';
+}
+
 function stepType(step) {
   if (step._ui_type) return step._ui_type;
+  /* Шаг может быть задан ОДНОЙ ссылкой на подключение, без connector_type —
+   * так его принимает и исполняет гейтвей (тип берётся из справочника при
+   * запуске). Без этой ветки конструктор считал такой шаг обычным SQL и не
+   * показывал ни выбор подключения, ни предпросмотр. */
+  if (step.connection_id && !step.connector_type) {
+    const rec = (connCache || []).find(c => c.id === step.connection_id);
+    const t = rec ? rec.type : '';
+    if (step.is_sink) return t ? 'sink:' + t : 'sink';
+    if (t) return t;
+    return step.is_sink ? 'sink' : 'postgresql';   /* справочник ещё не загружен */
+  }
   if (step.is_sink && step.connector_type) return 'sink:' + step.connector_type;
   if (step.match_rules)       return 'matchrules';
   if (step.scd2_business_key) return 'scd2';
@@ -1783,6 +2107,10 @@ function pbChangeStepType(idx, type) {
   /* Reset every discriminating field so only the chosen one stays set. */
   s.connector_type = '';
   s.connector_config = '';
+  /* Ссылку на подключение тоже сбрасываем: у подключения есть направление, и
+   * при смене «Источник» → «Приёмник» прежняя ссылка вылетела бы из фильтра
+   * списка, оставшись выбранной. */
+  s.connection_id = '';
   s.python_code = '';
   s.python_file = '';
   s.python_context_dir = '';
@@ -2052,7 +2380,7 @@ function makeMatchRulesFieldsHTML(step, idx) {
       <div class="form-group" style="margin:.6rem 0 0">
         <label>Все правила в формате JSON</label>
         <textarea class="mono-textarea" rows="8"
-          oninput="pb.steps[${idx}].match_rules=this.value"
+          oninput="pbStep(${idx}).match_rules=this.value"
           style="font-family:var(--mono);font-size:.74rem">${escHtml(step.match_rules || '')}</textarea>
       </div>
     </div>`;
@@ -2084,6 +2412,12 @@ function renderBuilderSteps() {
     preview.className = 'step-preview-inline';
     preview.style.cssText = 'display:none;margin:-0.5rem 0 1rem 0';
     container.appendChild(preview);
+  });
+  /* Оставляем в карточках только поля запроса — доступ живёт в подключении. */
+  pb.steps.forEach((st, i) => {
+    const t = stepType(st);
+    if (CONNECTOR_TYPES.includes(t) || t.startsWith('sink:'))
+      applyConnFieldFilter('step-conn-cfg-' + i, stepConnType(st), 'request');
   });
 }
 
@@ -2289,19 +2623,11 @@ function makeStepCard(step, idx) {
           <button type="button" class="btn btn-sm${matchMethod===m?' btn-primary':''}"
                   onclick="pbSetMatchMethod(${idx},'${m}')">${name}</button>`).join('')}
       </div>` : ''}
-      ${isSource ? `
-      <div style="display:flex;gap:.4rem;margin-top:.6rem;flex-wrap:wrap">
-        ${SOURCE_OPTIONS.map(([v,name]) => `
-          <button type="button" class="btn btn-sm${t===v?' btn-primary':''}"
-                  onclick="pbChangeStepType(${idx},'${v}')">${name}</button>`).join('')}
-      </div>` : ''}
-      ${isSink ? `
-      <div style="display:flex;gap:.4rem;margin-top:.6rem;flex-wrap:wrap">
-        ${SINK_OPTIONS.map(([v,name]) => `
-          <button type="button" class="btn btn-sm${sinkType===v?' btn-primary':''}"
-                  onclick="pbChangeStepType(${idx},'sink:${v}')">${name}</button>`).join('')}
-      </div>` : ''}
       ${isTransform ? sqlBlock : ''}
+      ${(isSource || isSink) ? makeConnectionPickerHTML(step, idx, isSink ? 'sink' : 'source') : ''}
+      ${/* Параметры доступа задаются в подключении, а ЗАПРОС к данным — здесь:
+            он свой у каждого конвейера. Ниже та же форма коннектора, из которой
+            фильтр оставляет только поля запроса (см. applyConnFieldFilter). */''}
       <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(step, idx)}</div>
       ${t.startsWith('sink:') ? makeSinkFieldsHTML(step, idx) : ''}
       ${t === 'scd2'  ? makeScd2FieldsHTML(step, idx)  : ''}
@@ -2320,7 +2646,10 @@ function makeStepCard(step, idx) {
    (pbPreviewSource) и «Подключиться» (pbTestConnection). Ветки для sink скрывают
    source-only поля (путь, заголовок, пагинация). Возвращает строку HTML. */
 function makeConnectorConfigHTML(step, idx) {
-  const type = step.connector_type;
+  /* Шаг может быть задан ОДНОЙ ссылкой на подключение, без connector_type —
+   * тогда тип знает только справочник. Без этого форма запроса (SQL, режим
+   * чтения, топик) для такого шага не рисовалась вовсе. */
+  const type = stepConnType(step);
   const cfg  = safeParse(step.connector_config, {});
 
   /* Pure SQL transform: no connector / python / scala → nothing to configure
@@ -2333,7 +2662,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="form-group" style="margin:0">
         <label>Код Python</label>
         <textarea class="mono-textarea" rows="8"
-          oninput="pb.steps[${idx}].python_code=this.value"
+          oninput="pbStep(${idx}).python_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code || '')}</textarea>
         <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
           <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
@@ -2349,7 +2678,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="form-group" style="margin:0">
         <label>Код Scala</label>
         <textarea class="mono-textarea" rows="8"
-          oninput="pb.steps[${idx}].scala_code=this.value"
+          oninput="pbStep(${idx}).scala_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.scala_code)}</textarea>
         <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
           <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
@@ -2425,7 +2754,7 @@ function makeConnectorConfigHTML(step, idx) {
     const method = cfg.method || 'GET';
     const auth = cfg.auth_type || 'none';
     const ptype = cfg.page_type || 'offset';
-    const reRender = `document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})`;
+    const reRender = `pbRerenderStepCfg(${idx})`;
     /* Только активные поля → раскладываем в 2 колонки (grid), без пустых ячеек;
        при нечётном числе последнее поле растягивается на всю ширину. */
     const fields = [];
@@ -2539,7 +2868,7 @@ function makeConnectorConfigHTML(step, idx) {
   if (type === 'xml') {
     const auth   = cfg.auth_type || 'none';
     const method = cfg.method || 'GET';
-    const reR = `document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})`;
+    const reR = `pbRerenderStepCfg(${idx})`;
     const f = [];
     f.push(`<label>Веб-адрес</label>
       <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">`);
@@ -2595,7 +2924,7 @@ function makeConnectorConfigHTML(step, idx) {
   if (type === 'soap') {
     const auth = cfg.auth_type || 'none';
     const ver  = cfg.soap_version || '1.1';
-    const reR = `document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})`;
+    const reR = `pbRerenderStepCfg(${idx})`;
     const f = [];
     f.push(`<label>Адрес сервиса</label>
       <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">`);
@@ -2692,7 +3021,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
-          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);pbRerenderStepCfg(${idx})">
             <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
             <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
             <option value="cdc"    ${cfg.read_mode==='cdc'            ?'selected':''}>Изменения из журнала БД (CDC)</option>
@@ -2770,7 +3099,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
-          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');pbRerenderStepCfg(${idx})">
             <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
             <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
           </select>
@@ -2841,7 +3170,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
-          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');pbRerenderStepCfg(${idx})">
             <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
             <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
           </select>
@@ -2914,7 +3243,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Формат сообщений</label>
-          <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);pbRerenderStepCfg(${idx})">
             <option value="json" ${fmt==='json'?'selected':''}>JSON</option>
             <option value="csv"  ${fmt==='csv' ?'selected':''}>CSV</option>
             <option value="avro" ${fmt==='avro'?'selected':''}>Avro (реестр схем)</option>
@@ -2957,7 +3286,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="step-row-2" style="margin-top:.4rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Механизм SASL</label>
-          <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value);pbRerenderStepCfg(${idx})">
             <option value="PLAIN"         ${mech==='PLAIN'         ?'selected':''}>PLAIN</option>
             <option value="SCRAM-SHA-256" ${mech==='SCRAM-SHA-256' ?'selected':''}>SCRAM-SHA-256</option>
             <option value="SCRAM-SHA-512" ${mech==='SCRAM-SHA-512' ?'selected':''}>SCRAM-SHA-512</option>
@@ -3051,7 +3380,7 @@ function makeConnectorConfigHTML(step, idx) {
     <div class="form-group" style="margin:0">
       <label>Конфигурация коннектора (JSON)</label>
       <textarea class="mono-textarea" rows="2" placeholder="{}"
-                oninput="pb.steps[${idx}].connector_config=this.value">${escHtml(step.connector_config || '')}</textarea>
+                oninput="pbStep(${idx}).connector_config=this.value">${escHtml(step.connector_config || '')}</textarea>
     </div>`;
 }
 
@@ -3075,6 +3404,7 @@ async function persistBuilderPipeline() {
     name:             s.name || `Шаг ${i + 1}`,
     connector_type:   s.connector_type   || '',
     connector_config: s.connector_config || '',
+    connection_id:    s.connection_id    || '',
     transform_sql:    s.transform_sql    || '',
     target_table:     s.target_table     || '',
     python_code:      s.python_code      || '',
@@ -5351,6 +5681,24 @@ async function apiPost(path, body) {
   return resp.json();
 }
 
+/* PUT с JSON-телом. apiFetch(path,'PUT',body) не годится: шлёт тело сырым и не
+ * ставит Content-Type. Нужен для идемпотентного обновления подключений. */
+async function apiPut(path, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
+  const resp = await fetch(API + path, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (resp.status === 401) { logout(); return; }
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(text || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
 async function apiPostRaw(path, body, contentType) {
   const headers = { 'Content-Type': contentType };
   if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
@@ -5495,6 +5843,243 @@ const MV_REFRESH = ['Вручную', 'При изменении источни�
 let _mvList = [];   /* last loaded datamarts — used to prefill the edit form */
 let _mvPerPage = 10;   /* page size (Infinity = «Все») */
 let _mvPage = 0;
+
+/* ══ Справочник подключений к внешним системам ═══════════════════════════════
+ * Подключение — именованная пара «тип системы + параметры доступа». Шаг
+ * конвейера ссылается на него через connection_id, поэтому пароль хранится в
+ * одном месте и его смена подхватывается всеми конвейерами.
+ *
+ * Здесь описаны ТОЛЬКО параметры доступа. Пошаговые ключи (query, table,
+ * cursor_column, topic, group_id, offset_*, data_path…) остаются в карточке
+ * шага в конструкторе — их читает гейтвей из конфига шага.
+ *
+ * Секреты сервер отдаёт как «********»; если поле не трогали, оно уходит
+ * обратно маской и пароль остаётся прежним. */
+
+
+const CONN_TYPE_LABELS = {
+  postgresql: 'PostgreSQL', greenplum: 'Greenplum', oracle: 'Oracle',
+  kafka: 'Kafka', csv: 'CSV-файл', parquet: 'Parquet-файл',
+  json_http: 'JSON по HTTP', xml: 'XML', soap: 'SOAP', siebel: 'Siebel',
+};
+
+
+
+
+let _connList = [];          /* последний загруженный справочник (для экрана) */
+let connCache  = [];         /* тот же справочник для СИНХРОННОГО чтения из конструктора */
+let _connEditId = null;      /* id редактируемого подключения, null = создание */
+let _connAfterSave = null;   /* колбэк: подставить новое подключение в шаг конструктора */
+
+/* Кэш обязателен синхронный: makeStepCard/renderBuilderSteps не умеют await. */
+async function loadConnectionsCache() {
+  try { connCache = (await apiGet('/api/connections')) || []; }
+  catch (_) { connCache = []; }
+  return connCache;
+}
+
+async function loadConnectionsView() {
+  const el = document.getElementById('connections-list');
+  if (!el) return;
+  el.innerHTML = '<div style="color:var(--muted);padding:.5rem">Загрузка…</div>';
+  try {
+    /* Список конвейеров нужен строке подключения: она показывает, кто его
+     * использует. Если раздел «Конвейеры» ещё не открывали, подтянем сами. */
+    if (!Array.isArray(_pipelinesAll) || !_pipelinesAll.length) {
+      try { _pipelinesAll = (await apiGet('/api/pipelines')) || []; } catch (_) {}
+    }
+    const list = await apiGet('/api/connections');
+    _connList = list || [];        /* apiGet после 401 отдаёт undefined, а не бросает */
+    connCache = _connList;
+    renderConnectionsList();
+  } catch (err) {
+    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+  }
+}
+
+function renderConnectionsList() {
+  const el = document.getElementById('connections-list');
+  if (!el) return;
+  if (!_connList.length) {
+    el.innerHTML = '<div class="empty-state">Подключений пока нет. Добавьте первое — и его можно будет выбирать в шагах конвейера.</div>';
+    return;
+  }
+  el.innerHTML = '';
+  _connList.forEach(c => el.appendChild(makeConnectionRow(c)));
+  sizeListRows('connections-list');
+}
+
+function makeConnectionRow(c) {
+  const div = document.createElement('div');
+  /* Кликабельная строка — как у конвейеров: клик по плашке открывает редактор,
+   * клики по кнопкам не перехватываем. */
+  div.className = 'pipeline-item pipeline-item-clickable';
+  div.title = 'Открыть подключение';
+  div.onclick = (e) => {
+    if (e.target.closest('button')) return;
+    openConnectionEditor(c.id);
+  };
+  const typeLabel = CONN_TYPE_LABELS[c.type] || c.type;
+  const cfg = c.config || {};
+  /* Короткая сводка «куда смотрит» — по одному ключу на семейство типов. */
+  const target = cfg.host ? `${cfg.host}${cfg.port ? ':' + cfg.port : ''}${cfg.dbname ? '/' + cfg.dbname : ''}${cfg.service_name ? '/' + cfg.service_name : ''}`
+               : (cfg.brokers || cfg.url || cfg.siebel_url || cfg.path || '');
+  const used = countStepsUsingConnection(c.id);
+  /* Состояние ПОСТОЯННОЙ сессии из пула: она живёт между запусками конвейеров,
+   * поэтому показываем её здесь, а не только в момент прогона. */
+  const st = c.status || 'idle';
+  const stBadge = st === 'ok'
+    ? `<span class="badge badge-ok" title="Постоянная сессия установлена${c.last_ok ? ', проверена ' + new Date(c.last_ok * 1000).toLocaleString('ru-RU') : ''}">● подключено${c.sessions > 1 ? ' ×' + c.sessions : ''}</span>`
+    : (st === 'error'
+      ? `<span class="badge badge-err" title="${escAttr(c.last_error || 'сессия недоступна')}">● нет связи</span>`
+      : `<span class="badge" title="Сессия ещё не поднята — фоновый обход поднимет её в течение минуты">○ подключается…</span>`);
+  /* Конвейеры, которые опираются на это подключение, — плашками, как шаги в
+   * строке конвейера (.step-list / .step-badge). */
+  const users = (Array.isArray(_pipelinesAll) ? _pipelinesAll : [])
+    .filter(p => (p.steps || []).some(s => s.connection_id === c.id))
+    .map(p => `<span class="step-badge">${escHtml(p.name || p.id)}</span>`)
+    .join('');
+
+  /* Структура один-в-один со строкой конвейера (makePipelineRow): обёртка
+   * flex:1, первая строка «название + плашки», под ней meta, затем плашки
+   * связанных сущностей, справа — действия. */
+  div.innerHTML = `
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <span class="pipeline-name">${escHtml(c.name)}</span>
+        ${stBadge}
+        <span class="badge badge-run">${escHtml(typeLabel)}</span>
+
+      </div>
+      <div class="pipeline-meta">
+        адрес: <code>${escHtml(target || '—')}</code>
+        &nbsp;·&nbsp; проверено: ${c.last_ok ? new Date(c.last_ok * 1000).toLocaleString('ru') : '—'}
+        &nbsp;·&nbsp; используется шагов: ${used}
+      </div>
+      <div class="step-list">${users}</div>
+    </div>
+    <div class="pipeline-actions">
+      <button class="btn btn-sm btn-primary" onclick="openConnectionEditor('${escAttr(c.id)}')">✎ Изменить</button>
+      <button class="btn btn-sm btn-danger" onclick="deleteConnection('${escAttr(c.id)}')">✕</button>
+    </div>`;
+  return div;
+}
+
+/* Сколько шагов ссылается на подключение — чтобы предупредить перед удалением. */
+function countStepsUsingConnection(id) {
+  if (!id || !Array.isArray(_pipelinesAll)) return 0;
+  let n = 0;
+  _pipelinesAll.forEach(p => (p.steps || []).forEach(s => { if (s.connection_id === id) n++; }));
+  return n;
+}
+
+
+function openConnectionEditor(id, dirHint, afterSave) {
+  _connEditId    = id || null;
+  _connAfterSave = afterSave || null;
+
+  /* Экран подключений может быть не открыт — редактор вызывают и из конструктора. */
+  if (!document.getElementById('view-connections').classList.contains('active'))
+    switchView('connections');
+
+  const rec = id ? (connCache.find(c => c.id === id) || null) : null;
+
+  /* Виртуальный «шаг» редактора: на нём работает та же форма коннектора, что и
+   * в конструкторе. connection_id нужен пробам — сервер подставит по нему
+   * настоящие секреты вместо масок. */
+  _connFormStep = {
+    id: '__conn__',
+    connector_type:   rec ? rec.type : 'postgresql',
+    connector_config: JSON.stringify(rec ? (rec.config || {}) : {}),
+    connection_id:    id || '',
+    is_sink:          false,
+    transform_sql:    '',
+    target_table:     '',
+  };
+
+  document.getElementById('conn-form-title').textContent = rec ? 'Изменение подключения' : 'Новое подключение';
+  document.getElementById('conn-name').value = rec ? rec.name : '';
+  document.getElementById('conn-status').textContent = '';
+  document.getElementById('conn-editor').style.display = '';
+  renderConnEditorForm();
+  document.getElementById('conn-name').focus();
+}
+
+/* Кнопки типов — те же наборы, что в карточке шага, и та же форма под ними. */
+function renderConnEditorForm() {
+  const cur  = _connFormStep.connector_type;
+  /* Один набор типов: подключение не делится на источник и приёмник. */
+  const opts = SOURCE_OPTIONS;
+  document.getElementById('conn-type-buttons').innerHTML = opts.map(([v, name]) =>
+    `<button type="button" class="btn btn-sm${cur === v ? ' btn-primary' : ''}"
+             onclick="connSetType('${v}')">${escHtml(name)}</button>`).join('');
+  document.getElementById('step-conn-cfg--1').innerHTML =
+    makeConnectorConfigHTML(_connFormStep, CONN_FORM_IDX);
+  /* В подключении — только параметры доступа. Запрос к данным задаётся в шаге
+   * конвейера, потому что у каждого конвейера он свой. */
+  applyConnFieldFilter('step-conn-cfg--1', _connFormStep.connector_type, 'access');
+}
+
+function connSetType(type) {
+  if (_connFormStep.connector_type === type) return;
+  _connFormStep.connector_type   = type;
+  _connFormStep.connector_config = '{}';   /* у другого типа другие ключи */
+  renderConnEditorForm();
+}
+
+function closeConnectionEditor() {
+  document.getElementById('conn-editor').style.display = 'none';
+  _connEditId = null;
+  _connAfterSave = null;
+}
+
+/* Тело запроса. Конфиг уже собран самой формой в _connFormStep.connector_config
+ * (через pbUpdateConnConfig), поэтому здесь его достаточно разобрать. Секрет,
+ * оставленный маской, уходит как есть — сервер поймёт это как «не менять». */
+function collectConnectionForm() {
+  return {
+    name: document.getElementById('conn-name').value.trim(),
+    type: _connFormStep.connector_type,
+    config: safeParse(_connFormStep.connector_config, {}),
+  };
+}
+
+async function saveConnection() {
+  const body = collectConnectionForm();
+  const st = document.getElementById('conn-status');
+  if (!body.name) { showToast('Укажите название подключения', 'warn'); return; }
+  st.textContent = 'Сохранение…';
+  try {
+    const saved = _connEditId
+      ? await apiPut('/api/connections/' + encodeURIComponent(_connEditId), body)
+      : await apiPost('/api/connections', body);
+    st.textContent = '';
+    showToast('Подключение сохранено', 'ok');
+    const cb = _connAfterSave;
+    closeConnectionEditor();
+    await loadConnectionsView();
+    if (cb && saved && saved.id) cb(saved.id);
+  } catch (err) {
+    st.textContent = '';
+    showToast(`Не удалось сохранить: ${escHtml(String(err))}`, 'error');
+  }
+}
+
+async function deleteConnection(id) {
+  const rec = connCache.find(c => c.id === id);
+  const used = countStepsUsingConnection(id);
+  const warn = used
+    ? `\n\nНа него ссылаются шаги конвейеров: ${used}. Эти шаги перестанут запускаться, пока вы не выберете им другое подключение.`
+    : '';
+  if (!confirm(`Удалить подключение «${rec ? rec.name : id}»?${warn}`)) return;
+  try {
+    await apiDelete('/api/connections/' + encodeURIComponent(id));
+    showToast('Подключение удалено', 'ok');
+    await loadConnectionsView();
+  } catch (err) {
+    showToast(`Не удалось удалить: ${escHtml(String(err))}`, 'error');
+  }
+}
 
 async function loadMatviews() {
   const el = document.getElementById('matviews-list');
