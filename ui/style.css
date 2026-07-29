@@ -1623,19 +1623,41 @@ details[open] .st-summary::before { content: '▼ '; }
  * должны занимать всю ячейку — иначе они короче соседних полей ввода и ряд
  * выглядит рваным. Глобальное .conn-group select{width:auto} задумано для
  * прежней flex-вёрстки, здесь его перебиваем. */
+/* Сетка полей форм подключения.
+ *
+ * Раньше это был grid с колонками minmax(270px, 1fr): поле «Порт» занимало
+ * столько же места, сколько «Путь к сертификату», и формы зияли пустотой.
+ * Теперь ряд переносится по мере надобности, а ширину каждому полю задаёт
+ * его собственная корзина .fw-* — по длине того, что в поле пишут. */
 .conn-grid {
-  display: grid;
-  /* auto-FILL, а не auto-fit: одиночное поле в ряду занимает одну колонку,
-   * а не растягивается на всю ширину — иначе выпадающий список шириной
-   * в экран выглядит нелепо и ломает выравнивание соседних рядов. */
-  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: .6rem 1rem;
-  align-items: start;
+  align-items: flex-start;
   margin-top: .2rem;
 }
-.conn-group .conn-grid select,
-.conn-group .conn-grid input[type=number] { width: 100%; max-width: none; }
-.conn-group .conn-grid select { text-align: left; text-align-last: left; }
+.conn-grid > .form-group { margin: 0; flex: 0 0 auto; min-width: 0; }
+.conn-grid > .form-group > input,
+.conn-grid > .form-group > select,
+.conn-grid > .form-group > textarea { width: 100%; max-width: none; }
+
+/* Корзины ширины: xs — число, s — короткое имя, m — хост или топик,
+ * l — адрес либо путь, full — многострочное поле на всю ширину. */
+.fw-xs   { width: 96px; }
+.fw-s    { width: 176px; }
+.fw-m    { width: 264px; }
+.fw-l    { width: 420px; }
+.fw-full { flex: 1 1 100%; width: 100%; }
+
+/* На узком экране длинные поля занимают всю строку — иначе появляется
+   горизонтальная прокрутка. */
+@media (max-width: 780px) {
+  .fw-l { flex: 1 1 100%; width: 100%; }
+  .fw-m { width: 100%; }
+}
+
+/* Подпись длиннее своего поля не должна его расталкивать. */
+.conn-grid > .form-group > label { overflow: hidden; text-overflow: ellipsis; }
 
 /* Ряды действий выравниваем по левому краю — так же, как поля и заголовки.
  * Раньше они прижимались вправо и висели в отрыве от своего блока. */

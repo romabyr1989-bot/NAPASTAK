@@ -1462,6 +1462,95 @@ const CONN_SHARED_KEYS = {
   kafka: ['data_format'],
 };
 
+/* Ширина поля — по тому, что в него пишут, а не по колонке сетки.
+ *
+ * Корзины: xs — число (порт, размер страницы), s — короткое имя (логин, схема,
+ * тег, версия), m — хост, база, топик, заголовок, l — адрес или путь в файловой
+ * системе, full — многострочное поле во всю ширину.
+ *
+ * Ключ ищется сначала в разделе своего типа, потом в общем: у Oracle схема
+ * длиннее, чем у Postgres, а «Топик» у Kafka длиннее обычного короткого имени. */
+const CONN_FIELD_WIDTH = {
+  '*': {
+    /* адреса и пути */
+    url: 'l', path: 'l', read_url: 'l', wsdl_url: 'l', namespace: 'l',
+    ssl_ca_location: 'l', ssl_certificate_location: 'l', ssl_key_location: 'l',
+    ssl_keystore_location: 'l', ssl_truststore_location: 'l',
+    sasl_kerberos_keytab: 'l', schema_registry_url: 'l',
+    schema_registry_ca_location: 'l', request_template: 'full',
+    post_body: 'full', table: 'full', query: 'full',
+    /* хост, база, идентификаторы среднего размера */
+    host: 'm', brokers: 'm', dbname: 'm', service_name: 'm', topic: 'm',
+    group_id: 'm', io_name: 'm', soap_action: 'm', auth_header: 'm',
+    data_path: 'm', sasl_kerberos_principal: 'm', schema_registry_auth: 'm',
+    auth_token: 'm', librdkafka_debug: 'm',
+    /* короткие имена и переключатели */
+    user: 's', password: 's', schema: 's', cursor_column: 's', cdc_slot: 's',
+    row_tag: 's', root_tag: 's', sink_row_tag: 's', operation: 's',
+    primary_key: 's', sink_entity: 's', delimiter: 's', header: 's',
+    method: 's', auth_type: 's', soap_version: 's', page_param: 's',
+    page_type: 's', total_field: 's', read_mode: 's', offset_reset: 's',
+    offset_start_mode: 's', isolation_level: 's', data_format: 's',
+    security_protocol: 'm', sasl_mechanism: 's', sasl_username: 's',
+    sasl_password: 's', sasl_kerberos_service_name: 's',
+    ssl_key_password: 's', ssl_truststore_password: 's',
+    broker_address_family: 's',
+    /* числа */
+    port: 'xs', page_size: 'xs', batch_size: 'xs', connect_timeout: 'xs',
+    offset_value: 'xs', partition: 'xs',
+  },
+  oracle:    { schema: 'm' },              /* TSMDM_IN и подобные длиннее */
+  greenplum: { schema: 'm' },
+};
+
+/* Проставляет полям класс ширины. Вызывается после отрисовки формы — так одна
+ * таблица обслуживает и карточку шага, и форму подключения, не размазываясь по
+ * шести десяткам мест в разметке. */
+function applyFieldWidths(container, type) {
+  const el = typeof container === 'string' ? document.getElementById(container) : container;
+  if (!el) return;
+
+  /* Разметка задаёт каждый ряд отдельной сеткой — это имело смысл, пока колонки
+   * были равной ширины. Теперь поля меряются по содержимому, и такой ряд с одним
+   * коротким полем оставлял справа пустоту в пол-экрана. Склеиваем соседние
+   * сетки в одну: поля идут потоком и переносятся сами, когда кончается место. */
+  el.querySelectorAll('.conn-grid').forEach(g => {
+    const prev = g.previousElementSibling;
+    if (!prev || !prev.classList.contains('conn-grid')) return;
+    while (g.firstChild) prev.appendChild(g.firstChild);
+    g.remove();
+  });
+  const own = CONN_FIELD_WIDTH[type] || {};
+  const all = CONN_FIELD_WIDTH['*'];
+  el.querySelectorAll('.form-group').forEach(g => {
+    if (/\bfw-/.test(g.className)) return;               /* уже размечено */
+    const n = g.querySelector('[oninput],[onchange],[onclick]');
+    if (!n) return;
+    const h = (n.getAttribute('oninput') || '') + ';' +
+              (n.getAttribute('onchange') || '') + ';' + (n.getAttribute('onclick') || '');
+    let key = null;
+    const m = h.match(/pbUpdateConnConfig\(\s*-?\d+\s*,\s*'([a-zA-Z_0-9]+)'/);
+    if (m) key = m[1];
+    else for (const fn in CONN_HANDLER_KEYS)
+      if (h.indexOf(fn + '(') >= 0) { key = CONN_HANDLER_KEYS[fn]; break; }
+    /* Инлайновые ширины из разметки (flex:2, width:50%, max-width) перебили бы
+     * класс — снимаем их: ширину теперь задаёт корзина, и только она. */
+    g.style.width = ''; g.style.maxWidth = ''; g.style.flex = ''; g.style.gridColumn = '';
+    /* Многострочное поле — всегда во всю ширину. Выпадающий список меряем по
+     * самому длинному варианту: таблица корзин не знает, что «Только новые
+     * строки — по полю-отметке» длиннее, чем «Все строки». */
+    const sel = g.querySelector('select');
+    let w;
+    if (g.querySelector('textarea')) w = 'full';
+    else if (sel) {
+      const longest = [...sel.options].reduce(
+        (a, o) => Math.max(a, (o.textContent || '').trim().length), 0);
+      w = longest <= 12 ? 's' : longest <= 26 ? 'm' : 'l';
+    } else w = own[key] || all[key] || 'm';
+    g.classList.add('fw-' + w);
+  });
+}
+
 /* Обработчики, правящие конфиг не через pbUpdateConnConfig. */
 const CONN_HANDLER_KEYS = {
   pbSetKafkaSecurity: 'security_protocol',
@@ -1550,6 +1639,7 @@ function pbRerenderStepCfg(idx) {
   /* В карточке шага фильтр обязателен и после частичной перерисовки, иначе
    * туда всплывут параметры доступа. */
   applyConnFieldFilter('step-conn-cfg-' + idx, stepConnType(step), 'request');
+  applyFieldWidths('step-conn-cfg-' + idx, stepConnType(step));
 }
 
 /* Привязать шаг к подключению из справочника (или отвязать при пустом id). */
@@ -2273,10 +2363,10 @@ function makeSinkFieldsHTML(step, idx) {
   const ENT = {
     csv:        ['Путь файла',        './data/export.csv'],
     parquet:    ['Путь файла',        './data/export.parquet'],
-    json_http:  ['URL (пусто = из конфига)', 'https://hooks.example.com/ingest'],
+    json_http:  ['URL', 'https://hooks.example.com/ingest'],
     postgresql: ['Таблица назначения', 'public.export_table'],
-    greenplum:  ['Таблица назначения', 'public.export_table'],
-    oracle:     ['Таблица назначения', 'EXPORT_TABLE'],
+    greenplum:  ['Таблица назначения', 'stg_customers'],
+    oracle:     ['Таблица назначения', 'ORDERS_EXPORT'],
     kafka:      ['Топик',              'dfo_export'],
   }[step.connector_type] || ['Назначение', ''];
   const mode = step.sink_mode || 'append';
@@ -2451,6 +2541,7 @@ function renderBuilderSteps() {
     const t = stepType(st);
     if (CONNECTOR_TYPES.includes(t) || t.startsWith('sink:'))
       applyConnFieldFilter('step-conn-cfg-' + i, stepConnType(st), 'request');
+      applyFieldWidths('step-conn-cfg-' + i, stepConnType(st));
   });
 }
 
@@ -2608,7 +2699,7 @@ function makeStepCard(step, idx) {
       <div class="form-group" style="margin:0">
         <label>${t.startsWith('sink:') ? 'Что выгружать (SQL)' : t === 'matchrules' ? 'Набор кандидатов (SQL)' : t === 'scd2' ? 'Источник — срез данных (SQL)' : lang === 'sql' ? 'SQL-трансформация' : 'Входные данные (SQL → df)'}</label>
         <textarea class="mono-textarea" rows="4"
-                  placeholder="SELECT * FROM {@prev} WHERE ..."
+                  placeholder="SELECT * FROM {@prev}"
                   oninput="pbUpdateStep(${idx},'transform_sql',this.value)">${escHtml(step.transform_sql || '')}</textarea>
         <div class="conn-actions" style="display:flex;margin-top:.4rem">
           <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
@@ -2620,7 +2711,7 @@ function makeStepCard(step, idx) {
     <div class="step-header">
       <button class="step-collapse" onclick="pbToggleStep(${idx})" title="Свернуть / развернуть шаг" aria-label="Свернуть / развернуть">▾</button>
       <span class="step-num">${idx + 1}</span>
-      <input class="step-name-input" type="text" placeholder="Название шага"
+      <input class="step-name-input" type="text" placeholder="Загрузка клиентов из Oracle"
              value="${escAttr(step.name)}"
              oninput="pbUpdateStep(${idx},'name',this.value);renderFlowGraph()">
       <button class="step-del" onclick="pbRemoveStep(${idx})" title="Удалить шаг" aria-label="Удалить шаг">×</button>
@@ -2628,7 +2719,7 @@ function makeStepCard(step, idx) {
     <div class="step-body">
       <div class="step-row-2">
         <div class="form-group" style="margin:0">
-          <label>Тип шага <span class="label-hint">= какое поле заполнено</span></label>
+          <label>Тип шага</label>
           <select class="step-type-select" onchange="pbChangeStepType(${idx}, this.value)">
             <optgroup label="Загрузка данных">
               <option value="source" ${CONNECTOR_TYPES.includes(t)?'selected':''}>Источник</option>
@@ -2728,7 +2819,7 @@ function makeConnectorConfigHTML(step, idx) {
     return `
     <div class="conn-group">
       <div class="conn-group-title">CSV-файл</div>
-      <div class="step-row-2" style="align-items:end">
+      <div class="conn-grid">
         ${step.is_sink ? '' : `
         <div class="form-group" style="margin:0;flex:2">
           <label>Путь к файлу</label>
@@ -2771,7 +2862,7 @@ function makeConnectorConfigHTML(step, idx) {
         <label>Путь или glob-паттерн</label>
         <input type="text" value="${escAttr(cfg.path || '')}"
                oninput="pbUpdateConnConfig(${idx},'path',this.value)"
-               placeholder="/data/exports/*.parquet">
+               placeholder="/data/exports/orders_*.parquet">
       </div>
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
@@ -2791,9 +2882,9 @@ function makeConnectorConfigHTML(step, idx) {
     /* Только активные поля → раскладываем в 2 колонки (grid), без пустых ячеек;
        при нечётном числе последнее поле растягивается на всю ширину. */
     const fields = [];
-    fields.push(`<label>Адрес (URL)</label>
+    fields.push(`<label>Адрес</label>
       <input type="text" value="${escAttr(cfg.url || '')}"
-             oninput="pbUpdateConnConfig(${idx},'url',this.value)" placeholder="https://api.example.com/data">`);
+             oninput="pbUpdateConnConfig(${idx},'url',this.value)" placeholder="https://api.example.com/v1/orders">`);
     if (!step.is_sink) fields.push(`<label>Метод</label>
       <select onchange="pbUpdateConnConfig(${idx},'method',this.value);${reRender}">
         <option value="GET"  ${method==='GET' ?'selected':''}>GET</option>
@@ -2807,7 +2898,7 @@ function makeConnectorConfigHTML(step, idx) {
       </select>`);
     if (auth !== 'none') fields.push(`<label>${auth==='bearer' ? 'Токен' : 'Значение ключа'}</label>
       <input type="text" value="${escAttr(cfg.auth_token || '')}"
-             oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="sk-...">`);
+             oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="eyJhbGciOiJIUzI1NiJ9">`);
     if (auth === 'api_key') fields.push(`<label>Имя заголовка</label>
       <input type="text" value="${escAttr(cfg.auth_header || '')}"
              oninput="pbUpdateConnConfig(${idx},'auth_header',this.value)" placeholder="X-API-Key">`);
@@ -2817,7 +2908,7 @@ function makeConnectorConfigHTML(step, idx) {
                oninput="pbUpdateConnConfig(${idx},'data_path',this.value)" placeholder="data.items">`);
       fields.push(`<label>Параметр пагинации</label>
         <input type="text" value="${escAttr(cfg.page_param || '')}"
-               oninput="pbUpdateConnConfig(${idx},'page_param',this.value)" placeholder="пусто = без пагинации">`);
+               oninput="pbUpdateConnConfig(${idx},'page_param',this.value)" placeholder="offset">`);
       fields.push(`<label>Тип пагинации</label>
         <select onchange="pbUpdateConnConfig(${idx},'page_type',this.value);${reRender}">
           <option value="offset" ${ptype==='offset'?'selected':''}>По смещению (offset)</option>
@@ -2836,12 +2927,13 @@ function makeConnectorConfigHTML(step, idx) {
     return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к REST API</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">${grid}</div>
+      <div class="conn-grid">${grid}</div>
       ${(!step.is_sink && method==='POST') ? `
       <div class="form-group" style="margin:.5rem 0 0">
-        <label>Тело запроса (JSON)</label>
+        <label>Тело запроса</label>
         <textarea class="mono-textarea" rows="3" placeholder='{"query":"..."}'
-                  oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body || '')}</textarea>
+                  oninput="pbUpdateConnConfig(${idx},'post_body',this.value)"
+                  placeholder='{"filter":{"status":"active"},"limit":100}'>${escHtml(cfg.post_body || '')}</textarea>
       </div>` : ''}
       ${step.is_sink ? '' : `
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
@@ -2861,7 +2953,7 @@ function makeConnectorConfigHTML(step, idx) {
         <div class="form-group" style="margin:0">
           <label>Размер страницы</label>
           <input type="number" min="1" value="${escAttr(cfg.page_size || 1000)}"
-                 oninput="pbUpdateConnConfig(${idx},'page_size',parseInt(this.value,10)||1000)">
+                 oninput="pbUpdateConnConfig(${idx},'page_size',parseInt(this.value,10)||1000)" placeholder="1000">
         </div>`;
     const actions = step.is_sink ? '' : `
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
@@ -2875,18 +2967,18 @@ function makeConnectorConfigHTML(step, idx) {
     return `
     <div class="conn-group">
       <div class="conn-group-title">${step.is_sink ? 'Приёмник' : 'Источник'} Siebel</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">
+      <div class="conn-grid">
         <div class="form-group" style="margin:0;grid-column:1/-1">
           <label>Адрес сервиса Siebel</label>
-          <input type="text" value="${escAttr(cfg.url || '')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">
+          <input type="text" value="${escAttr(cfg.url || '')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)" placeholder="https://siebel.example.com/siebel/v1.0/service/ContactInterface">
         </div>
         <div class="form-group" style="margin:0">
           <label>Объект интеграции</label>
-          <input type="text" value="${escAttr(cfg.io_name || '')}" oninput="pbUpdateConnConfig(${idx},'io_name',this.value)">
+          <input type="text" value="${escAttr(cfg.io_name || '')}" oninput="pbUpdateConnConfig(${idx},'io_name',this.value)" placeholder="Contact Interface">
         </div>
         <div class="form-group" style="margin:0">
           <label>Пользователь</label>
-          <input type="text" value="${escAttr(cfg.user || '')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)">
+          <input type="text" value="${escAttr(cfg.user || '')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="SADMIN">
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль</label>
@@ -2904,11 +2996,11 @@ function makeConnectorConfigHTML(step, idx) {
     const reR = `pbRerenderStepCfg(${idx})`;
     const f = [];
     f.push(`<label>Веб-адрес</label>
-      <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">`);
+      <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)" placeholder="https://api.example.com/v1/orders.xml">`);
     f.push(`<label>Путь к файлу</label>
-      <input type="text" value="${escAttr(cfg.path||'')}" oninput="pbUpdateConnConfig(${idx},'path',this.value)">`);
+      <input type="text" value="${escAttr(cfg.path||'')}" oninput="pbUpdateConnConfig(${idx},'path',this.value)" placeholder="/var/lib/napastak/in/orders.xml">`);
     f.push(`<label>Тег одной записи</label>
-      <input type="text" value="${escAttr(cfg.row_tag||'')}" oninput="pbUpdateConnConfig(${idx},'row_tag',this.value)">`);
+      <input type="text" value="${escAttr(cfg.row_tag||'')}" oninput="pbUpdateConnConfig(${idx},'row_tag',this.value)" placeholder="order">`);
     if (!step.is_sink) {
       f.push(`<label>Метод запроса</label>
         <select onchange="pbUpdateConnConfig(${idx},'method',this.value);${reR}">
@@ -2916,10 +3008,10 @@ function makeConnectorConfigHTML(step, idx) {
           <option value="POST" ${method==='POST'?'selected':''}>POST</option>
         </select>`);
       f.push(`<label>Параметр постраничной загрузки</label>
-        <input type="text" value="${escAttr(cfg.page_param||'')}" oninput="pbUpdateConnConfig(${idx},'page_param',this.value)">`);
+        <input type="text" value="${escAttr(cfg.page_param||'')}" oninput="pbUpdateConnConfig(${idx},'page_param',this.value)" placeholder="offset">`);
     } else {
       f.push(`<label>Корневой тег документа</label>
-        <input type="text" value="${escAttr(cfg.root_tag||'rows')}" oninput="pbUpdateConnConfig(${idx},'root_tag',this.value)">`);
+        <input type="text" value="${escAttr(cfg.root_tag||'rows')}" oninput="pbUpdateConnConfig(${idx},'root_tag',this.value)" placeholder="rows">`);
     }
     f.push(`<label>Авторизация</label>
       <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value);${reR}">
@@ -2928,15 +3020,15 @@ function makeConnectorConfigHTML(step, idx) {
         <option value="bearer" ${auth==='bearer'?'selected':''}>Bearer-токен</option>
       </select>`);
     if (auth==='basic') {
-      f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)">`);
+      f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="api_user">`);
       f.push(`<label>Пароль</label><input type="password" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
     } else if (auth==='bearer') {
-      f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)">`);
+      f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="eyJhbGciOiJIUzI1NiJ9">`);
     }
     const grid = f.map((x,i)=>`<div class="form-group" style="margin:0${(i===f.length-1&&f.length%2===1)?';grid-column:1/-1':''}">${x}</div>`).join('');
     const postBody = (!step.is_sink && method==='POST') ? `
       <div class="form-group" style="margin:.5rem 0 0"><label>Тело запроса</label>
-        <textarea class="mono-textarea" rows="3" oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body||'')}</textarea></div>` : '';
+        <textarea class="mono-textarea" rows="3" oninput="pbUpdateConnConfig(${idx},'post_body',this.value)" placeholder="&lt;request&gt;&lt;entity&gt;orders&lt;/entity&gt;&lt;limit&gt;1000&lt;/limit&gt;&lt;/request&gt;">${escHtml(cfg.post_body||'')}</textarea></div>` : '';
     const actions = step.is_sink ? '' : `
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
@@ -2948,7 +3040,7 @@ function makeConnectorConfigHTML(step, idx) {
     return `
     <div class="conn-group">
       <div class="conn-group-title">${step.is_sink?'Приёмник':'Источник'} XML</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">${grid}</div>
+      <div class="conn-grid">${grid}</div>
       ${postBody}
       ${actions}
     </div>`;
@@ -2960,9 +3052,9 @@ function makeConnectorConfigHTML(step, idx) {
     const reR = `pbRerenderStepCfg(${idx})`;
     const f = [];
     f.push(`<label>Адрес сервиса</label>
-      <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)">`);
+      <input type="text" value="${escAttr(cfg.url||'')}" oninput="pbUpdateConnConfig(${idx},'url',this.value)" placeholder="https://eai.example.ru/services/OrderService">`);
     f.push(`<label>Действие SOAP</label>
-      <input type="text" value="${escAttr(cfg.soap_action||'')}" oninput="pbUpdateConnConfig(${idx},'soap_action',this.value)">`);
+      <input type="text" value="${escAttr(cfg.soap_action||'')}" oninput="pbUpdateConnConfig(${idx},'soap_action',this.value)" placeholder="http://services.example.ru/orders/v1/GetOrders">`);
     f.push(`<label>Версия SOAP</label>
       <select onchange="pbUpdateConnConfig(${idx},'soap_version',this.value)">
         <option value="1.1" ${ver==='1.1'?'selected':''}>1.1</option>
@@ -2970,14 +3062,14 @@ function makeConnectorConfigHTML(step, idx) {
       </select>`);
     if (step.is_sink) {
       f.push(`<label>Имя операции</label>
-        <input type="text" value="${escAttr(cfg.operation||'')}" oninput="pbUpdateConnConfig(${idx},'operation',this.value)">`);
+        <input type="text" value="${escAttr(cfg.operation||'')}" oninput="pbUpdateConnConfig(${idx},'operation',this.value)" placeholder="Import">`);
       f.push(`<label>Пространство имён</label>
-        <input type="text" value="${escAttr(cfg.namespace||'')}" oninput="pbUpdateConnConfig(${idx},'namespace',this.value)">`);
+        <input type="text" value="${escAttr(cfg.namespace||'')}" oninput="pbUpdateConnConfig(${idx},'namespace',this.value)" placeholder="http://services.example.ru/orders/v1">`);
       f.push(`<label>Тег одной строки</label>
-        <input type="text" value="${escAttr(cfg.sink_row_tag||'row')}" oninput="pbUpdateConnConfig(${idx},'sink_row_tag',this.value)">`);
+        <input type="text" value="${escAttr(cfg.sink_row_tag||'row')}" oninput="pbUpdateConnConfig(${idx},'sink_row_tag',this.value)" placeholder="row">`);
     } else {
       f.push(`<label>Тег записи в ответе</label>
-        <input type="text" value="${escAttr(cfg.row_tag||'')}" oninput="pbUpdateConnConfig(${idx},'row_tag',this.value)">`);
+        <input type="text" value="${escAttr(cfg.row_tag||'')}" oninput="pbUpdateConnConfig(${idx},'row_tag',this.value)" placeholder="Order">`);
     }
     f.push(`<label>Авторизация</label>
       <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value);${reR}">
@@ -2986,16 +3078,16 @@ function makeConnectorConfigHTML(step, idx) {
         <option value="bearer" ${auth==='bearer'?'selected':''}>Bearer-токен</option>
       </select>`);
     if (auth==='basic') {
-      f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)">`);
+      f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="svc_eai">`);
       f.push(`<label>Пароль</label><input type="password" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
     } else if (auth==='bearer') {
-      f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)">`);
+      f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="eyJhbGciOiJIUzI1NiJ9">`);
     }
     const grid = f.map((x,i)=>`<div class="form-group" style="margin:0${(i===f.length-1&&f.length%2===1)?';grid-column:1/-1':''}">${x}</div>`).join('');
     const tpl = step.is_sink ? '' : `
       <div class="form-group" style="margin:.5rem 0 0"><label>Шаблон SOAP-запроса</label>
         <textarea class="mono-textarea" rows="5"
-                  oninput="pbUpdateConnConfig(${idx},'request_template',this.value)">${escHtml(cfg.request_template||'')}</textarea></div>`;
+                  oninput="pbUpdateConnConfig(${idx},'request_template',this.value)" placeholder="&lt;soap:Envelope xmlns:soap=&quot;http://schemas.xmlsoap.org/soap/envelope/&quot;&gt;…&lt;/soap:Envelope&gt;">${escHtml(cfg.request_template||'')}</textarea></div>`;
     const actions = step.is_sink ? '' : `
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
@@ -3007,7 +3099,7 @@ function makeConnectorConfigHTML(step, idx) {
     return `
     <div class="conn-group">
       <div class="conn-group-title">${step.is_sink?'Приёмник':'Источник'} SOAP</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">${grid}</div>
+      <div class="conn-grid">${grid}</div>
       ${tpl}
       ${actions}
     </div>`;
@@ -3016,8 +3108,8 @@ function makeConnectorConfigHTML(step, idx) {
   if (type === 'postgresql') return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к PostgreSQL</div>
-      <div style="display:flex;gap:.75rem 1rem;align-items:flex-start;flex-wrap:wrap">
-        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem">
+      <div class="conn-grid">
+        <div style="display:contents">
           <div class="form-group" style="margin:0">
             <label>База данных</label>
             <input type="text" value="${escAttr(cfg.dbname || '')}"
@@ -3034,7 +3126,7 @@ function makeConnectorConfigHTML(step, idx) {
                    oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="5432">
           </div>
         </div>
-        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem;align-self:stretch">
+        <div style="display:contents">
           <div class="form-group" style="margin:0">
             <label>Пользователь</label>
             <input type="text" value="${escAttr(cfg.user || '')}"
@@ -3056,18 +3148,18 @@ function makeConnectorConfigHTML(step, idx) {
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
       ${step.is_sink ? '' : `
-      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
+      <div class="conn-grid" style="margin-top:.6rem">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
           <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);pbRerenderStepCfg(${idx})">
-            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
-            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
+            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки</option>
+            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки</option>
             <option value="cdc"    ${cfg.read_mode==='cdc'            ?'selected':''}>Изменения из журнала БД (CDC)</option>
           </select>
         </div>
         ${cfg.read_mode==='cursor' ? `
         <div class="form-group" style="margin:0;flex:2">
-          <label>Поле-отметка <span class="label-hint">монотонное: id / updated_at</span></label>
+          <label>Поле-отметка</label>
           <input type="text" value="${escAttr(cfg.cursor_column || '')}"
                  oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)" placeholder="updated_at">
         </div>` : ''}
@@ -3081,7 +3173,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="form-group" style="margin:.6rem 0 0">
         <label>Запрос к источнику</label>
         <textarea class="mono-textarea" rows="3"
-                  placeholder="orders   или   SELECT * FROM orders WHERE active = true"
+                  placeholder="SELECT * FROM orders WHERE created_at &gt;= &#x27;2026-01-01&#x27;"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
         ${/* Только в форме подключения. В карточке шага предпросмотр уже есть
              сверху, под выбором подключения, и вывод уходит именно туда
@@ -3099,17 +3191,17 @@ function makeConnectorConfigHTML(step, idx) {
   if (type === 'greenplum') return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к Greenplum</div>
-      <div style="display:flex;gap:.75rem 1rem;align-items:flex-start;flex-wrap:wrap">
-        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem">
+      <div class="conn-grid">
+        <div style="display:contents">
           <div class="form-group" style="margin:0">
             <label>База данных</label>
             <input type="text" value="${escAttr(cfg.dbname || '')}"
-                   oninput="pbUpdateConnConfig(${idx},'dbname',this.value)" placeholder="postgres">
+                   oninput="pbUpdateConnConfig(${idx},'dbname',this.value)" placeholder="tsmdm">
           </div>
           <div class="form-group" style="margin:0">
             <label>Хост</label>
             <input type="text" value="${escAttr(cfg.host || '')}"
-                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="localhost">
+                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="gp-master.prod.internal">
           </div>
           <div class="form-group" style="margin:0;max-width:90px">
             <label>Порт</label>
@@ -3117,11 +3209,11 @@ function makeConnectorConfigHTML(step, idx) {
                    oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="5432">
           </div>
         </div>
-        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem;align-self:stretch">
+        <div style="display:contents">
           <div class="form-group" style="margin:0">
             <label>Пользователь</label>
             <input type="text" value="${escAttr(cfg.user || '')}"
-                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="postgres">
+                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="gpadmin">
           </div>
           <div class="form-group" style="margin:0">
             <label>Схема</label>
@@ -3144,12 +3236,12 @@ function makeConnectorConfigHTML(step, idx) {
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
       ${step.is_sink ? '' : `
-      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
+      <div class="conn-grid" style="margin-top:.6rem">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
           <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');pbRerenderStepCfg(${idx})">
-            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
-            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
+            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки</option>
+            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки</option>
           </select>
         </div>
         ${cfg.read_mode==='cursor' ? `
@@ -3162,7 +3254,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="form-group" style="margin:.6rem 0 0">
         <label>Запрос к источнику</label>
         <textarea class="mono-textarea" rows="3"
-                  placeholder="orders   или   SELECT * FROM orders WHERE active = true"
+                  placeholder="SELECT * FROM customers WHERE last_upd_ts &gt; &#x27;2026-01-01&#x27;"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
         ${/* Только в форме подключения. В карточке шага предпросмотр уже есть
              сверху, под выбором подключения, и вывод уходит именно туда
@@ -3180,8 +3272,8 @@ function makeConnectorConfigHTML(step, idx) {
   if (type === 'oracle') return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к Oracle</div>
-      <div style="display:flex;gap:.75rem 1rem;align-items:flex-start;flex-wrap:wrap">
-        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem">
+      <div class="conn-grid">
+        <div style="display:contents">
           <div class="form-group" style="margin:0">
             <label>Имя сервиса</label>
             <input type="text" value="${escAttr(cfg.service_name || '')}"
@@ -3190,7 +3282,7 @@ function makeConnectorConfigHTML(step, idx) {
           <div class="form-group" style="margin:0">
             <label>Хост</label>
             <input type="text" value="${escAttr(cfg.host || '')}"
-                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="localhost">
+                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="oracle.prod.internal">
           </div>
           <div class="form-group" style="margin:0;max-width:90px">
             <label>Порт</label>
@@ -3198,11 +3290,11 @@ function makeConnectorConfigHTML(step, idx) {
                    oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="1521">
           </div>
         </div>
-        <div style="flex:1 1 130px;display:flex;flex-direction:column;gap:.6rem;align-self:stretch">
+        <div style="display:contents">
           <div class="form-group" style="margin:0">
             <label>Пользователь</label>
             <input type="text" value="${escAttr(cfg.user || '')}"
-                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="oracle">
+                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="TSMDM_USER">
           </div>
           <div class="form-group" style="margin:0">
             <label>Схема</label>
@@ -3225,12 +3317,12 @@ function makeConnectorConfigHTML(step, idx) {
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
       ${step.is_sink ? '' : `
-      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
+      <div class="conn-grid" style="margin-top:.6rem">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
           <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');pbRerenderStepCfg(${idx})">
-            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки — каждый раз заново</option>
-            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки — по полю-отметке</option>
+            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки</option>
+            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки</option>
           </select>
         </div>
         ${cfg.read_mode==='cursor' ? `
@@ -3243,7 +3335,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="form-group" style="margin:.6rem 0 0">
         <label>Запрос к источнику</label>
         <textarea class="mono-textarea" rows="3"
-                  placeholder="ORDERS   или   SELECT * FROM orders WHERE active = 1"
+                  placeholder="SELECT * FROM S_ORG_EXT WHERE LAST_UPD &gt; SYSDATE - 7"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
         ${/* Только в форме подключения. В карточке шага предпросмотр уже есть
              сверху, под выбором подключения, и вывод уходит именно туда
@@ -3279,36 +3371,30 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Брокеры</label>
-          <input type="text" value="${escAttr(cfg.brokers || '')}" placeholder="localhost:9092"
+          <input type="text" value="${escAttr(cfg.brokers || '')}" placeholder="kafka-1:9092,kafka-2:9092"
                  oninput="pbUpdateConnConfig(${idx},'brokers',this.value)">
         </div>
         ${step.is_sink ? '' : `
         <div class="form-group" style="margin:0">
           <label>Группа консьюмера</label>
-          <input type="text" value="${escAttr(cfg.group_id || '')}" placeholder="dfo_consumer"
+          <input type="text" value="${escAttr(cfg.group_id || '')}" placeholder="napastak-orders"
                  oninput="pbUpdateConnConfig(${idx},'group_id',this.value)">
         </div>`}
         <div class="form-group" style="margin:0">
-          <label>Топик${step.is_sink ? ' (назначение)' : ''}</label>
-          <input type="text" value="${escAttr(cfg.topic || '')}" placeholder="orders"
+          <label>Топик</label>
+          <input type="text" value="${escAttr(cfg.topic || '')}" placeholder="dfo_export"
                  oninput="pbUpdateConnConfig(${idx},'topic',this.value)">
         </div>
         <div class="form-group" style="margin:0">
           <label>Защита соединения</label>
           <select onchange="pbSetKafkaSecurity(${idx},this.value)">
-            <option value=""               ${sec===''              ?'selected':''}>Без шифрования и авторизации (PLAINTEXT)</option>
+            <option value=""               ${sec===''              ?'selected':''}>PLAINTEXT</option>
             <option value="SASL_SSL"       ${sec==='SASL_SSL'       ?'selected':''}>SASL + TLS</option>
             <option value="SASL_PLAINTEXT" ${sec==='SASL_PLAINTEXT' ?'selected':''}>SASL без TLS</option>
             <option value="SSL"            ${sec==='SSL'            ?'selected':''}>Только TLS</option>
           </select>
         </div>
       </div>
-      ${sec ? '' : `
-      <div style="font-size:.74rem;color:var(--muted);border-left:2px solid var(--border);padding:.3rem .5rem;margin:.5rem 0 0">
-        Выберите «Защиту соединения» — появятся поля аутентификации (логин, пароль,
-        механизм SASL) и сертификатов (truststore, keystore). Сейчас подключение
-        настроено без шифрования и авторизации.
-      </div>`}
 
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
@@ -3316,7 +3402,7 @@ function makeConnectorConfigHTML(step, idx) {
           <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);pbRerenderStepCfg(${idx})">
             <option value="json" ${fmt==='json'?'selected':''}>JSON</option>
             <option value="csv"  ${fmt==='csv' ?'selected':''}>CSV</option>
-            <option value="avro" ${fmt==='avro'?'selected':''}>Avro (реестр схем)</option>
+            <option value="avro" ${fmt==='avro'?'selected':''}>Avro</option>
           </select>
         </div>
         ${step.is_sink ? '' : `
@@ -3328,26 +3414,26 @@ function makeConnectorConfigHTML(step, idx) {
           </select>
         </div>
         <div class="form-group" style="margin:0">
-          <label>Режим чтения (isolation)</label>
+          <label>Режим чтения</label>
           <select onchange="pbUpdateConnConfig(${idx},'isolation_level',this.value)">
-            <option value="read_uncommitted" ${iso==='read_uncommitted'?'selected':''}>read_uncommitted (совместимо со всеми брокерами)</option>
-            <option value="read_committed"   ${iso==='read_committed'  ?'selected':''}>read_committed (только транзакционные источники, Kafka 0.11+)</option>
+            <option value="read_uncommitted" ${iso==='read_uncommitted'?'selected':''}>read_uncommitted</option>
+            <option value="read_committed"   ${iso==='read_committed'  ?'selected':''}>read_committed</option>
           </select>
         </div>
         <div class="form-group" style="margin:0">
-          <label>Стартовая позиция (совместимость)</label>
+          <label>Стартовая позиция</label>
           ${(() => {
             const isNumeric = /^\d+$/.test(osm);
             const sel = isNumeric ? 'numeric' : osm;
             return `
           <select onchange="pbSetKafkaOffsetStartMode(${idx},this.value)">
-            <option value="logical"  ${sel==='logical' ?'selected':''}>logical (обычные брокеры — резолв через ListOffsets)</option>
-            <option value="absolute" ${sel==='absolute'?'selected':''}>absolute (брокер/прокси без ListOffsets — чтение с offset 0, автопереход на latest при OFFSET_OUT_OF_RANGE)</option>
-            <option value="numeric"  ${sel==='numeric' ?'selected':''}>точный offset вручную (ни earliest, ни latest не резолвятся — offset берётся у владельца брокера)</option>
+            <option value="logical"  ${sel==='logical' ?'selected':''}>logical</option>
+            <option value="absolute" ${sel==='absolute'?'selected':''}>absolute</option>
+            <option value="numeric"  ${sel==='numeric' ?'selected':''}>Точный offset вручную</option>
           </select>
           ${isNumeric ? `
           <input type="number" min="0" step="1" value="${escAttr(osm)}" style="margin-top:.35rem"
-                 placeholder="например 15230"
+                 placeholder="15230"
                  oninput="pbUpdateConnConfig(${idx},'offset_start_mode',this.value)">` : ''}`;
           })()}
         </div>`}
@@ -3367,7 +3453,7 @@ function makeConnectorConfigHTML(step, idx) {
         ${isKerberos ? '' : `
         <div class="form-group" style="margin:0">
           <label>Пользователь</label>
-          <input type="text" value="${escAttr(cfg.sasl_username || '')}" placeholder="имя пользователя (Confluent Cloud — API-ключ)"
+          <input type="text" value="${escAttr(cfg.sasl_username || '')}" placeholder="etl_reader"
                  oninput="pbUpdateConnConfig(${idx},'sasl_username',this.value)">
         </div>
         <div class="form-group" style="margin:0">
@@ -3383,32 +3469,29 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Kerberos — принципал</label>
-          <input type="text" value="${escAttr(cfg.sasl_kerberos_principal || '')}" placeholder="user@REALM"
+          <input type="text" value="${escAttr(cfg.sasl_kerberos_principal || '')}" placeholder="napastak@CORP.LOCAL"
                  oninput="pbUpdateConnConfig(${idx},'sasl_kerberos_principal',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Kerberos — keytab (путь на сервере)</label>
+          <label>Kerberos — keytab</label>
           <input type="text" value="${escAttr(cfg.sasl_kerberos_keytab || '')}" placeholder="/etc/security/dfo.keytab"
                  oninput="pbUpdateConnConfig(${idx},'sasl_kerberos_keytab',this.value)">
         </div>
-        <div style="grid-column:1/-1;font-size:.72rem;color:var(--muted)">
-          Значения KAFKA_KERBEROS_KEYTAB / _PRINCIPAL / _SERVICE_NAME из окружения
-          гейтвея, если заданы, перекрывают указанное здесь.
-        </div>`}
+`}
       </div>` : ''}
       ${needsTls ? `
       <div style="font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:.9rem 0 .1rem">Сертификаты и доверенные корни</div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
-          <label>CA‑сертификат (путь на сервере)</label>
+          <label>CA‑сертификат</label>
           <input type="text" value="${escAttr(cfg.ssl_ca_location || '')}" placeholder="/opt/dataflow-os/certs/ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'ssl_ca_location',this.value)">
         </div>
       </div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
-          <label>Truststore PKCS#12 (вместо CA‑файла)</label>
-          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="truststore.p12 / .pfx"
+          <label>Truststore PKCS#12</label>
+          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="/opt/dataflow-os/certs/truststore.p12"
                  oninput="pbUpdateConnConfig(${idx},'ssl_truststore_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
@@ -3419,25 +3502,25 @@ function makeConnectorConfigHTML(step, idx) {
       </div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
-          <label>Клиентский сертификат (mTLS, необяз.)</label>
-          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="client.pem / client.p12"
+          <label>Клиентский сертификат</label>
+          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="/opt/dataflow-os/certs/client.pem"
                  oninput="pbUpdateConnConfig(${idx},'ssl_certificate_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Клиентский ключ (для PEM/DER)</label>
-          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="client.key — не нужен для PKCS#12"
+          <label>Клиентский ключ</label>
+          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="/opt/dataflow-os/certs/client.key"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Пароль ключа / keystore</label>
+          <label>Пароль ключа</label>
           <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>
       </div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
-          <label>PKCS#12 keystore (необяз., альтернатива cert+key)</label>
-          <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="client.p12 / client.pfx"
+          <label>PKCS#12 keystore</label>
+          <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="/opt/dataflow-os/certs/client.p12"
                  oninput="pbUpdateConnConfig(${idx},'ssl_keystore_location',this.value)">
         </div>
       </div>` : ''}
@@ -3446,18 +3529,18 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Адрес Schema Registry</label>
-          <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="https://registry:8081"
+          <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="https://schema-registry:8081"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_url',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Авторизация реестра (user:pass)</label>
-          <input type="password" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="user:pass" autocomplete="off"
+          <label>Авторизация реестра</label>
+          <input type="password" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
         </div>
       </div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
-          <label>CA реестра (для private CA, необяз.)</label>
+          <label>CA реестра</label>
           <input type="text" value="${escAttr(cfg.schema_registry_ca_location || '')}" placeholder="/opt/dataflow-os/certs/registry-ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_ca_location',this.value)">
         </div>
@@ -3467,18 +3550,18 @@ function makeConnectorConfigHTML(step, idx) {
            главное: адрес брокеров и защиту соединения. */''}
       <details style="margin-top:.6rem">
         <summary style="cursor:pointer;font-size:.74rem;color:var(--muted);user-select:none">Дополнительно: сеть и диагностика</summary>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;margin-top:.5rem">
+        <div class="conn-grid" style="margin-top:.5rem">
           <div class="form-group" style="margin:0">
             <label>Семейство адресов</label>
             <select onchange="pbUpdateConnConfig(${idx},'broker_address_family',this.value)">
-              <option value="v4"  ${(cfg.broker_address_family||'v4')==='v4' ?'selected':''}>IPv4 (по умолчанию)</option>
+              <option value="v4"  ${(cfg.broker_address_family||'v4')==='v4' ?'selected':''}>IPv4</option>
               <option value="v6"  ${cfg.broker_address_family==='v6' ?'selected':''}>IPv6</option>
               <option value="any" ${cfg.broker_address_family==='any'?'selected':''}>Любое</option>
             </select>
           </div>
           <div class="form-group" style="margin:0">
             <label>Отладка librdkafka</label>
-            <input type="text" value="${escAttr(cfg.librdkafka_debug || '')}" placeholder="broker,security — пусто выключает"
+            <input type="text" value="${escAttr(cfg.librdkafka_debug || '')}" placeholder="broker,security"
                    oninput="pbUpdateConnConfig(${idx},'librdkafka_debug',this.value)">
           </div>
         </div>
@@ -6163,6 +6246,7 @@ function renderConnEditorBody() {
    * отдельным блоком: здесь они задают ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ для всех шагов на
    * этом подключении, а шаг конвейера их переопределяет. Слияние на сервере
    * ровно такое же: конфиг подключения — база, конфиг шага — сверху. */
+  applyFieldWidths(box, _connFormStep.connector_type);
   groupStepDefaults(box, _connFormStep.connector_type);
 }
 
@@ -6194,14 +6278,10 @@ function groupStepDefaults(box, type) {
   const title = document.createElement('div');
   title.className = 'conn-group-title';
   title.textContent = 'Значения по умолчанию для шагов';
-  const hint = document.createElement('div');
-  hint.style.cssText = 'font-size:.72rem;color:var(--muted);margin:-.2rem 0 .4rem';
-  hint.textContent = 'Подставляются в шаги конвейеров на этом подключении. ' +
-                     'В самом шаге любое из них можно задать по-своему — значение шага главнее.';
   const row = document.createElement('div');
   row.className = 'conn-grid';          /* та же сетка, что и у полей доступа */
   move.forEach(g => row.appendChild(g));
-  sec.appendChild(title); sec.appendChild(hint); sec.appendChild(row);
+  sec.appendChild(title); sec.appendChild(row);
 
   /* Предпросмотр читает данные по параметрам запроса (топик, таблица, запрос) —
    * значит, его место под этими полями, а не в блоке доступа: иначе кнопка
@@ -6251,7 +6331,11 @@ function addAccessFieldsFromSinkVariant(box, formStep) {
   const row = document.createElement('div');
   row.className = 'conn-grid';
   extra.forEach(g => row.appendChild(g));
-  box.appendChild(row);
+  /* Дописывать в конец нельзя: там уже стоит ряд с «Подключиться», и поле
+   * доступа оказывалось ПОД кнопкой, разрезая блок надвое. Ставим перед ним. */
+  const acts = box.querySelector('.conn-actions');
+  if (acts) acts.parentNode.insertBefore(row, acts);
+  else      box.appendChild(row);
 }
 
 function connSetType(type) {
