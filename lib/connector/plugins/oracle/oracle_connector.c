@@ -662,10 +662,18 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->schema = sc;
     batch->ncols  = ncols_out;
 
-    /* Колонки фиксированного размера limit (реальное nrows ≤ limit). */
+    /* Колонки фиксированного размера limit (реальное nrows ≤ limit).
+     * Ширина ячейки — по ОБЪЯВЛЕННОМУ типу: хранилище читает INT64 и BOOL как
+     * int64_t, DOUBLE как double. Раньше здесь всегда был char*, и в числовую
+     * колонку уезжал указатель: на живом Oracle id приходил как 5098454304
+     * вместо 42, сумма — как 4.99e-311. Тот же дефект был в pg и greenplum. */
     for (int c = 0; c < ncols_out; c++) {
         batch->null_bitmap[c] = arena_calloc(a, ((size_t)limit + 7) / 8);
-        batch->values[c]      = arena_alloc(a, (size_t)limit * sizeof(char *));
+        size_t esz = (sc->cols[c].type == COL_DOUBLE) ? sizeof(double)
+                   : (sc->cols[c].type == COL_INT64 ||
+                      sc->cols[c].type == COL_BOOL)   ? sizeof(int64_t)
+                                                      : sizeof(char *);
+        batch->values[c]      = arena_calloc(a, (size_t)limit * esz);
     }
 
     int nrows = 0;
@@ -694,11 +702,29 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
             if (dpiStmt_getQueryValue(st, (uint32_t)(c+1), &nt, &d) != DPI_SUCCESS
                 || !d || d->isNull) {
                 batch->null_bitmap[oc][nrows/8] |= (uint8_t)(1u << (nrows % 8));
-                ((char **)batch->values[oc])[nrows] = arena_strdup(a, DFO_NULL_SENTINEL);
+                if (sc->cols[oc].type != COL_INT64 && sc->cols[oc].type != COL_DOUBLE &&
+                    sc->cols[oc].type != COL_BOOL)
+                    ((char **)batch->values[oc])[nrows] = arena_strdup(a, DFO_NULL_SENTINEL);
                 continue;
             }
             char *s = ora_cell_to_str(a, ctx->conn, nt, otype[oc], d);
-            ((char **)batch->values[oc])[nrows] = s;
+            switch (sc->cols[oc].type) {
+            case COL_INT64:
+                ((int64_t *)batch->values[oc])[nrows] = s ? (int64_t)strtoll(s, NULL, 10) : 0;
+                break;
+            case COL_DOUBLE:
+                ((double *)batch->values[oc])[nrows] = s ? strtod(s, NULL) : 0.0;
+                break;
+            case COL_BOOL:
+                /* хранилище читает булев столбец как int64_t, а не как int */
+                ((int64_t *)batch->values[oc])[nrows] =
+                    (s && (s[0]=='t' || s[0]=='T' || s[0]=='1')) ? 1 : 0;
+                break;
+            default:
+                ((char **)batch->values[oc])[nrows] = s;
+                break;
+            }
+            /* закладка курсора — всегда текстовое представление */
             if (oc == cursor_out_idx) last_cursor_val = s;
         }
         nrows++;
@@ -729,6 +755,34 @@ static int ora_exec_chk(dpiConn *conn, const char *sql) {
     return rc == DPI_SUCCESS ? 0 : -1;
 }
 
+/* Имя колонки для DDL и INSERT.
+ *
+ * Oracle приводит НЕзаквоченные идентификаторы к верхнему регистру, а
+ * заквоченные хранит буква в букву. Приёмник квотил имена как есть — из
+ * внутренней таблицы они приходят строчными, — поэтому создавал колонки
+ * "id"/"customer" и не мог писать в уже существующую таблицу с обычными
+ * ID/CUSTOMER: ORA-00904 «invalid identifier». Ровно та же логика уже
+ * применена к имени таблицы (см. комментарий в ora_write_batch).
+ *
+ * Обычный идентификатор отдаём без кавычек в верхнем регистре — тогда он
+ * совпадёт и с созданной нами таблицей, и с чужой. Всё необычное (пробелы,
+ * кириллица, знаки) по-прежнему квотим: без кавычек Oracle его не примет. */
+static void ora_col_ident(char *dst, size_t dstsz, const char *name) {
+    if (!name || !name[0]) { snprintf(dst, dstsz, "\"col\""); return; }
+    int plain = ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z'));
+    for (const char *q = name; plain && *q; q++)
+        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+              (*q >= '0' && *q <= '9') || *q == '_' || *q == '$' || *q == '#'))
+            plain = 0;
+    if (!plain) { snprintf(dst, dstsz, "\"%s\"", name); return; }
+    size_t i = 0;
+    for (; name[i] && i + 1 < dstsz; i++) {
+        char ch = name[i];
+        dst[i] = (ch >= 'a' && ch <= 'z') ? (char)(ch - 'a' + 'A') : ch;
+    }
+    dst[i] = '\0';
+}
+
 /* Создаёт целевую таблицу при необходимости (все колонки VARCHAR2(4000)),
  * при OVERWRITE делает TRUNCATE, затем вставляет строки пачками по ORA_INS_CHUNK
  * через INSERT ALL. Значения экранируются вручную (одинарная кавычка → ''). */
@@ -743,8 +797,10 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
     /* CREATE TABLE IF NOT EXISTS через PL/SQL (в Oracle нет IF NOT EXISTS). */
     {
         size_t cap = 256 + (size_t)ncols * 80; char *cols = malloc(cap); size_t off = 0;
-        for (int c = 0; c < ncols; c++)
-            off += (size_t)snprintf(cols+off, cap-off, "%s\"%s\" VARCHAR2(4000)", c?", ":"", schema->cols[c].name);
+        for (int c = 0; c < ncols; c++) {
+            char ci_[130]; ora_col_ident(ci_, sizeof(ci_), schema->cols[c].name);
+            off += (size_t)snprintf(cols+off, cap-off, "%s%s VARCHAR2(4000)", c?", ":"", ci_);
+        }
         size_t dcap = cap + 600; char *ddl = malloc(dcap);
         /* Имя таблицы НЕ цитируем — Oracle приведёт его к UPPER, ровно так же
          * её потом находит read_batch (тоже без кавычек). С кавычками sink
@@ -765,8 +821,10 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
     /* Список колонок "(\"c1\", \"c2\", ...)" — общий для всех чанков INSERT ALL. */
     char collist[4096]; size_t co = 0;
     co += (size_t)snprintf(collist+co, sizeof(collist)-co, "(");
-    for (int c = 0; c < ncols; c++)
-        co += (size_t)snprintf(collist+co, sizeof(collist)-co, "%s\"%s\"", c?", ":"", schema->cols[c].name);
+    for (int c = 0; c < ncols; c++) {
+        char ci_[130]; ora_col_ident(ci_, sizeof(ci_), schema->cols[c].name);
+        co += (size_t)snprintf(collist+co, sizeof(collist)-co, "%s%s", c?", ":"", ci_);
+    }
     snprintf(collist+co, sizeof(collist)-co, ")");
 
     int written = 0;
