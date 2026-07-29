@@ -7971,6 +7971,24 @@ static void h_connector_probe_ping(HttpReq *req, HttpResp *resp) {
     arena_destroy(a);
 }
 
+/* Предпросмотр обязан быть БЕЗ ПОСЛЕДСТВИЙ.
+ *
+ * У Kafka явный group_id включает инкрементальную семантику: читаем с
+ * закоммиченного смещения и коммитим после чтения. Поэтому «Показать
+ * сообщения» в интерфейсе съедало сообщения у боевого конвейера — на живом
+ * брокере из 200 сообщений в конвейер доезжало 195, ровно на длину
+ * предпросмотра. Подменяем group_id на значение по умолчанию: коннектор
+ * заводит эфемерную группу, читает с начала и ничего не коммитит.
+ * Для прочих типов ключ незнакомый и просто игнорируется. */
+static const char *probe_readonly_cfg(Arena *a, const char *cfg_json) {
+    if (!cfg_json) return cfg_json;
+    JVal *base = json_parse(a, cfg_json, strlen(cfg_json));
+    if (!base || base->type != JV_OBJECT) return cfg_json;
+    const char *ov = "{\"group_id\":\"dfo-consumer\"}";
+    JVal *over = json_parse(a, ov, strlen(ov));
+    return conn_merge_config(a, base, over);
+}
+
 /* POST /api/connector/probe/preview  {"type","config","query","limit"}
  * Reads one batch from the source via the connector and returns it as
  * {"columns":[...], "rows":[[...]]} — used to preview the source query. */
@@ -7999,7 +8017,7 @@ static void h_connector_probe_preview(HttpReq *req, HttpResp *resp) {
         }
     }
 
-    ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
+    ConnectorInst *inst = load_connector_by_type(a, type, probe_readonly_cfg(a, cfg_json));
     if (!inst) { http_resp_error(resp,500,"connector load failed"); arena_destroy(a); return; }
     const DfoConnector *api = connector_api(inst);
     void *ctx = connector_ctx(inst);
