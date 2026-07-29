@@ -1768,7 +1768,7 @@ function kafkaFriendlyError(err) {
                                                                             'Не удалось прочитать доверенные сертификаты — проверьте «Пароль truststore» и путь к файлу (.p12/.pfx или PEM).'],
     [/certificate verify|verify failed|broker certificate|SSL handshake|ssl handshake|CERTIFICATE_VERIFY|unable to get local issuer|self.signed/i,
                                                                             'Сертификат брокера не прошёл проверку — проверьте «CA‑сертификат» и соответствие имени хоста в сертификате.'],
-    [/PKCS12|keystore|private key|bad decrypt|key values mismatch|ssl.key/i,'Проблема с клиентским сертификатом/ключом — проверьте пути и «Пароль keystore / ключа».'],
+    [/PKCS12|keystore|private key|bad decrypt|key values mismatch|ssl.key/i,'Проблема с клиентским сертификатом/ключом — проверьте пути и «Пароль ключа / keystore».'],
     /* Kerberos/GSSAPI — ВЫШЕ общего SASL: текст ошибок GSSAPI часто содержит
      * «sasl» (напр. "sasl_cyrus: GSSAPI Error"), иначе маршрутизируется в
      * подсказку про логин/пароль, которых для GSSAPI нет. */
@@ -3378,7 +3378,7 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Пароль keystore / ключа</label>
+          <label>Пароль ключа / keystore</label>
           <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>
@@ -6066,11 +6066,48 @@ function renderConnEditorForm() {
   document.getElementById('conn-type-buttons').innerHTML = opts.map(([v, name]) =>
     `<button type="button" class="btn btn-sm${cur === v ? ' btn-primary' : ''}"
              onclick="connSetType('${v}')">${escHtml(name)}</button>`).join('');
-  document.getElementById('step-conn-cfg--1').innerHTML =
-    makeConnectorConfigHTML(_connFormStep, CONN_FORM_IDX);
+  const box = document.getElementById('step-conn-cfg--1');
+  box.innerHTML = makeConnectorConfigHTML(_connFormStep, CONN_FORM_IDX);
+  /* Подключение не знает про роль, а форма коннектора кое-где ветвится по
+   * is_sink: часть полей доступа рисуется ТОЛЬКО в варианте приёмника
+   * (у SOAP — «Пространство имён»). Показываем объединение обоих вариантов,
+   * иначе такое поле не появилось бы нигде: в шаге его скроет фильтр доступа,
+   * а сюда оно не попало бы вовсе. */
+  addAccessFieldsFromSinkVariant(box, _connFormStep);
   /* В подключении — только параметры доступа. Запрос к данным задаётся в шаге
    * конвейера, потому что у каждого конвейера он свой. */
   applyConnFieldFilter('step-conn-cfg--1', _connFormStep.connector_type, 'access');
+}
+
+/* Добавляет в форму подключения поля доступа, которые форма рисует только для
+ * приёмника. Дубликаты не создаём: ключ, уже присутствующий в разметке,
+ * пропускаем. */
+function addAccessFieldsFromSinkVariant(box, formStep) {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = makeConnectorConfigHTML(
+    Object.assign({}, formStep, { is_sink: true }), CONN_FORM_IDX);
+
+  const keyOf = (el) => {
+    const n = el.querySelector('[oninput],[onchange],[onclick]');
+    if (!n) return null;
+    const h = (n.getAttribute('oninput') || '') + ';' + (n.getAttribute('onchange') || '');
+    const m = h.match(/pbUpdateConnConfig\(\s*-?\d+\s*,\s*'([a-zA-Z_0-9]+)'/);
+    return m ? m[1] : null;
+  };
+  const have = new Set();
+  box.querySelectorAll('.form-group').forEach(g => { const k = keyOf(g); if (k) have.add(k); });
+
+  const extra = [];
+  tmp.querySelectorAll('.form-group').forEach(g => {
+    const k = keyOf(g);
+    if (k && !have.has(k)) { have.add(k); extra.push(g); }
+  });
+  if (!extra.length) return;
+  const row = document.createElement('div');
+  row.className = 'step-row-2';
+  row.style.marginTop = '.4rem';
+  extra.forEach(g => row.appendChild(g));
+  box.appendChild(row);
 }
 
 function connSetType(type) {
