@@ -355,7 +355,13 @@ static int soap_ping(void *vctx) {
     if (hdrs) curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
     if (res!=CURLE_OK) { snprintf(ctx->last_err,sizeof(ctx->last_err),"Ошибка соединения с %s: %s",ctx->url,curl_easy_strerror(res)); return -1; }
-    if (code>=500) { snprintf(ctx->last_err,sizeof(ctx->last_err),"HTTP %ld от %s",code,ctx->url); return -1; }
+    /* 501 Not Implemented на HEAD — это НЕ отказ сервиса. Проба ходит HEAD-ом
+     * (CURLOPT_NOBODY), а SOAP-эндпоинты часто отвечают на него 501 или 405,
+     * принимая при этом обычные POST-запросы. Раньше такой сервис показывался
+     * как «нет связи», хотя конвейер по нему успешно читал данные — проба
+     * противоречила реальности. Сам факт HTTP-ответа означает, что адрес
+     * доступен; настоящие отказы (500, 502, 503) по-прежнему считаем ошибкой. */
+    if (code>=500 && code!=501) { snprintf(ctx->last_err,sizeof(ctx->last_err),"HTTP %ld от %s",code,ctx->url); return -1; }
     return 0;
 }
 
