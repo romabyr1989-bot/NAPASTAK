@@ -1540,18 +1540,16 @@ function stepRenderView(step) {
 
 /* Единая точка перерисовки формы запроса в карточке шага. */
 function pbRerenderStepCfg(idx) {
+  /* Редактор подключения собирается только своей функцией — иначе после
+   * переключателя пропадали поля варианта приёмника и секция умолчаний. */
+  if (idx === CONN_FORM_IDX) { renderConnEditorBody(); return; }
   const el = document.getElementById('step-conn-cfg-' + idx);
   if (!el) return;
   const step = pbStep(idx);
-  el.innerHTML = makeConnectorConfigHTML(
-    idx === CONN_FORM_IDX ? step : stepRenderView(step), idx);
-  /* Фильтр обязателен и после ЧАСТИЧНОЙ перерисовки (смена защиты Kafka, режима
-   * чтения и т.п.): без него в редакторе подключения всплывали бы поля запроса
-   * (топик, группа консьюмера), попадали в конфиг подключения и становились
-   * базой сразу для всех конвейеров. */
-  applyConnFieldFilter('step-conn-cfg-' + idx,
-                       idx === CONN_FORM_IDX ? _connFormStep.connector_type : stepConnType(step),
-                       idx === CONN_FORM_IDX ? 'access' : 'request');
+  el.innerHTML = makeConnectorConfigHTML(stepRenderView(step), idx);
+  /* В карточке шага фильтр обязателен и после частичной перерисовки, иначе
+   * туда всплывут параметры доступа. */
+  applyConnFieldFilter('step-conn-cfg-' + idx, stepConnType(step), 'request');
 }
 
 /* Привязать шаг к подключению из справочника (или отвязать при пустом id). */
@@ -6099,7 +6097,17 @@ function renderConnEditorForm() {
   document.getElementById('conn-type-buttons').innerHTML = opts.map(([v, name]) =>
     `<button type="button" class="btn btn-sm${cur === v ? ' btn-primary' : ''}"
              onclick="connSetType('${v}')">${escHtml(name)}</button>`).join('');
+  renderConnEditorBody();
+}
+
+/* Тело формы подключения. ЕДИНСТВЕННАЯ точка сборки: её же зовёт
+ * pbRerenderStepCfg при частичной перерисовке (смена протокола, формата,
+ * режима чтения, стартовой позиции). Раньше перерисовка шла другим путём и
+ * теряла и поля варианта приёмника, и секцию значений по умолчанию — поля
+ * «то есть, то нет» в зависимости от переключения. */
+function renderConnEditorBody() {
   const box = document.getElementById('step-conn-cfg--1');
+  if (!box || !_connFormStep) return;
   box.innerHTML = makeConnectorConfigHTML(_connFormStep, CONN_FORM_IDX);
   /* Подключение не знает про роль, а форма коннектора кое-где ветвится по
    * is_sink: часть полей доступа рисуется ТОЛЬКО в варианте приёмника
