@@ -170,12 +170,19 @@ static int pg_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     PgCtx *ctx = vctx;
     if (!ctx || !ctx->conn) return -1;
 
+    /* Раньше список ограничивался схемой public — таблицы в любой другой схеме
+     * не показывались вовсе, хотя читать их можно (см. pg_qualify_dup). Имя
+     * возвращаем в том же виде, в каком его принимает чтение: из public — просто
+     * table, из прочих — schema.table. */
     PGresult *r = PQexec(ctx->conn,
-        "SELECT table_name, table_type "
+        "SELECT CASE WHEN table_schema = 'public' THEN table_name "
+        "            ELSE table_schema || '.' || table_name END AS name, "
+        "       table_type "
         "FROM information_schema.tables "
-        "WHERE table_schema = 'public' "
+        "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
+        "  AND table_schema NOT LIKE 'pg_toast%' "
         "  AND table_type IN ('BASE TABLE','VIEW') "
-        "ORDER BY table_name");
+        "ORDER BY 1");
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         LOG_ERROR("pg list_entities: %s", PQerrorMessage(ctx->conn));
@@ -200,13 +207,28 @@ static int pg_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     PgCtx *ctx = vctx;
     if (!ctx || !ctx->conn) return -1;
 
-    const char *params[1] = { entity };
+    /* Имя может прийти со схемой (dwh.orders) — разбираем по последней точке;
+     * без схемы ищем по search_path, а не только в public. */
+    char schema_buf[128] = "", table_buf[256] = "";
+    const char *dot = entity ? strrchr(entity, '.') : NULL;
+    if (dot) {
+        size_t sl = (size_t)(dot - entity);
+        if (sl >= sizeof(schema_buf)) sl = sizeof(schema_buf) - 1;
+        memcpy(schema_buf, entity, sl); schema_buf[sl] = '\0';
+        snprintf(table_buf, sizeof(table_buf), "%s", dot + 1);
+    } else {
+        snprintf(table_buf, sizeof(table_buf), "%s", entity ? entity : "");
+    }
+
+    const char *params[2] = { table_buf, schema_buf[0] ? schema_buf : NULL };
     PGresult *r = PQexecParams(ctx->conn,
         "SELECT column_name, data_type, is_nullable "
         "FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = $1 "
+        "WHERE table_name = $1 "
+        "  AND ($2::text IS NULL OR table_schema = $2) "
+        "  AND ($2::text IS NOT NULL OR table_schema = ANY (current_schemas(false))) "
         "ORDER BY ordinal_position",
-        1, NULL, params, NULL, NULL, 0);
+        2, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         LOG_ERROR("pg describe %s: %s", entity, PQerrorMessage(ctx->conn));
@@ -266,6 +288,35 @@ static void pg_cdc_ensure_slot(PgCtx *ctx) {
     PQclear(cr);
 }
 
+/* Заворачивает имя сущности в кавычки как идентификатор, понимая точку между
+ * схемой и таблицей: dwh.orders — это ДВА идентификатора, а "dwh.orders" —
+ * одно имя с точкой внутри. Раньше и чтение, и запись квотили строку целиком,
+ * поэтому любая таблица со схемой давала «отношение не существует».
+ * Каждая часть экранируется отдельно, так что имя по-прежнему не инъектируется.
+ * Возвращает malloc-строку (освобождать free) либо NULL. */
+static char *pg_qualify_dup(PGconn *c, const char *ent) {
+    if (!ent || !ent[0]) return NULL;
+    if (strchr(ent, '"')) return strdup(ent);      /* заквотили до нас — не трогаем */
+
+    const char *dot = strrchr(ent, '.');
+    char *qs = NULL, *qt = NULL, *out = NULL;
+    if (!dot) {
+        qt = PQescapeIdentifier(c, ent, strlen(ent));
+        if (qt) out = strdup(qt);
+    } else {
+        qs = PQescapeIdentifier(c, ent, (size_t)(dot - ent));
+        qt = PQescapeIdentifier(c, dot + 1, strlen(dot + 1));
+        if (qs && qt) {
+            size_t n = strlen(qs) + strlen(qt) + 2;
+            out = malloc(n);
+            if (out) snprintf(out, n, "%s.%s", qs, qt);
+        }
+    }
+    if (qs) PQfreemem(qs);
+    if (qt) PQfreemem(qt);
+    return out;
+}
+
 /* ── read_batch(): читаем один батч строк из PG ──
  * Два режима, выбор по конфигу:
  *   • OFFSET-пагинация (по умолчанию): cursor — строковое целое смещение.
@@ -317,8 +368,12 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         char base[PG_MAX_SQL];
         if (strncasecmp(src, "SELECT", 6) == 0)
             snprintf(base, sizeof(base), "(%s) _dfo_q", src);
-        else
-            snprintf(base, sizeof(base), "\"%s\"", src);
+        else {
+            char *qi = pg_qualify_dup(ctx->conn, src);
+            if (!qi) return -1;
+            snprintf(base, sizeof(base), "%s", qi);
+            free(qi);
+        }
 
         const char *cursor = (req && req->cursor) ? req->cursor : "";
         if (cursor[0]) {
@@ -340,6 +395,7 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         int64_t offset = 0;
         if (req && req->cursor && req->cursor[0])
             offset = (int64_t)strtoll(req->cursor, NULL, 10);
+        char *qi = NULL;
         if (strncasecmp(src, "SELECT", 6) == 0)
             /* Subquery: LIMIT/OFFSET across batches is only stable if the user's
              * SELECT carries its own ORDER BY (or use cursor_column mode). We can't
@@ -347,14 +403,17 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
             snprintf(sql, sizeof(sql),
                 "SELECT * FROM (%s) _dfo_q LIMIT %lld OFFSET %lld",
                 src, (long long)limit, (long long)offset);
-        else
+        else {
             /* Plain table: without ORDER BY, PostgreSQL does not guarantee a stable
              * row order, so OFFSET paging across batches could skip or duplicate
              * rows. ctid (physical row id) gives a cheap, deterministic scan order
              * for a static table. */
+            qi = pg_qualify_dup(ctx->conn, src);
+            if (!qi) return -1;
             snprintf(sql, sizeof(sql),
-                "SELECT * FROM \"%s\" ORDER BY ctid LIMIT %lld OFFSET %lld",
-                src, (long long)limit, (long long)offset);
+                "SELECT * FROM %s ORDER BY ctid LIMIT %lld OFFSET %lld",
+                qi, (long long)limit, (long long)offset);
+        }
         res = PQexec(ctx->conn, sql);
         /* Views and foreign tables have no ctid column — fall back to unordered
          * paging (the user should add ORDER BY / use cursor_column for those). */
@@ -363,10 +422,11 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
             strstr(PQerrorMessage(ctx->conn), "ctid")) {
             PQclear(res);
             snprintf(sql, sizeof(sql),
-                "SELECT * FROM \"%s\" LIMIT %lld OFFSET %lld",
-                src, (long long)limit, (long long)offset);
+                "SELECT * FROM %s LIMIT %lld OFFSET %lld",
+                qi, (long long)limit, (long long)offset);
             res = PQexec(ctx->conn, sql);
         }
+        free(qi);
     }
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -402,26 +462,49 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->ncols  = ncols;
     batch->nrows  = nrows;
 
-    /* All columns store char* TEXT values regardless of logical type. */
+    /* Массив значений должен соответствовать ОБЪЯВЛЕННОМУ типу колонки: хранилище
+     * читает INT64 и BOOL как int64_t, DOUBLE как double, остальное как char*.
+     * Раньше здесь всегда лежал char*, и для числовых колонок наверх уезжал сам
+     * указатель — id приходил как 4979278304, amount как 2.46e-314. Заметно это
+     * только на живой БД, поэтому дефект дожил до сюда. */
     for (int c = 0; c < ncols; c++) {
         batch->null_bitmap[c] = arena_calloc(a, ((size_t)nrows + 7) / 8);
-        batch->values[c] = arena_alloc(a, (size_t)nrows * sizeof(char *));
+        size_t esz = (sc->cols[c].type == COL_DOUBLE) ? sizeof(double)
+                   : (sc->cols[c].type == COL_INT64 ||
+                      sc->cols[c].type == COL_BOOL)   ? sizeof(int64_t)
+                                                      : sizeof(char *);
+        batch->values[c] = arena_calloc(a, (size_t)nrows * esz);
     }
 
-    /* Fill values — always the source text from PQgetvalue (bool normalised to
-     * true/false). NULL -> sentinel + bitmap bit, for every type. */
+    /* Значение разбираем в тот вид, который объявили в схеме. NULL помечаем в
+     * битовой карте; типизированные ячейки при этом остаются нулями (память из
+     * arena_calloc), текстовые получают маркер — так же, как делает CSV. */
     for (int r = 0; r < nrows; r++) {
         for (int c = 0; c < ncols; c++) {
             if (PQgetisnull(res, r, c)) {
                 batch->null_bitmap[c][r/8] |= (uint8_t)(1u << (r % 8));
-                ((char **)batch->values[c])[r] = (char *)DFO_NULL_SENTINEL;
+                if (sc->cols[c].type != COL_INT64 && sc->cols[c].type != COL_DOUBLE &&
+                    sc->cols[c].type != COL_BOOL)
+                    ((char **)batch->values[c])[r] = (char *)DFO_NULL_SENTINEL;
                 continue;
             }
             const char *v = PQgetvalue(res, r, c);
-            if (sc->cols[c].type == COL_BOOL)
-                ((char **)batch->values[c])[r] = (char *)((v[0]=='t'||v[0]=='T'||v[0]=='1') ? "true" : "false");
-            else
+            switch (sc->cols[c].type) {
+            case COL_INT64:
+                ((int64_t *)batch->values[c])[r] = (int64_t)strtoll(v, NULL, 10);
+                break;
+            case COL_DOUBLE:
+                ((double *)batch->values[c])[r] = strtod(v, NULL);
+                break;
+            case COL_BOOL:
+                /* хранилище читает булев столбец как int64_t, а не как int */
+                ((int64_t *)batch->values[c])[r] =
+                    (v[0]=='t' || v[0]=='T' || v[0]=='1') ? 1 : 0;
+                break;
+            default:
                 ((char **)batch->values[c])[r] = arena_strdup(a, v);
+                break;
+            }
         }
     }
 
@@ -518,7 +601,7 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
     }
     int ncols = batch->ncols;
 
-    char *eident = PQescapeIdentifier(ctx->conn, entity, strlen(entity));
+    char *eident = pg_qualify_dup(ctx->conn, entity);
     if (!eident) return -1;
 
     /* Optional primary key (sink config). When non-empty we emit a PRIMARY KEY
@@ -531,13 +614,13 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
     if (npk > 0) {
         if (pg_pk_ident_list(ctx->conn, pk_names, npk, pk_idents, sizeof(pk_idents)) < 0) {
             LOG_ERROR("pg sink: failed to build primary_key identifier list");
-            PQfreemem(eident); return -1;
+            free(eident); return -1;
         }
     }
     /* Mark which schema columns belong to the PK (raw-name match) so the UPSERT
      * SET clause updates only non-key columns. */
     unsigned char *col_is_pk = calloc((size_t)(ncols > 0 ? ncols : 1), 1);
-    if (!col_is_pk) { PQfreemem(eident); return -1; }
+    if (!col_is_pk) { free(eident); return -1; }
     int n_nonpk = ncols;
     if (npk > 0) {
         n_nonpk = 0;
@@ -572,11 +655,11 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
             off += (size_t)snprintf(ddl+off, cap-off, ", PRIMARY KEY (%s)", pk_idents);
         snprintf(ddl+off, cap-off, ")");
         int rc = pg_exec_ok_ctx(ctx, ddl); free(ddl);
-        if (rc < 0) { free(col_is_pk); PQfreemem(eident); return -1; }
+        if (rc < 0) { free(col_is_pk); free(eident); return -1; }
     }
     if (mode == DFO_SINK_OVERWRITE) {
         char trunc[512]; snprintf(trunc, sizeof(trunc), "TRUNCATE TABLE %s", eident);
-        if (pg_exec_ok_ctx(ctx, trunc) < 0) { free(col_is_pk); PQfreemem(eident); return -1; }
+        if (pg_exec_ok_ctx(ctx, trunc) < 0) { free(col_is_pk); free(eident); return -1; }
     }
 
     /* Column list "(c1, c2, ...)" reused for every INSERT. */
@@ -635,12 +718,17 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
                 const uint8_t *bm = batch->null_bitmap[c];
                 int isnull = (bm && ((bm[r/8] >> (r%8)) & 1u));
                 if (isnull) { PG_APP("%sNULL", c?", ":""); continue; }
-                /* Values are always text (text-always model); the schema type only
-                 * drives the column type in the DDL above. We send the text literal
-                 * and let PG assignment-cast it ('42'->BIGINT, '12.5'->NUMERIC,
-                 * 'true'->BOOLEAN). Reading a char* cell as a native int64/double
-                 * (the old typed switch) reinterpreted the pointer as the value and
-                 * wrote garbage into typed sink columns. */
+                /* ДВА РАЗНЫХ КОНТРАКТА, не перепутать:
+                 *   • батч ИСТОЧНИКА уходит в хранилище и обязан быть
+                 *     типизированным — INT64/BOOL как int64_t, DOUBLE как double
+                 *     (см. pg_read_batch и compress.c);
+                 *   • батч ПРИЁМНИКА готовит шлюз (api.c, run_sink_step): там
+                 *     значения ВСЕГДА char*, а тип колонки в схеме нужен лишь
+                 *     чтобы создать BIGINT/NUMERIC/BOOLEAN вместо сплошного TEXT.
+                 * Здесь мы на второй стороне, поэтому читаем текст и отдаём
+                 * литерал — PostgreSQL сам приведёт '42'->BIGINT, 'true'->BOOLEAN.
+                 * Типизированный разбор в этом месте прочитает указатель как
+                 * число и запишет мусор. */
                 const char *v = ((char**)batch->values[c])[r]; if(!v) v="";
                 /* NULL contract: a TEXT cell holding the sentinel is a real NULL,
                  * not the literal string — emit SQL NULL so the column stays NULL. */
@@ -654,11 +742,11 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
         if (conflict[0]) PG_APP("%s", conflict);
         #undef PG_APP
         int rc = pg_exec_ok_ctx(ctx, sql); free(sql);
-        if (rc < 0) { free(col_is_pk); PQfreemem(eident); return -1; }
+        if (rc < 0) { free(col_is_pk); free(eident); return -1; }
         written += (end - start);
     }
     free(col_is_pk);
-    PQfreemem(eident);
+    free(eident);
     LOG_INFO("pg sink: %d rows → %s (%s%s)", written, entity,
              mode==DFO_SINK_OVERWRITE?"overwrite":"append",
              npk>0?", upsert":"");
