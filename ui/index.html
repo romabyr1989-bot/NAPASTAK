@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🐇 NAPASTAK</title>
-<link rel="stylesheet" href="style.css?v=29">
+<link rel="stylesheet" href="style.css?v=30">
 </head>
 <body>
 <div id="app">
@@ -468,12 +468,15 @@
              id контейнера должен совпадать с шаблоном step-conn-cfg-${idx}) -->
         <div id="step-conn-cfg--1" style="margin-top:.75rem"></div>
 
-        <div class="builder-settings-row" style="margin-top:.2rem;align-items:center">
-          <!-- Кнопка «Подключиться» не дублируется здесь: она есть в самой форме
-               коннектора выше (у всех 10 типов), перенесённой из конструктора. -->
-          <button class="btn btn-primary btn-sm" style="min-width:120px;justify-content:center" onclick="saveConnection()">Сохранить</button>
-          <button class="btn btn-sm" style="min-width:120px;justify-content:center" onclick="closeConnectionEditor()">Отмена</button>
-          <span id="conn-status" class="query-stat" style="margin-left:.5rem"></span>
+        <!-- Подвал формы: отчёркнут сверху, чтобы «Сохранить»/«Отмена» читались
+             как действия над формой целиком, а не как ещё один блок полей.
+             Ширина кнопок та же, что у «Подключиться» выше, и левый край общий —
+             ряды выстраиваются в одну колонку. Кнопка «Подключиться» здесь не
+             дублируется: она есть в самой форме коннектора (у всех 10 типов). -->
+        <div class="builder-settings-row conn-footer">
+          <button class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center" onclick="saveConnection()">Сохранить</button>
+          <button class="btn btn-sm" style="min-width:150px;justify-content:center" onclick="closeConnectionEditor()">Отмена</button>
+          <span id="conn-status" class="query-stat"></span>
         </div>
       </div>
 
@@ -757,7 +760,7 @@
 </div>
 
 <div id="toast-container"></div>
-<script src="app.js?v=67"></script>
+<script src="app.js?v=70"></script>
 
 <div id="save-result-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeSaveModal()">
   <div class="modal-box">

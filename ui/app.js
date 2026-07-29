@@ -1635,7 +1635,7 @@ function makeConnectionPickerHTML(step, idx, dir) {
           выбранной системы. Читает по эффективному конфигу — параметры берутся
           из подключения, секреты подставляет сервер по connection_id. */
       (cur || hasInline) ? `
-    <div style="display:flex;justify-content:flex-end;margin:-.15rem 0 .35rem">
+    <div class="conn-actions" style="display:flex;margin:-.15rem 0 .35rem">
       <button type="button" class="btn btn-primary btn-sm" style="min-width:200px;justify-content:center"
               onclick="event.stopPropagation();${stepConnType(step) === 'kafka' && !step.is_sink ? `pbPreviewKafka(${idx})` : `pbPreviewSource(${idx})`}"
               title="${dir === 'sink' ? 'Показать, что сейчас лежит в приёмнике' : 'Прочитать пробную порцию данных из источника'}">${
@@ -2753,12 +2753,12 @@ function makeConnectorConfigHTML(step, idx) {
         </div>`}
       </div>
       ${step.is_sink ? '' : `
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Файл доступен' : 'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
     </div>`;
@@ -2773,12 +2773,12 @@ function makeConnectorConfigHTML(step, idx) {
                oninput="pbUpdateConnConfig(${idx},'path',this.value)"
                placeholder="/data/exports/*.parquet">
       </div>
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Файл доступен' : 'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>
     </div>`;
@@ -2844,12 +2844,12 @@ function makeConnectorConfigHTML(step, idx) {
                   oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body || '')}</textarea>
       </div>` : ''}
       ${step.is_sink ? '' : `
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
     </div>`;
@@ -2864,12 +2864,12 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'page_size',parseInt(this.value,10)||1000)">
         </div>`;
     const actions = step.is_sink ? '' : `
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`;
     return `
@@ -2938,12 +2938,12 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="form-group" style="margin:.5rem 0 0"><label>Тело запроса</label>
         <textarea class="mono-textarea" rows="3" oninput="pbUpdateConnConfig(${idx},'post_body',this.value)">${escHtml(cfg.post_body||'')}</textarea></div>` : '';
     const actions = step.is_sink ? '' : `
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok?';background:var(--green);border-color:var(--green);color:#fff':''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok?';background:var(--green);border-color:var(--green);color:#fff':''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok?'✓ Подключено':'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
       </div><div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`;
     return `
     <div class="conn-group">
@@ -2997,12 +2997,12 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="5"
                   oninput="pbUpdateConnConfig(${idx},'request_template',this.value)">${escHtml(cfg.request_template||'')}</textarea></div>`;
     const actions = step.is_sink ? '' : `
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok?';background:var(--green);border-color:var(--green);color:#fff':''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok?';background:var(--green);border-color:var(--green);color:#fff':''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok?'✓ Подключено':'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Показать данные</button>
       </div><div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`;
     return `
     <div class="conn-group">
@@ -3045,10 +3045,15 @@ function makeConnectorConfigHTML(step, idx) {
             <input type="password" value="${escAttr(cfg.password || '')}"
                    oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
           </div>
-          <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                  style="white-space:nowrap;align-self:flex-end;margin-top:auto;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
-                  onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
         </div>
+      </div>
+      ${/* Кнопка вынесена из колонки с паролем в собственный ряд: внутри колонки
+           она прижималась к её правому краю и висела отдельно от всего остального.
+           Ряд такой же, как у прочих типов, — по левому краю формы. */''}
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
       ${step.is_sink ? '' : `
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
@@ -3078,8 +3083,8 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="3"
                   placeholder="orders   или   SELECT * FROM orders WHERE active = true"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
         </div>
       </div>
@@ -3123,10 +3128,15 @@ function makeConnectorConfigHTML(step, idx) {
             <input type="password" value="${escAttr(cfg.password || '')}"
                    oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
           </div>
-          <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                  style="white-space:nowrap;align-self:flex-end;margin-top:auto;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
-                  onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
         </div>
+      </div>
+      ${/* Кнопка вынесена из колонки с паролем в собственный ряд: внутри колонки
+           она прижималась к её правому краю и висела отдельно от всего остального.
+           Ряд такой же, как у прочих типов, — по левому краю формы. */''}
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
       ${step.is_sink ? '' : `
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
@@ -3149,8 +3159,8 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="3"
                   placeholder="orders   или   SELECT * FROM orders WHERE active = true"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
         </div>
       </div>
@@ -3194,10 +3204,15 @@ function makeConnectorConfigHTML(step, idx) {
             <input type="password" value="${escAttr(cfg.password || '')}"
                    oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
           </div>
-          <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                  style="white-space:nowrap;align-self:flex-end;margin-top:auto;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
-                  onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
         </div>
+      </div>
+      ${/* Кнопка вынесена из колонки с паролем в собственный ряд: внутри колонки
+           она прижималась к её правому краю и висела отдельно от всего остального.
+           Ряд такой же, как у прочих типов, — по левому краю формы. */''}
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
       ${step.is_sink ? '' : `
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
@@ -3220,8 +3235,8 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="3"
                   placeholder="ORDERS   или   SELECT * FROM orders WHERE active = 1"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
         </div>
       </div>
@@ -3453,18 +3468,21 @@ function makeConnectorConfigHTML(step, idx) {
           </div>
         </div>
       </details>
-      <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
-                onclick="event.stopPropagation();pbPreviewKafka(${idx})">▶ Показать сообщения</button>
+      ${/* Действия — по левому краю, как и остальное содержимое формы: одинокий
+           блок у правого края выбивался из общего выравнивания. Основное
+           действие блока доступа — «Подключиться», предпросмотр вторичен. */''}
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
+        <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                onclick="event.stopPropagation();pbPreviewKafka(${idx})">▶ Показать сообщения</button>
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.5rem"></div>`}
       ${step.is_sink ? `
-      <div style="display:flex;justify-content:flex-end;margin-top:.6rem">
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
-                style="white-space:nowrap;min-width:140px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>` : ''}
     </div>`;
@@ -6169,6 +6187,25 @@ function groupStepDefaults(box, type) {
   row.className = 'conn-grid';          /* та же сетка, что и у полей доступа */
   move.forEach(g => row.appendChild(g));
   sec.appendChild(title); sec.appendChild(hint); sec.appendChild(row);
+
+  /* Предпросмотр читает данные по параметрам запроса (топик, таблица, запрос) —
+   * значит, его место под этими полями, а не в блоке доступа: иначе кнопка
+   * стоит выше того, от чего зависит. «Подключиться» остаётся наверху: оно
+   * проверяет только доступ. У БД кнопка «Выполнить» лежит внутри поля
+   * «Запрос к источнику» и переезжает вместе с ним — её не трогаем. */
+  const prevBtn = [...box.querySelectorAll('.conn-actions button[onclick*="pbPreview"]')]
+                    .find(b => !b.closest('.form-group'));
+  if (prevBtn) {
+    const acts = document.createElement('div');
+    acts.className = 'conn-actions';
+    acts.style.cssText = 'display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap';
+    acts.appendChild(prevBtn);
+    sec.appendChild(acts);
+  }
+  /* Вывод предпросмотра — всегда в самый низ, под кнопку, которая его наполняет. */
+  const out = box.querySelector('[id^="pb-steppreview-"],[id^="pb-dbpreview-"]');
+  if (out) sec.appendChild(out);
+
   box.appendChild(sec);
 }
 
