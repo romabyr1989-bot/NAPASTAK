@@ -3266,6 +3266,19 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'topic',this.value)">
         </div>
         <div class="form-group" style="margin:0">
+          <label>Семейство адресов</label>
+          <select onchange="pbUpdateConnConfig(${idx},'broker_address_family',this.value)">
+            <option value="v4"  ${(cfg.broker_address_family||'v4')==='v4' ?'selected':''}>IPv4 (по умолчанию)</option>
+            <option value="v6"  ${cfg.broker_address_family==='v6' ?'selected':''}>IPv6</option>
+            <option value="any" ${cfg.broker_address_family==='any'?'selected':''}>Любое</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Отладка librdkafka</label>
+          <input type="text" value="${escAttr(cfg.librdkafka_debug || '')}" placeholder="broker,security — пусто выключает"
+                 oninput="pbUpdateConnConfig(${idx},'librdkafka_debug',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
           <label>Защита соединения</label>
           <select onchange="pbSetKafkaSecurity(${idx},this.value)">
             <option value=""               ${sec===''              ?'selected':''}>Без шифрования и авторизации (PLAINTEXT)</option>
@@ -3344,6 +3357,26 @@ function makeConnectorConfigHTML(step, idx) {
           <label>Пароль</label>
           <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder=""
                  oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
+        </div>`}
+        ${!isKerberos ? '' : `
+        <div class="form-group" style="margin:0">
+          <label>Kerberos — имя сервиса</label>
+          <input type="text" value="${escAttr(cfg.sasl_kerberos_service_name || '')}" placeholder="kafka"
+                 oninput="pbUpdateConnConfig(${idx},'sasl_kerberos_service_name',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Kerberos — принципал</label>
+          <input type="text" value="${escAttr(cfg.sasl_kerberos_principal || '')}" placeholder="user@REALM"
+                 oninput="pbUpdateConnConfig(${idx},'sasl_kerberos_principal',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Kerberos — keytab (путь на сервере)</label>
+          <input type="text" value="${escAttr(cfg.sasl_kerberos_keytab || '')}" placeholder="/etc/security/dfo.keytab"
+                 oninput="pbUpdateConnConfig(${idx},'sasl_kerberos_keytab',this.value)">
+        </div>
+        <div style="grid-column:1/-1;font-size:.72rem;color:var(--muted)">
+          Значения KAFKA_KERBEROS_KEYTAB / _PRINCIPAL / _SERVICE_NAME из окружения
+          гейтвея, если заданы, перекрывают указанное здесь.
         </div>`}
       </div>` : ''}
       ${needsTls ? `
