@@ -1636,7 +1636,7 @@ function makeConnectionPickerHTML(step, idx, dir) {
           из подключения, секреты подставляет сервер по connection_id. */
       (cur || hasInline) ? `
     <div class="conn-actions" style="display:flex;margin:-.15rem 0 .35rem">
-      <button type="button" class="btn btn-primary btn-sm" style="min-width:200px;justify-content:center"
+      <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
               onclick="event.stopPropagation();${stepConnType(step) === 'kafka' && !step.is_sink ? `pbPreviewKafka(${idx})` : `pbPreviewSource(${idx})`}"
               title="${dir === 'sink' ? 'Показать, что сейчас лежит в приёмнике' : 'Прочитать пробную порцию данных из источника'}">${
                 dir === 'sink' ? '▶ Что сейчас в приёмнике'
@@ -2347,8 +2347,8 @@ function makeMatchFieldsHTML(step, idx) {
           <input type="number" min="0" max="1" step="0.05" value="${escAttr(thr)}"
                  oninput="pbUpdateStep(${idx},'_match_threshold',parseFloat(this.value))"></div>
       </div>
-      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+      <div class="conn-actions" style="display:flex;margin-top:.4rem">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
                 onclick="event.stopPropagation();pbGenerateMatchSQL(${idx})">⚙ Построить запрос</button>
       </div>
     </div>`;
@@ -2406,8 +2406,8 @@ function makeMatchRulesFieldsHTML(step, idx) {
           </select></div>
         <div class="form-group" style="margin:0"></div>
       </div>
-      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
-        <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+      <div class="conn-actions" style="display:flex;margin-top:.4rem">
+        <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
                 onclick="event.stopPropagation();pbBuildMatchRule(${idx})">⚙ Построить правило</button>
       </div>
       <div class="form-group" style="margin:.6rem 0 0">
@@ -2610,8 +2610,8 @@ function makeStepCard(step, idx) {
         <textarea class="mono-textarea" rows="4"
                   placeholder="SELECT * FROM {@prev} WHERE ..."
                   oninput="pbUpdateStep(${idx},'transform_sql',this.value)">${escHtml(step.transform_sql || '')}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();runStepSQL(${idx})"
                   title="Выполнить только этот SQL (без upstream-шагов)">▶ Выполнить</button>
         </div>
@@ -2697,8 +2697,8 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="8"
           oninput="pbStep(${idx}).python_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code || '')}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();runStepPython(${idx})"
                   title="Выполнить только этот Python (без предыдущих шагов)">▶ Выполнить</button>
         </div>
@@ -2713,8 +2713,8 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="8"
           oninput="pbStep(${idx}).scala_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.scala_code)}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:.4rem">
-          <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-primary btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();runStepScala(${idx})"
                   title="Выполнить только этот Scala (без предыдущих шагов)">▶ Выполнить</button>
         </div>
@@ -3083,10 +3083,15 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="3"
                   placeholder="orders   или   SELECT * FROM orders WHERE active = true"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        ${/* Только в форме подключения. В карточке шага предпросмотр уже есть
+             сверху, под выбором подключения, и вывод уходит именно туда
+             (pb-steppreview-N) — вторая кнопка здесь давала два одинаковых
+             действия и результат появлялся не под нажатой кнопкой. */
+          idx === CONN_FORM_IDX ? `
         <div class="conn-actions" style="display:flex;margin-top:.4rem">
           <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
-        </div>
+        </div>` : ''}
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
     </div>`;
@@ -3159,10 +3164,15 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="3"
                   placeholder="orders   или   SELECT * FROM orders WHERE active = true"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        ${/* Только в форме подключения. В карточке шага предпросмотр уже есть
+             сверху, под выбором подключения, и вывод уходит именно туда
+             (pb-steppreview-N) — вторая кнопка здесь давала два одинаковых
+             действия и результат появлялся не под нажатой кнопкой. */
+          idx === CONN_FORM_IDX ? `
         <div class="conn-actions" style="display:flex;margin-top:.4rem">
           <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
-        </div>
+        </div>` : ''}
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
     </div>`;
@@ -3235,10 +3245,15 @@ function makeConnectorConfigHTML(step, idx) {
         <textarea class="mono-textarea" rows="3"
                   placeholder="ORDERS   или   SELECT * FROM orders WHERE active = 1"
                   oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        ${/* Только в форме подключения. В карточке шага предпросмотр уже есть
+             сверху, под выбором подключения, и вывод уходит именно туда
+             (pb-steppreview-N) — вторая кнопка здесь давала два одинаковых
+             действия и результат появлялся не под нажатой кнопкой. */
+          idx === CONN_FORM_IDX ? `
         <div class="conn-actions" style="display:flex;margin-top:.4rem">
           <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
-        </div>
+        </div>` : ''}
       </div>
       <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
     </div>`;
