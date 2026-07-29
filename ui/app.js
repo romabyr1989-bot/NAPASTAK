@@ -1438,16 +1438,28 @@ const CONN_REQUEST_KEYS = {
   postgresql: ['read_mode','table','query','cursor_column','cdc_slot','primary_key'],
   greenplum:  ['read_mode','table','query','cursor_column','primary_key'],
   oracle:     ['read_mode','table','query','cursor_column','primary_key'],
-  /* data_format — в ДОСТУПЕ: им раскрывается блок Schema Registry, который
-   * тоже относится к доступу. Оставь его в запросе — реестр стало бы негде
-   * настроить. При необходимости формат переопределяется в конфиге шага. */
-  kafka:      ['topic','group_id','offset_reset','offset_start_mode','isolation_level'],
+  kafka:      ['topic','group_id','offset_reset','offset_start_mode','isolation_level','data_format'],
   json_http:  ['data_path','post_body','page_param','page_type','page_size','total_field'],
   xml:        ['row_tag','root_tag','data_path','post_body','page_param','page_size'],
   soap:       ['soap_action','operation','request_template','row_tag','sink_row_tag','data_path','page_size'],
   siebel:     ['io_name','eim_object','data_path','read_body','page_param','size_param','page_size'],
   csv:        [],   /* сам файл и есть источник — запрашивать нечего */
   parquet:    [],
+};
+
+
+/* Ключи, видимые в ОБЕИХ формах. Такой ключ одновременно является настройкой
+ * шага и переключателем, раскрывающим поля другой половины. Спрятать его в
+ * одной из форм нельзя: либо теряется настройка, либо становится недоступным
+ * то, что он раскрывает.
+ *
+ * data_format: формат сообщений задаётся по топику (на одном кластере бывают и
+ * JSON-, и Avro-топики), поэтому нужен в шаге; он же раскрывает блок Schema
+ * Registry, который относится к доступу и настраивается в подключении.
+ * Значение из подключения работает как значение по умолчанию, шаг его
+ * переопределяет — ровно как остальной конфиг. */
+const CONN_SHARED_KEYS = {
+  kafka: ['data_format'],
 };
 
 /* Обработчики, правящие конфиг не через pbUpdateConnConfig. */
@@ -1476,6 +1488,7 @@ function applyConnFieldFilter(containerId, type, mode) {
     else for (const fn in CONN_HANDLER_KEYS)
       if (h.indexOf(fn + '(') >= 0) { key = CONN_HANDLER_KEYS[fn]; break; }
     if (!key) return;
+    if ((CONN_SHARED_KEYS[type] || []).indexOf(key) >= 0) return;   /* виден везде */
     const isRequest = req.indexOf(key) >= 0;
     if (mode === 'request' ? !isRequest : isRequest) {
       const box = node.closest('.form-group') || node.parentElement;
