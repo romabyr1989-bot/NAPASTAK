@@ -1617,3 +1617,21 @@ details[open] .st-summary::before { content: '▼ '; }
 /* ── Index button in table card ── */
 .idx-btn { font-size: .7rem; padding: .1rem .45rem; margin-left: .4rem; vertical-align: middle; opacity: .7; }
 .idx-btn:hover { opacity: 1; }
+
+/* Сетка формы подключения: поля сами заполняют ряды, поэтому выпадающие списки
+ * должны занимать всю ячейку — иначе они короче соседних полей ввода и ряд
+ * выглядит рваным. Глобальное .conn-group select{width:auto} задумано для
+ * прежней flex-вёрстки, здесь его перебиваем. */
+.conn-grid {
+  display: grid;
+  /* auto-FILL, а не auto-fit: одиночное поле в ряду занимает одну колонку,
+   * а не растягивается на всю ширину — иначе выпадающий список шириной
+   * в экран выглядит нелепо и ломает выравнивание соседних рядов. */
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: .6rem 1rem;
+  align-items: start;
+  margin-top: .2rem;
+}
+.conn-group .conn-grid select,
+.conn-group .conn-grid input[type=number] { width: 100%; max-width: none; }
+.conn-group .conn-grid select { text-align: left; text-align-last: left; }

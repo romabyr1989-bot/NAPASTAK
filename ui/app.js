@@ -3246,7 +3246,7 @@ function makeConnectorConfigHTML(step, idx) {
     return `
     <div class="conn-group">
       <div class="conn-group-title">Подключение к Kafka</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;align-items:start">
+      <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Брокеры</label>
           <input type="text" value="${escAttr(cfg.brokers || '')}" placeholder="localhost:9092"
@@ -3264,19 +3264,6 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'topic',this.value)">
         </div>
         <div class="form-group" style="margin:0">
-          <label>Семейство адресов</label>
-          <select onchange="pbUpdateConnConfig(${idx},'broker_address_family',this.value)">
-            <option value="v4"  ${(cfg.broker_address_family||'v4')==='v4' ?'selected':''}>IPv4 (по умолчанию)</option>
-            <option value="v6"  ${cfg.broker_address_family==='v6' ?'selected':''}>IPv6</option>
-            <option value="any" ${cfg.broker_address_family==='any'?'selected':''}>Любое</option>
-          </select>
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>Отладка librdkafka</label>
-          <input type="text" value="${escAttr(cfg.librdkafka_debug || '')}" placeholder="broker,security — пусто выключает"
-                 oninput="pbUpdateConnConfig(${idx},'librdkafka_debug',this.value)">
-        </div>
-        <div class="form-group" style="margin:0">
           <label>Защита соединения</label>
           <select onchange="pbSetKafkaSecurity(${idx},this.value)">
             <option value=""               ${sec===''              ?'selected':''}>Без шифрования и авторизации (PLAINTEXT)</option>
@@ -3292,7 +3279,8 @@ function makeConnectorConfigHTML(step, idx) {
         механизм SASL) и сертификатов (truststore, keystore). Сейчас подключение
         настроено без шифрования и авторизации.
       </div>`}
-      <div class="step-row-2" style="margin-top:.6rem;align-items:center">
+
+      <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Формат сообщений</label>
           <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);pbRerenderStepCfg(${idx})">
@@ -3335,7 +3323,8 @@ function makeConnectorConfigHTML(step, idx) {
         </div>`}
       </div>
       ${needsSasl ? `
-      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+      <div style="font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:.9rem 0 .1rem">Аутентификация</div>
+      <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Механизм SASL</label>
           <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value);pbRerenderStepCfg(${idx})">
@@ -3353,7 +3342,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль</label>
-          <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder=""
+          <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
         </div>`}
         ${!isKerberos ? '' : `
@@ -3378,17 +3367,18 @@ function makeConnectorConfigHTML(step, idx) {
         </div>`}
       </div>` : ''}
       ${needsTls ? `
-      <div class="step-row-2" style="margin-top:.4rem;align-items:start">
-        <div class="form-group" style="margin:0;flex:2">
+      <div style="font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:.9rem 0 .1rem">Сертификаты и доверенные корни</div>
+      <div class="conn-grid">
+        <div class="form-group" style="margin:0">
           <label>CA‑сертификат (путь на сервере)</label>
           <input type="text" value="${escAttr(cfg.ssl_ca_location || '')}" placeholder="/opt/dataflow-os/certs/ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'ssl_ca_location',this.value)">
         </div>
       </div>
-      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
-        <div class="form-group" style="margin:0;flex:2">
+      <div class="conn-grid">
+        <div class="form-group" style="margin:0">
           <label>Truststore PKCS#12 (вместо CA‑файла)</label>
-          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="truststore.p12 / .pfx — распакуется в PEM автоматически"
+          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="truststore.p12 / .pfx"
                  oninput="pbUpdateConnConfig(${idx},'ssl_truststore_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
@@ -3397,7 +3387,7 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'ssl_truststore_password',this.value)">
         </div>
       </div>
-      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
+      <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Клиентский сертификат (mTLS, необяз.)</label>
           <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="client.pem / client.p12"
@@ -3414,16 +3404,17 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>
       </div>
-      <div class="step-row-2" style="margin-top:.4rem;align-items:center">
-        <div class="form-group" style="margin:0;flex:2">
+      <div class="conn-grid">
+        <div class="form-group" style="margin:0">
           <label>PKCS#12 keystore (необяз., альтернатива cert+key)</label>
           <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="client.p12 / client.pfx"
                  oninput="pbUpdateConnConfig(${idx},'ssl_keystore_location',this.value)">
         </div>
       </div>` : ''}
       ${fmt==='avro' ? `
-      <div class="step-row-2" style="margin-top:.4rem">
-        <div class="form-group" style="margin:0;flex:2">
+      <div style="font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:.9rem 0 .1rem">Реестр схем (Avro)</div>
+      <div class="conn-grid">
+        <div class="form-group" style="margin:0">
           <label>Адрес Schema Registry</label>
           <input type="text" value="${escAttr(cfg.schema_registry_url || '')}" placeholder="https://registry:8081"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_url',this.value)">
@@ -3434,14 +3425,34 @@ function makeConnectorConfigHTML(step, idx) {
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
         </div>
       </div>
-      <div class="step-row-2" style="margin-top:.4rem">
-        <div class="form-group" style="margin:0;flex:2">
+      <div class="conn-grid">
+        <div class="form-group" style="margin:0">
           <label>CA реестра (для private CA, необяз.)</label>
           <input type="text" value="${escAttr(cfg.schema_registry_ca_location || '')}" placeholder="/opt/dataflow-os/certs/registry-ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_ca_location',this.value)">
         </div>
       </div>` : ''}
       ${step.is_sink ? '' : `
+      ${/* Редкие служебные параметры кластера — свёрнуты, чтобы не оттеснять
+           главное: адрес брокеров и защиту соединения. */''}
+      <details style="margin-top:.6rem">
+        <summary style="cursor:pointer;font-size:.74rem;color:var(--muted);user-select:none">Дополнительно: сеть и диагностика</summary>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem 1rem;margin-top:.5rem">
+          <div class="form-group" style="margin:0">
+            <label>Семейство адресов</label>
+            <select onchange="pbUpdateConnConfig(${idx},'broker_address_family',this.value)">
+              <option value="v4"  ${(cfg.broker_address_family||'v4')==='v4' ?'selected':''}>IPv4 (по умолчанию)</option>
+              <option value="v6"  ${cfg.broker_address_family==='v6' ?'selected':''}>IPv6</option>
+              <option value="any" ${cfg.broker_address_family==='any'?'selected':''}>Любое</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Отладка librdkafka</label>
+            <input type="text" value="${escAttr(cfg.librdkafka_debug || '')}" placeholder="broker,security — пусто выключает"
+                   oninput="pbUpdateConnConfig(${idx},'librdkafka_debug',this.value)">
+          </div>
+        </div>
+      </details>
       <div class="conn-actions" style="display:flex;justify-content:flex-end;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
         <button type="button" class="btn btn-primary btn-sm" style="min-width:140px;justify-content:center"
                 onclick="event.stopPropagation();pbPreviewKafka(${idx})">▶ Показать сообщения</button>
@@ -6155,7 +6166,7 @@ function groupStepDefaults(box, type) {
   hint.textContent = 'Подставляются в шаги конвейеров на этом подключении. ' +
                      'В самом шаге любое из них можно задать по-своему — значение шага главнее.';
   const row = document.createElement('div');
-  row.className = 'step-row-2';
+  row.className = 'conn-grid';          /* та же сетка, что и у полей доступа */
   move.forEach(g => row.appendChild(g));
   sec.appendChild(title); sec.appendChild(hint); sec.appendChild(row);
   box.appendChild(sec);
@@ -6186,8 +6197,7 @@ function addAccessFieldsFromSinkVariant(box, formStep) {
   });
   if (!extra.length) return;
   const row = document.createElement('div');
-  row.className = 'step-row-2';
-  row.style.marginTop = '.4rem';
+  row.className = 'conn-grid';
   extra.forEach(g => row.appendChild(g));
   box.appendChild(row);
 }
