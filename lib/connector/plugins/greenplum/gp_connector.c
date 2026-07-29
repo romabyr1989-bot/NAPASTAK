@@ -427,9 +427,11 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
     for (int c = 0; c < ncols; c++) {
         sc->cols[c].name = arena_strdup(a, PQfname(res, c));
-        /* Logical type by PG OID — values are stored as text (text-always model),
-         * so no native read-back, but the catalog type renders numbers/bools as
-         * JSON numbers/bools on output. */
+        /* Логический тип по OID. ВНИМАНИЕ: значения ниже кладутся в том же
+         * виде, в каком объявлен тип — хранилище читает INT64 и BOOL как
+         * int64_t, DOUBLE как double. Раньше здесь стояла пометка «values are
+         * stored as text», и массив действительно был char*: наверх уезжал
+         * указатель вместо числа. Тот же дефект был в pg_connector. */
         Oid oid = PQftype(res, c);
         if (oid==20||oid==21||oid==23||oid==26)            sc->cols[c].type = COL_INT64;
         else if (oid==700||oid==701||oid==1700)            sc->cols[c].type = COL_DOUBLE;
@@ -443,20 +445,44 @@ static int gp_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     batch->ncols  = ncols;
     batch->nrows  = nrows;
 
-    /* Колоночное хранение: на каждую колонку — битмап NULL-ов и массив char*
-     * (text-always). Материализуем значения strdup-ом в арену (res очистим). */
+    /* Колоночное хранение: на каждую колонку — битмап NULL-ов и массив под
+     * ОБЪЯВЛЕННЫЙ тип. Текстовые значения материализуем strdup-ом в арену
+     * (res очистим), числовые и логические разбираем сразу. */
     for (int c = 0; c < ncols; c++) {
         batch->null_bitmap[c] = arena_calloc(a, ((size_t)nrows + 7) / 8);
-        batch->values[c]      = arena_alloc(a, (size_t)nrows * sizeof(char *));
+        size_t esz = (sc->cols[c].type == COL_DOUBLE) ? sizeof(double)
+                   : (sc->cols[c].type == COL_INT64 ||
+                      sc->cols[c].type == COL_BOOL)   ? sizeof(int64_t)
+                                                      : sizeof(char *);
+        batch->values[c]      = arena_calloc(a, (size_t)nrows * esz);
     }
 
     for (int r = 0; r < nrows; r++) {
         for (int c = 0; c < ncols; c++) {
             if (PQgetisnull(res, r, c)) {
                 batch->null_bitmap[c][r/8] |= (uint8_t)(1u << (r % 8));
+                if (sc->cols[c].type != COL_INT64 && sc->cols[c].type != COL_DOUBLE &&
+                    sc->cols[c].type != COL_BOOL)
+                    ((char **)batch->values[c])[r] = (char *)DFO_NULL_SENTINEL;
                 continue;
             }
-            ((char **)batch->values[c])[r] = arena_strdup(a, PQgetvalue(res, r, c));
+            const char *v = PQgetvalue(res, r, c);
+            switch (sc->cols[c].type) {
+            case COL_INT64:
+                ((int64_t *)batch->values[c])[r] = (int64_t)strtoll(v, NULL, 10);
+                break;
+            case COL_DOUBLE:
+                ((double *)batch->values[c])[r] = strtod(v, NULL);
+                break;
+            case COL_BOOL:
+                /* хранилище читает булев столбец как int64_t, а не как int */
+                ((int64_t *)batch->values[c])[r] =
+                    (v[0]=='t' || v[0]=='T' || v[0]=='1') ? 1 : 0;
+                break;
+            default:
+                ((char **)batch->values[c])[r] = arena_strdup(a, v);
+                break;
+            }
         }
     }
 
