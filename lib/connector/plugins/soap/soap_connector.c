@@ -361,6 +361,12 @@ static int soap_ping(void *vctx) {
      * как «нет связи», хотя конвейер по нему успешно читал данные — проба
      * противоречила реальности. Сам факт HTTP-ответа означает, что адрес
      * доступен; настоящие отказы (500, 502, 503) по-прежнему считаем ошибкой. */
+    /* 401/403 — учётные данные не приняты: подключение НЕ рабочее. */
+    if (code==401 || code==403) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),
+                 "сервис отклонил учётные данные (HTTP %ld)",code);
+        return -1;
+    }
     if (code>=500 && code!=501) { snprintf(ctx->last_err,sizeof(ctx->last_err),"HTTP %ld от %s",code,ctx->url); return -1; }
     return 0;
 }

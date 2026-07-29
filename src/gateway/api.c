@@ -8046,6 +8046,11 @@ static void h_connector_probe_preview(HttpReq *req, HttpResp *resp) {
     jb_key(&jb,"columns"); jb_arr_begin(&jb);
     Schema *sc = b ? b->schema : NULL;
     int ncols = sc ? sc->ncols : 0, nrows = b ? b->nrows : 0;
+    /* Коннектор вправе вернуть больше запрошенного: у Siebel, например, размер
+     * страницы задан в конфиге и req->limit его не уменьшает — предпросмотр на
+     * 3 строки притаскивал всю страницу в 100. Обрезаем здесь, чтобы «показать
+     * N строк» означало ровно N у любого коннектора. */
+    if (nrows > limit) nrows = limit;
     for (int c = 0; c < ncols; c++) jb_str(&jb, sc->cols[c].name);
     jb_arr_end(&jb);
     jb_key(&jb,"rows"); jb_arr_begin(&jb);

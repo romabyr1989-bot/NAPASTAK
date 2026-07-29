@@ -199,6 +199,15 @@ static int siebel_ping(void *vctx) {
                  "Ошибка соединения с %s: %s", ctx->url, curl_easy_strerror(res));
         return -1;
     }
+    /* 401/403 — учётные данные не приняты: подключение НЕ рабочее. Раньше
+     * проба считала отказом только ≥500, поэтому с неверным паролем показывала
+     * «Подключено», а конвейер потом падал. Проверка доступа обязана ловить
+     * именно это. */
+    if (code==401 || code==403) {
+        snprintf(ctx->last_err,sizeof(ctx->last_err),
+                 "Siebel отклонил учётные данные (HTTP %ld)",code);
+        return -1;
+    }
     if (code>=500) {
         snprintf(ctx->last_err,sizeof(ctx->last_err),
                  "HTTP %ld от %s", code, ctx->url);
