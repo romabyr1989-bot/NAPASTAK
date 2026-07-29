@@ -6107,9 +6107,50 @@ function renderConnEditorForm() {
    * иначе такое поле не появилось бы нигде: в шаге его скроет фильтр доступа,
    * а сюда оно не попало бы вовсе. */
   addAccessFieldsFromSinkVariant(box, _connFormStep);
-  /* В подключении — только параметры доступа. Запрос к данным задаётся в шаге
-   * конвейера, потому что у каждого конвейера он свой. */
-  applyConnFieldFilter('step-conn-cfg--1', _connFormStep.connector_type, 'access');
+  /* Поля запроса (топик, группа, offset, формат) не прячем, а выносим вниз
+   * отдельным блоком: здесь они задают ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ для всех шагов на
+   * этом подключении, а шаг конвейера их переопределяет. Слияние на сервере
+   * ровно такое же: конфиг подключения — база, конфиг шага — сверху. */
+  groupStepDefaults(box, _connFormStep.connector_type);
+}
+
+/* Переносит поля запроса в отдельную секцию «Значения по умолчанию для шагов». */
+function groupStepDefaults(box, type) {
+  const req = CONN_REQUEST_KEYS[type];
+  if (!req || !req.length) return;
+  const shared = CONN_SHARED_KEYS[type] || [];
+  const keyOf = (el) => {
+    const n = el.querySelector('[oninput],[onchange],[onclick]');
+    if (!n) return null;
+    const h = (n.getAttribute('oninput') || '') + ';' + (n.getAttribute('onchange') || '');
+    const m = h.match(/pbUpdateConnConfig\(\s*-?\d+\s*,\s*'([a-zA-Z_0-9]+)'/);
+    if (m) return m[1];
+    if (h.indexOf('pbSetKafkaOffsetStartMode(') >= 0) return 'offset_start_mode';
+    return null;
+  };
+  const move = [];
+  box.querySelectorAll('.form-group').forEach(g => {
+    const k = keyOf(g);
+    /* общий ключ (формат сообщений) уже показан среди параметров доступа */
+    if (k && req.indexOf(k) >= 0 && shared.indexOf(k) < 0) move.push(g);
+  });
+  if (!move.length) return;
+
+  const sec = document.createElement('div');
+  sec.className = 'conn-group';
+  sec.style.marginTop = '.75rem';
+  const title = document.createElement('div');
+  title.className = 'conn-group-title';
+  title.textContent = 'Значения по умолчанию для шагов';
+  const hint = document.createElement('div');
+  hint.style.cssText = 'font-size:.72rem;color:var(--muted);margin:-.2rem 0 .4rem';
+  hint.textContent = 'Подставляются в шаги конвейеров на этом подключении. ' +
+                     'В самом шаге любое из них можно задать по-своему — значение шага главнее.';
+  const row = document.createElement('div');
+  row.className = 'step-row-2';
+  move.forEach(g => row.appendChild(g));
+  sec.appendChild(title); sec.appendChild(hint); sec.appendChild(row);
+  box.appendChild(sec);
 }
 
 /* Добавляет в форму подключения поля доступа, которые форма рисует только для
