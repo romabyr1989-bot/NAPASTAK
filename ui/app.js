@@ -3275,6 +3275,12 @@ function makeConnectorConfigHTML(step, idx) {
           </select>
         </div>
       </div>
+      ${sec ? '' : `
+      <div style="font-size:.74rem;color:var(--muted);border-left:2px solid var(--border);padding:.3rem .5rem;margin:.5rem 0 0">
+        Выберите «Защиту соединения» — появятся поля аутентификации (логин, пароль,
+        механизм SASL) и сертификатов (truststore, keystore). Сейчас подключение
+        настроено без шифрования и авторизации.
+      </div>`}
       <div class="step-row-2" style="margin-top:.6rem;align-items:center">
         <div class="form-group" style="margin:0">
           <label>Формат сообщений</label>
