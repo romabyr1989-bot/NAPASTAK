@@ -1559,6 +1559,91 @@ function makeConnectorConfigHTML(step, idx) {
       </div>` : ''}
     </div>`;
 
+  if (type === 'kafka') {
+    const proto = cfg.security_protocol || 'plaintext';
+    const isSasl = proto.startsWith('sasl');
+    const isTls  = proto.endsWith('ssl');
+    const mech   = cfg.sasl_mechanism || 'SCRAM-SHA-512';
+    return `
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0;flex:2">
+        <label>Брокеры <span class="label-hint">host:port через запятую</span></label>
+        <input type="text" value="${escAttr(cfg.brokers || '')}"
+               oninput="pbUpdateConnConfig(${idx},'brokers',this.value)"
+               placeholder="kafka-1:9092,kafka-2:9092">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Топик</label>
+        <input type="text" value="${escAttr(cfg.topic || '')}"
+               oninput="pbUpdateConnConfig(${idx},'topic',this.value)"
+               placeholder="events">
+      </div>
+    </div>
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Consumer group</label>
+        <input type="text" value="${escAttr(cfg.group_id || '')}"
+               oninput="pbUpdateConnConfig(${idx},'group_id',this.value)"
+               placeholder="dfo-consumer">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Формат сообщений</label>
+        <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value)">
+          <option value="json" ${(cfg.data_format||'json')==='json'?'selected':''}>JSON</option>
+          <option value="csv"  ${cfg.data_format==='csv'            ?'selected':''}>CSV / raw</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Протокол <span class="label-hint">должен совпадать с listener'ом брокера</span></label>
+        <select onchange="pbUpdateConnConfig(${idx},'security_protocol',this.value);document.getElementById('step-conn-cfg-${idx}').innerHTML=makeConnectorConfigHTML(pb.steps[${idx}],${idx})">
+          <option value="plaintext"      ${proto==='plaintext'     ?'selected':''}>PLAINTEXT — без аутентификации</option>
+          <option value="sasl_plaintext" ${proto==='sasl_plaintext'?'selected':''}>SASL_PLAINTEXT — SASL без TLS</option>
+          <option value="sasl_ssl"       ${proto==='sasl_ssl'      ?'selected':''}>SASL_SSL — SASL поверх TLS</option>
+          <option value="ssl"            ${proto==='ssl'           ?'selected':''}>SSL — только TLS-сертификаты</option>
+        </select>
+      </div>
+    </div>
+    ${isSasl ? `
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>SASL-механизм</label>
+        <select onchange="pbUpdateConnConfig(${idx},'sasl_mechanism',this.value)">
+          <option value="SCRAM-SHA-512" ${mech==='SCRAM-SHA-512'?'selected':''}>SCRAM-SHA-512</option>
+          <option value="SCRAM-SHA-256" ${mech==='SCRAM-SHA-256'?'selected':''}>SCRAM-SHA-256</option>
+          <option value="PLAIN"         ${mech==='PLAIN'        ?'selected':''}>PLAIN</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Пользователь</label>
+        <input type="text" value="${escAttr(cfg.sasl_username || '')}"
+               oninput="pbUpdateConnConfig(${idx},'sasl_username',this.value)"
+               placeholder="dfo">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Пароль</label>
+        <input type="password" value="${escAttr(cfg.sasl_password || '')}"
+               oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)"
+               placeholder="">
+      </div>
+    </div>` : ''}
+    ${isTls ? `
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0;flex:2">
+        <label>CA-сертификат <span class="label-hint">путь на сервере; пусто → системное хранилище</span></label>
+        <input type="text" value="${escAttr(cfg.ssl_ca_location || '')}"
+               oninput="pbUpdateConnConfig(${idx},'ssl_ca_location',this.value)"
+               placeholder="/etc/ssl/certs/kafka-ca.pem">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label style="display:flex;align-items:center;gap:.4rem">
+          <input type="checkbox" ${cfg.ssl_no_verify ? 'checked' : ''}
+                 onchange="pbUpdateConnConfig(${idx},'ssl_no_verify',this.checked)">
+          Не проверять имя хоста
+        </label>
+      </div>
+    </div>` : ''}`;
+  }
+
   if (type === 'airbyte') {
     /* Step 2 (connector): pick from AIRBYTE_CATALOG, then a JSON pane for
      * the source-specific config (each Airbyte source has its own schema). */

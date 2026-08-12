@@ -152,18 +152,26 @@ static const char *jval_to_json(JVal *v, Arena *a) {
 /* Копируем JVal-поле в char[]-буфер фиксированного размера.
  * Если значение — объект/массив, сериализуем в JSON-строку, чтобы connector_config
  * можно было передавать в create() коннектора как обычную C-строку. */
-static void copy_jval_str(JVal *v, char *dst, size_t dstsz, Arena *a) {
+static void copy_jval_str(JVal *v, char *dst, size_t dstsz, Arena *a,
+                          const char *what) {
     if (!v) { dst[0] = '\0'; return; }
+    const char *s;
+    size_t n;
     if (v->type == JV_STRING) {
-        size_t n = v->len < dstsz-1 ? v->len : dstsz-1;
-        memcpy(dst, v->s, n); dst[n] = '\0';
-    } else if (v->type == JV_OBJECT || v->type == JV_ARRAY) {
-        const char *s = jval_to_json(v, a);
-        strncpy(dst, s, dstsz-1); dst[dstsz-1] = '\0';
+        s = v->s; n = v->len;
     } else {
-        const char *s = json_str(v, "");
-        strncpy(dst, s, dstsz-1); dst[dstsz-1] = '\0';
+        s = (v->type == JV_OBJECT || v->type == JV_ARRAY) ? jval_to_json(v, a)
+                                                          : json_str(v, "");
+        n = strlen(s);
     }
+    /* Truncating here used to be silent, which turns a slightly-too-long
+     * connector_config into a config with half a password in it. */
+    if (n > dstsz - 1) {
+        LOG_WARN("%s is %zu bytes, truncated to %zu — the value stored will be "
+                 "incomplete", what, n, dstsz - 1);
+        n = dstsz - 1;
+    }
+    memcpy(dst, s, n); dst[n] = '\0';
 }
 
 /* Map textual trigger type to enum. Unknown values default to MANUAL
@@ -245,7 +253,7 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             strncpy(st->id,  json_str(json_get(s,"id"),""),  sizeof(st->id)-1);
             strncpy(st->name,json_str(json_get(s,"name"),""),sizeof(st->name)-1);
             strncpy(st->connector_type, json_str(json_get(s,"connector_type"),""), sizeof(st->connector_type)-1);
-            copy_jval_str(json_get(s,"connector_config"), st->connector_config, sizeof(st->connector_config), a);
+            copy_jval_str(json_get(s,"connector_config"), st->connector_config, sizeof(st->connector_config), a, "connector_config");
             strncpy(st->transform_sql,   json_str(json_get(s,"transform_sql"),""),   sizeof(st->transform_sql)-1);
             strncpy(st->target_table,    json_str(json_get(s,"target_table"),""),    sizeof(st->target_table)-1);
             /* Python step (optional) */
