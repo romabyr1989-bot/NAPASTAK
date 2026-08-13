@@ -92,8 +92,13 @@ typedef struct {
     char  ssl_ca_location[512];          /* CA-сертификат брокера (PEM или DER) */
     char  ssl_certificate_location[512]; /* клиентский cert: PEM или PKCS#12 (cert+key) */
     char  ssl_key_location[512];         /* клиентский приватный ключ (PEM); для PKCS#12 не нужен */
-    char  ssl_key_password[256];         /* пароль ключа/keystore, если зашифрован */
+    char  ssl_key_password[256];         /* пароль приватного ключа (PEM), если зашифрован */
     char  ssl_keystore_location[512];    /* явный PKCS#12 keystore (альтернатива cert+key) */
+    /* Пароль keystore отдельно от пароля ключа: librdkafka требует
+     * ssl.keystore.password ОБЯЗАТЕЛЬНО, если задан ssl.keystore.location, и
+     * администраторы выдают его отдельным значением. Пусто — берём
+     * ssl_key_password (так конфиг вёл себя раньше, до появления этого поля). */
+    char  ssl_keystore_password[256];
     /* Truststore в формате PKCS#12 (.p12/.pfx) с паролем — так его выдают
      * администраторы Kafka, привыкшие к Java-клиенту. У librdkafka понятия
      * truststore НЕТ: доверенные корни она принимает только PEM-ом через
@@ -184,12 +189,23 @@ static void cfg_str(const char *cfg, const char *key, char *dst, size_t dstsz)
 /* Read a string field out of the parsed config object. Accepts both the
  * snake_case name used by the UI/YAML ("sasl_username") and librdkafka's own
  * dotted name ("sasl.username"), so a config copied from a Kafka client
- * works unchanged. `dotted` may be NULL. */
+ * works unchanged. `dotted` may be NULL.
+ *
+ * Дополнительно принимается форма с префиксом "kafka." ("kafka.sasl.username"):
+ * именно так свойства записаны в конфигурации Java/Spring-потребителей, и
+ * администраторы выдают их копипастой оттуда. */
 static void cfg_get(JVal *root, const char *snake, const char *dotted,
                     char *dst, size_t dstsz)
 {
     JVal *v = json_get(root, snake);
-    if (!v && dotted) v = json_get(root, dotted);
+    if (!v && dotted) {
+        v = json_get(root, dotted);
+        if (!v) {
+            char prefixed[128];
+            snprintf(prefixed, sizeof(prefixed), "kafka.%s", dotted);
+            v = json_get(root, prefixed);
+        }
+    }
     if (!v || v->type == JV_NULL) return;
 
     if (v->type == JV_STRING) {
@@ -512,8 +528,17 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
 
     if (keystore) {
         kset_sec(conf, ctx, "ssl.keystore.location", keystore, errstr, errlen);
-        if (ctx->ssl_key_password[0])
-            kset_sec(conf, ctx, "ssl.keystore.password", ctx->ssl_key_password, errstr, errlen);
+        /* Пароль keystore обязателен для librdkafka. Основной источник —
+         * ssl_keystore_password; ssl_key_password остаётся запасным, потому что
+         * до появления отдельного поля keystore настраивали через него. */
+        const char *kspass = ctx->ssl_keystore_password[0] ? ctx->ssl_keystore_password
+                                                           : ctx->ssl_key_password;
+        if (kspass[0])
+            kset_sec(conf, ctx, "ssl.keystore.password", kspass, errstr, errlen);
+        else
+            LOG_WARN("kafka: задан ssl_keystore_location без пароля — librdkafka "
+                     "считает ssl.keystore.password обязательным и откажется "
+                     "создавать клиент");
         LOG_INFO("kafka: клиентский сертификат в формате PKCS#12 (keystore)");
     } else {
         if (ctx->ssl_certificate_location[0]) {
@@ -1147,8 +1172,9 @@ static void kafka_cfg_from_json(KafkaCtx *ctx, JVal *cfg)
     cfg_get(cfg, "ssl_key_location",         "ssl.key.location",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
     cfg_get(cfg, "ssl_key_password",         "ssl.key.password",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
     cfg_get(cfg, "ssl_keystore_location",    "ssl.keystore.location",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
-    cfg_get(cfg, "ssl_truststore_location",  NULL, ctx->ssl_truststore_location, sizeof(ctx->ssl_truststore_location));
-    cfg_get(cfg, "ssl_truststore_password",  NULL, ctx->ssl_truststore_password, sizeof(ctx->ssl_truststore_password));
+    cfg_get(cfg, "ssl_keystore_password",    "ssl.keystore.password",    ctx->ssl_keystore_password,    sizeof(ctx->ssl_keystore_password));
+    cfg_get(cfg, "ssl_truststore_location",  "ssl.truststore.location",  ctx->ssl_truststore_location,  sizeof(ctx->ssl_truststore_location));
+    cfg_get(cfg, "ssl_truststore_password",  "ssl.truststore.password",  ctx->ssl_truststore_password,  sizeof(ctx->ssl_truststore_password));
 
     cfg_get(cfg, "offset_reset",      NULL, ctx->offset_reset,      sizeof(ctx->offset_reset));
     cfg_get(cfg, "isolation_level",   NULL, ctx->isolation_level,   sizeof(ctx->isolation_level));
@@ -1184,6 +1210,7 @@ static void kafka_cfg_from_scan(KafkaCtx *ctx, const char *cfg)
     cfg_str(cfg, "\"ssl_key_location\"",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
     cfg_str(cfg, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
     cfg_str(cfg, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
+    cfg_str(cfg, "\"ssl_keystore_password\"",    ctx->ssl_keystore_password,    sizeof(ctx->ssl_keystore_password));
     cfg_str(cfg, "\"ssl_truststore_location\"",  ctx->ssl_truststore_location,  sizeof(ctx->ssl_truststore_location));
     cfg_str(cfg, "\"ssl_truststore_password\"",  ctx->ssl_truststore_password,  sizeof(ctx->ssl_truststore_password));
 

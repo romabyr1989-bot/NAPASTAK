@@ -56,24 +56,57 @@ Connector type is `kafka`. `connector_config`:
 | `sasl_username` | — | SASL user |
 | `sasl_password` | — | SASL password |
 | `ssl_ca_location` | — | broker CA; PEM or DER (DER is converted automatically) |
-| `ssl_truststore_location` | — | PKCS#12 truststore; unpacked to PEM automatically |
+| `ssl_truststore_location` | — | PKCS#12 truststore (`.p12`/`.pfx`); unpacked to PEM automatically |
 | `ssl_truststore_password` | — | truststore passphrase |
 | `ssl_certificate_location` | — | client certificate for mTLS: PEM, DER or PKCS#12 |
 | `ssl_key_location` | — | client key (PEM or DER); not needed with a PKCS#12 keystore |
-| `ssl_key_password` | — | passphrase for the key or keystore |
-| `ssl_keystore_location` | — | explicit PKCS#12 keystore (alternative to cert + key) |
+| `ssl_key_password` | — | passphrase for the private key (PEM mode) |
+| `ssl_keystore_location` | — | explicit PKCS#12 keystore (`.p12`/`.pfx`), alternative to cert + key |
+| `ssl_keystore_password` | — | keystore passphrase; **required** whenever a keystore is set |
 | `sasl_kerberos_service_name` | `kafka` | GSSAPI broker service principal |
 | `sasl_kerberos_principal` | — | GSSAPI client principal; overrides `KAFKA_KERBEROS_PRINCIPAL` |
 | `sasl_kerberos_keytab` | — | GSSAPI keytab path; overrides `KAFKA_KERBEROS_KEYTAB` |
 
 Every key also accepts librdkafka's own dotted spelling (`security.protocol`,
-`sasl.username`, …), so a config copied from another Kafka client works as-is.
+`sasl.username`, …) and that spelling with a `kafka.` prefix
+(`kafka.ssl.keystore.location`), which is how the properties appear in
+Java/Spring consumer configs. A config copied from another Kafka client works
+as-is in any of the three forms.
 Protocol and mechanism values are case-insensitive and `-`/`_` are
 interchangeable: `sasl-ssl` and `scram_sha_256` are understood and normalized to
 `SASL_SSL` and `SCRAM-SHA-256`.
 
 TLS certificate-chain and hostname verification are always on when the protocol
 includes TLS. There is deliberately no switch to disable them.
+
+librdkafka treats `ssl.keystore.password` as mandatory once
+`ssl.keystore.location` is set: without it the client is not created at all. If
+`ssl_keystore_password` is empty the connector falls back to `ssl_key_password`,
+which is how a keystore had to be configured before the dedicated field existed.
+
+### Keystore + truststore, both PKCS#12
+
+```json
+{
+  "brokers": "kafka-1:9093,kafka-2:9093",
+  "topic": "events",
+  "security_protocol": "SASL_SSL",
+  "sasl_mechanism": "SCRAM-SHA-512",
+  "sasl_username": "dfo",
+  "sasl_password": "…",
+  "ssl_keystore_location": "/opt/confluent/certificates/client.pfx",
+  "ssl_keystore_password": "…",
+  "ssl_truststore_location": "/opt/confluent/certificates/truststore.p12",
+  "ssl_truststore_password": "…"
+}
+```
+
+librdkafka has no notion of a truststore — it accepts trusted roots only as PEM
+via `ssl.ca.location` — so the connector opens the PKCS#12 itself and writes the
+public certificates to a temporary PEM, removed on destroy. The keystore is
+handed to librdkafka as `ssl.keystore.location` unchanged. Format is detected by
+parsing the file, not by extension, so `.pfx` and `.p12` are interchangeable and
+an extensionless container works too.
 
 ### SCRAM over TLS
 

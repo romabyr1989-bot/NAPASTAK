@@ -1493,7 +1493,7 @@ const CONN_FIELD_WIDTH = {
     offset_start_mode: 's', isolation_level: 's', data_format: 's',
     security_protocol: 'm', sasl_mechanism: 's', sasl_username: 's',
     sasl_password: 's', sasl_kerberos_service_name: 's',
-    ssl_key_password: 's', ssl_truststore_password: 's',
+    ssl_key_password: 's', ssl_keystore_password: 's', ssl_truststore_password: 's',
     broker_address_family: 's',
     /* числа */
     port: 'xs', page_size: 'xs', batch_size: 'xs', connect_timeout: 'xs',
@@ -1839,6 +1839,14 @@ function kafkaCfgProblems(cfg) {
       warn.push('Клиентский сертификат указан без ключа: если это не PKCS#12-контейнер (cert+key одним файлом), заполните «Клиентский ключ».');
     if (!(cfg.ssl_ca_location || '').trim() && !(cfg.ssl_truststore_location || '').trim())
       warn.push('CA‑сертификат не задан — проверка брокера пойдёт по системному хранилищу (частный банковский CA обычно нужно указать явно).');
+    /* librdkafka отказывается создавать клиент, если задан ssl.keystore.location
+     * без ssl.keystore.password, — блокируем здесь, а не ловим отказ потом.
+     * Пароль ключа принимается как запасной: так keystore настраивали раньше. */
+    if (keystore && !(cfg.ssl_keystore_password || '').trim()
+                 && !(cfg.ssl_key_password || '').trim())
+      block.push('PKCS#12 keystore требует пароль — заполните «Пароль keystore».');
+    if ((cfg.ssl_truststore_location || '').trim() && !(cfg.ssl_truststore_password || '').trim())
+      warn.push('Truststore указан без пароля — если хранилище защищено, распаковать его не удастся и проверка сертификата брокера не пройдёт.');
   }
   return { block, warn };
 }
@@ -3520,8 +3528,13 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>PKCS#12 keystore</label>
-          <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="/opt/dataflow-os/certs/client.p12"
+          <input type="text" value="${escAttr(cfg.ssl_keystore_location || '')}" placeholder="/opt/confluent/certificates/client.pfx"
                  oninput="pbUpdateConnConfig(${idx},'ssl_keystore_location',this.value)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Пароль keystore</label>
+          <input type="password" value="${escAttr(cfg.ssl_keystore_password || '')}" placeholder="" autocomplete="off"
+                 oninput="pbUpdateConnConfig(${idx},'ssl_keystore_password',this.value)">
         </div>
       </div>` : ''}
       ${fmt==='avro' ? `
