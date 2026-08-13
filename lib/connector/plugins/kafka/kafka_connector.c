@@ -139,6 +139,10 @@ typedef struct {
      * broker is unreachable (RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN). Lets a read
      * distinguish "broker down" (hard error) from "topic drained" (0 rows OK). */
     atomic_int      all_brokers_down;
+    /* То же для отказа аутентификации SASL. Без этого признака неверный пароль
+     * неотличим от пустого топика: оба дают ноль сообщений, и шаг выглядит
+     * успешным. Причина отказа пишется в last_err. */
+    atomic_int      auth_failed;
 
     DfoCdcHandler   cdc_handler;
     void           *cdc_userdata;
@@ -157,9 +161,11 @@ static void kafka_curl_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT)
 
 /* ── JSON config parser helpers ── */
 
-/* Извлекает строковое значение по ключу "key" из плоского JSON-конфига в dst.
- * Наивный парсер (strstr/strchr), достаточный для одноуровневого config_json;
- * при отсутствии ключа dst не трогается (остаётся значение по умолчанию). */
+/* Наивный сканер (strstr/strchr) — оставлен ТОЛЬКО как запасной путь для
+ * конфигов, которые не разбираются как JSON. Он обрывает значение на первой
+ * же кавычке и потому портит любое значение с escape-последовательностью —
+ * ровно то, что регулярно встречается в паролях SASL. Основной путь разбора —
+ * cfg_get() поверх json_parse(). */
 static void cfg_str(const char *cfg, const char *key, char *dst, size_t dstsz)
 {
     const char *p = strstr(cfg, key);
@@ -175,6 +181,53 @@ static void cfg_str(const char *cfg, const char *key, char *dst, size_t dstsz)
     }
 }
 
+/* Read a string field out of the parsed config object. Accepts both the
+ * snake_case name used by the UI/YAML ("sasl_username") and librdkafka's own
+ * dotted name ("sasl.username"), so a config copied from a Kafka client
+ * works unchanged. `dotted` may be NULL. */
+static void cfg_get(JVal *root, const char *snake, const char *dotted,
+                    char *dst, size_t dstsz)
+{
+    JVal *v = json_get(root, snake);
+    if (!v && dotted) v = json_get(root, dotted);
+    if (!v || v->type == JV_NULL) return;
+
+    if (v->type == JV_STRING) {
+        if (v->len >= dstsz)
+            LOG_WARN("kafka: config \"%s\" is %zu bytes, truncated to %zu",
+                     snake, v->len, dstsz - 1);
+        snprintf(dst, dstsz, "%.*s", (int)v->len, v->s);
+    } else if (v->type == JV_BOOL) {
+        snprintf(dst, dstsz, "%s", v->b ? "true" : "false");
+    } else if (v->type == JV_NUMBER) {
+        snprintf(dst, dstsz, "%lld", (long long)v->n);
+    }
+}
+
+/* librdkafka сверяет security.protocol без учёта регистра, но "SASL-SSL" через
+ * дефис в рукописных конфигах встречается постоянно, а её она уже отвергает.
+ * Приводим к виду SASL_SSL: ВЕРХНИЙ регистр обязателен — остальной код
+ * коннектора сравнивает это поле как strstr(..., "SSL") и
+ * strncmp(..., "SASL", 4), и нижний регистр молча отключил бы настройку TLS. */
+static void normalize_protocol(char *s)
+{
+    for (char *p = s; *p; p++) {
+        if (*p == '-') *p = '_';
+        else *p = (char)toupper((unsigned char)*p);
+    }
+}
+
+/* Механизмы Kafka пишет как "SCRAM-SHA-256". Принимаем scram_sha_256,
+ * scram-sha-256, SCRAM_SHA_512, plain, … и приводим к этому написанию.
+ * Верхний регистр здесь тоже обязателен: ниже есть strcmp(..., "GSSAPI"). */
+static void normalize_mechanism(char *s)
+{
+    for (char *p = s; *p; p++) {
+        if (*p == '_') *p = '-';
+        else *p = (char)toupper((unsigned char)*p);
+    }
+}
+
 /* ── Kafka rdkafka helpers ── */
 
 /* rd_kafka error callback. librdkafka delivers asynchronous, cluster-level
@@ -187,15 +240,31 @@ static void kafka_error_cb(rd_kafka_t *rk, int err, const char *reason, void *op
     (void)rk;
     KafkaCtx *ctx = (KafkaCtx *)opaque;
     if (!ctx) return;
-    if ((rd_kafka_resp_err_t)err == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
+    rd_kafka_resp_err_t e = (rd_kafka_resp_err_t)err;
+
+    if (e == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
         atomic_store(&ctx->all_brokers_down, 1);
         snprintf(ctx->last_err, sizeof(ctx->last_err),
                  "all brokers down (%s): %s",
                  ctx->brokers, reason ? reason : "no reachable broker");
         LOG_WARN("kafka: all brokers down: %s", reason ? reason : "");
+    } else if (e == RD_KAFKA_RESP_ERR__AUTHENTICATION ||
+               e == RD_KAFKA_RESP_ERR_SASL_AUTHENTICATION_FAILED) {
+        /* Синхронные вызовы librdkafka отдают лишь общий код («Broker transport
+         * failure»); настоящая причина — отказ SASL — приходит только сюда.
+         * Без этой ветки неверный пароль давал ноль сообщений и выглядел как
+         * пустой топик. */
+        atomic_store(&ctx->auth_failed, 1);
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "ошибка аутентификации SASL (%s, механизм %s, пользователь %s): %s",
+                 ctx->brokers,
+                 ctx->sasl_mechanism[0] ? ctx->sasl_mechanism : "<не задан>",
+                 ctx->sasl_username[0]  ? ctx->sasl_username  : "<не задан>",
+                 reason ? reason : rd_kafka_err2str(e));
+        LOG_ERROR("kafka: %s", ctx->last_err);
     } else {
         LOG_WARN("kafka: error_cb [%s]: %s",
-                 rd_kafka_err2name((rd_kafka_resp_err_t)err), reason ? reason : "");
+                 rd_kafka_err2name(e), reason ? reason : "");
     }
 }
 
@@ -265,13 +334,36 @@ static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_
  * опечатка в security.protocol или sasl.mechanism тихо оставляла соединение
  * незащищённым. Помечаем контекст как непригодный, чтобы создание клиента
  * упало с внятной причиной вместо мнимого успеха. */
+/* Ключи, значение которых нельзя показывать: last_err попадает и в лог, и в
+ * ответ UI. Проверка по подстроке "password" покрывает sasl.password,
+ * ssl.key.password и ssl.keystore.password — все, что сюда передаются. */
+static bool kafka_secret_key(const char *key)
+{
+    return strstr(key, "password") != NULL;
+}
+
 static void kset_sec(rd_kafka_conf_t *conf, KafkaCtx *ctx, const char *key,
                      const char *val, char *errstr, size_t errlen)
 {
     if (rd_kafka_conf_set(conf, key, val, errstr, errlen) == RD_KAFKA_CONF_OK) return;
     ctx->cfg_invalid = true;
-    snprintf(ctx->last_err, sizeof(ctx->last_err),
-             "librdkafka отвергла %s=\"%s\": %s", key, val ? val : "", errstr);
+
+    /* «No such configuration property: sasl.mechanism» означает не ошибку в
+     * конфиге, а сборку librdkafka без поддержки SASL. Без списка собранных
+     * возможностей эти два случая по логу неотличимы. */
+    char feats[256];
+    size_t fsz = sizeof(feats);
+    if (rd_kafka_conf_get(conf, "builtin.features", feats, &fsz) != RD_KAFKA_CONF_OK)
+        snprintf(feats, sizeof(feats), "<неизвестно>");
+
+    if (kafka_secret_key(key))
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "librdkafka отвергла %s: %s (builtin.features=%s)",
+                 key, errstr, feats);
+    else
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "librdkafka отвергла %s=\"%s\": %s (builtin.features=%s)",
+                 key, val ? val : "", errstr, feats);
     LOG_ERROR("kafka: %s", ctx->last_err);
 }
 
@@ -1025,6 +1117,82 @@ static void *consumer_thread_fn(void *arg)
 
 /* ── Connector functions ── */
 
+/* Разбор конфига из уже распарсенного JSON-объекта. Для каждого поля принимаем
+ * и snake_case из UI/YAML, и точечное имя librdkafka — конфиг, скопированный из
+ * настроек стороннего Kafka-клиента, работает без переписывания. */
+static void kafka_cfg_from_json(KafkaCtx *ctx, JVal *cfg)
+{
+    cfg_get(cfg, "brokers",     "bootstrap.servers", ctx->brokers,     sizeof(ctx->brokers));
+    cfg_get(cfg, "group_id",    "group.id",          ctx->group_id,    sizeof(ctx->group_id));
+    cfg_get(cfg, "topic",       NULL,                ctx->topic_name,  sizeof(ctx->topic_name));
+    cfg_get(cfg, "data_format", NULL,                ctx->data_format, sizeof(ctx->data_format));
+    cfg_get(cfg, "broker_address_family", "broker.address.family", ctx->addr_family, sizeof(ctx->addr_family));
+
+    cfg_get(cfg, "schema_registry_url",         NULL, ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
+    cfg_get(cfg, "schema_registry_auth",        NULL, ctx->sr_auth,             sizeof(ctx->sr_auth));
+    cfg_get(cfg, "schema_registry_ca_location", NULL, ctx->sr_ca_location,      sizeof(ctx->sr_ca_location));
+
+    /* Безопасность (необязательно — пустые значения оставляют plaintext). */
+    cfg_get(cfg, "security_protocol", "security.protocol", ctx->security_protocol, sizeof(ctx->security_protocol));
+    cfg_get(cfg, "sasl_mechanism",    "sasl.mechanism",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
+    cfg_get(cfg, "sasl_username",     "sasl.username",     ctx->sasl_username,     sizeof(ctx->sasl_username));
+    cfg_get(cfg, "sasl_password",     "sasl.password",     ctx->sasl_password,     sizeof(ctx->sasl_password));
+    cfg_get(cfg, "sasl_kerberos_service_name", "sasl.kerberos.service.name", ctx->sasl_kerberos_service_name, sizeof(ctx->sasl_kerberos_service_name));
+    cfg_get(cfg, "sasl_kerberos_principal",    "sasl.kerberos.principal",    ctx->sasl_kerberos_principal,    sizeof(ctx->sasl_kerberos_principal));
+    cfg_get(cfg, "sasl_kerberos_keytab",       "sasl.kerberos.keytab",       ctx->sasl_kerberos_keytab,       sizeof(ctx->sasl_kerberos_keytab));
+
+    /* TLS/mTLS (для security_protocol SSL | SASL_SSL). */
+    cfg_get(cfg, "ssl_ca_location",          "ssl.ca.location",          ctx->ssl_ca_location,          sizeof(ctx->ssl_ca_location));
+    cfg_get(cfg, "ssl_certificate_location", "ssl.certificate.location", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));
+    cfg_get(cfg, "ssl_key_location",         "ssl.key.location",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
+    cfg_get(cfg, "ssl_key_password",         "ssl.key.password",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
+    cfg_get(cfg, "ssl_keystore_location",    "ssl.keystore.location",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
+    cfg_get(cfg, "ssl_truststore_location",  NULL, ctx->ssl_truststore_location, sizeof(ctx->ssl_truststore_location));
+    cfg_get(cfg, "ssl_truststore_password",  NULL, ctx->ssl_truststore_password, sizeof(ctx->ssl_truststore_password));
+
+    cfg_get(cfg, "offset_reset",      NULL, ctx->offset_reset,      sizeof(ctx->offset_reset));
+    cfg_get(cfg, "isolation_level",   NULL, ctx->isolation_level,   sizeof(ctx->isolation_level));
+    cfg_get(cfg, "offset_start_mode", NULL, ctx->offset_start_mode, sizeof(ctx->offset_start_mode));
+    cfg_get(cfg, "librdkafka_debug",  "debug", ctx->librdkafka_debug, sizeof(ctx->librdkafka_debug));
+}
+
+/* Запасной разбор для конфига, который не является JSON-объектом. Набор полей
+ * тот же, что и в JSON-пути: сужать его нельзя — конфиги, работающие сейчас,
+ * иначе молча потеряли бы настройки TLS. */
+static void kafka_cfg_from_scan(KafkaCtx *ctx, const char *cfg)
+{
+    cfg_str(cfg, "\"brokers\"",     ctx->brokers,     sizeof(ctx->brokers));
+    cfg_str(cfg, "\"group_id\"",    ctx->group_id,    sizeof(ctx->group_id));
+    cfg_str(cfg, "\"topic\"",       ctx->topic_name,  sizeof(ctx->topic_name));
+    cfg_str(cfg, "\"data_format\"", ctx->data_format, sizeof(ctx->data_format));
+    cfg_str(cfg, "\"broker_address_family\"", ctx->addr_family, sizeof(ctx->addr_family));
+
+    cfg_str(cfg, "\"schema_registry_url\"",         ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
+    cfg_str(cfg, "\"schema_registry_auth\"",        ctx->sr_auth,             sizeof(ctx->sr_auth));
+    cfg_str(cfg, "\"schema_registry_ca_location\"", ctx->sr_ca_location,      sizeof(ctx->sr_ca_location));
+
+    cfg_str(cfg, "\"security_protocol\"", ctx->security_protocol, sizeof(ctx->security_protocol));
+    cfg_str(cfg, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
+    cfg_str(cfg, "\"sasl_username\"",     ctx->sasl_username,     sizeof(ctx->sasl_username));
+    cfg_str(cfg, "\"sasl_password\"",     ctx->sasl_password,     sizeof(ctx->sasl_password));
+    cfg_str(cfg, "\"sasl_kerberos_service_name\"", ctx->sasl_kerberos_service_name, sizeof(ctx->sasl_kerberos_service_name));
+    cfg_str(cfg, "\"sasl_kerberos_principal\"",    ctx->sasl_kerberos_principal,    sizeof(ctx->sasl_kerberos_principal));
+    cfg_str(cfg, "\"sasl_kerberos_keytab\"",       ctx->sasl_kerberos_keytab,       sizeof(ctx->sasl_kerberos_keytab));
+
+    cfg_str(cfg, "\"ssl_ca_location\"",          ctx->ssl_ca_location,          sizeof(ctx->ssl_ca_location));
+    cfg_str(cfg, "\"ssl_certificate_location\"", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));
+    cfg_str(cfg, "\"ssl_key_location\"",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
+    cfg_str(cfg, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
+    cfg_str(cfg, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
+    cfg_str(cfg, "\"ssl_truststore_location\"",  ctx->ssl_truststore_location,  sizeof(ctx->ssl_truststore_location));
+    cfg_str(cfg, "\"ssl_truststore_password\"",  ctx->ssl_truststore_password,  sizeof(ctx->ssl_truststore_password));
+
+    cfg_str(cfg, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
+    cfg_str(cfg, "\"isolation_level\"",   ctx->isolation_level,   sizeof(ctx->isolation_level));
+    cfg_str(cfg, "\"offset_start_mode\"", ctx->offset_start_mode, sizeof(ctx->offset_start_mode));
+    cfg_str(cfg, "\"librdkafka_debug\"",  ctx->librdkafka_debug,  sizeof(ctx->librdkafka_debug));
+}
+
 /* Создаёт контекст коннектора: разбирает config_json, инициализирует кэш схем,
  * создаёт consumer и подписывается на топик. Возвращает ctx всегда (даже при
  * ошибке инициализации rk — причина пишется в last_err). */
@@ -1036,6 +1204,7 @@ static void *kafka_create(const char *config_json, Arena *arena)
     ctx->arena = arena;
     pthread_mutex_init(&ctx->buf_mu, NULL);
     atomic_store(&ctx->consumer_running, 0);
+    atomic_store(&ctx->auth_failed, 0);
 
     /* Schema cache for avro (shares the host arena's lifetime). */
     ctx->schema_cache = arena_calloc(arena, sizeof(AvroSchemaCache));
@@ -1052,40 +1221,38 @@ static void *kafka_create(const char *config_json, Arena *arena)
     ctx->sr_ca_location[0]      = '\0';
 
     if (config_json) {
-        cfg_str(config_json, "\"brokers\"",     ctx->brokers,     sizeof(ctx->brokers));
-        cfg_str(config_json, "\"group_id\"",    ctx->group_id,    sizeof(ctx->group_id));
-        cfg_str(config_json, "\"topic\"",       ctx->topic_name,  sizeof(ctx->topic_name));
-        cfg_str(config_json, "\"data_format\"", ctx->data_format, sizeof(ctx->data_format));
-        cfg_str(config_json, "\"broker_address_family\"", ctx->addr_family, sizeof(ctx->addr_family));
-        cfg_str(config_json, "\"schema_registry_url\"",  ctx->schema_registry_url, sizeof(ctx->schema_registry_url));
-        cfg_str(config_json, "\"schema_registry_auth\"", ctx->sr_auth,             sizeof(ctx->sr_auth));
-        cfg_str(config_json, "\"schema_registry_ca_location\"", ctx->sr_ca_location, sizeof(ctx->sr_ca_location));
-        /* security (optional — empty keeps plaintext) */
-        cfg_str(config_json, "\"security_protocol\"", ctx->security_protocol, sizeof(ctx->security_protocol));
-        cfg_str(config_json, "\"sasl_mechanism\"",    ctx->sasl_mechanism,    sizeof(ctx->sasl_mechanism));
-        /* librdkafka принимает эти значения регистронезависимо (канон — строчный:
-         * "sasl_ssl"), а внутренние гейты сравнивают по подстроке "SSL"/"SASL".
-         * Нормализуем к верхнему регистру, чтобы пиннинг TLS и дефолт PLAIN
-         * срабатывали независимо от регистра из YAML/API. */
-        for (char *s = ctx->security_protocol; *s; s++) *s = (char)toupper((unsigned char)*s);
-        for (char *s = ctx->sasl_mechanism;    *s; s++) *s = (char)toupper((unsigned char)*s);
-        cfg_str(config_json, "\"sasl_username\"",     ctx->sasl_username,     sizeof(ctx->sasl_username));
-        cfg_str(config_json, "\"sasl_password\"",     ctx->sasl_password,     sizeof(ctx->sasl_password));
-        cfg_str(config_json, "\"sasl_kerberos_service_name\"", ctx->sasl_kerberos_service_name, sizeof(ctx->sasl_kerberos_service_name));
-        cfg_str(config_json, "\"sasl_kerberos_principal\"",    ctx->sasl_kerberos_principal,    sizeof(ctx->sasl_kerberos_principal));
-        cfg_str(config_json, "\"sasl_kerberos_keytab\"",       ctx->sasl_kerberos_keytab,       sizeof(ctx->sasl_kerberos_keytab));
-        /* TLS/mTLS (для security_protocol SSL | SASL_SSL) */
-        cfg_str(config_json, "\"ssl_ca_location\"",          ctx->ssl_ca_location,          sizeof(ctx->ssl_ca_location));
-        cfg_str(config_json, "\"ssl_certificate_location\"", ctx->ssl_certificate_location, sizeof(ctx->ssl_certificate_location));
-        cfg_str(config_json, "\"ssl_key_location\"",         ctx->ssl_key_location,         sizeof(ctx->ssl_key_location));
-        cfg_str(config_json, "\"ssl_key_password\"",         ctx->ssl_key_password,         sizeof(ctx->ssl_key_password));
-        cfg_str(config_json, "\"ssl_truststore_location\"", ctx->ssl_truststore_location, sizeof(ctx->ssl_truststore_location));
-    cfg_str(config_json, "\"ssl_truststore_password\"", ctx->ssl_truststore_password, sizeof(ctx->ssl_truststore_password));
-    cfg_str(config_json, "\"ssl_keystore_location\"",    ctx->ssl_keystore_location,    sizeof(ctx->ssl_keystore_location));
-        cfg_str(config_json, "\"offset_reset\"",      ctx->offset_reset,      sizeof(ctx->offset_reset));
-        cfg_str(config_json, "\"isolation_level\"",   ctx->isolation_level,   sizeof(ctx->isolation_level));
-        cfg_str(config_json, "\"offset_start_mode\"", ctx->offset_start_mode, sizeof(ctx->offset_start_mode));
-        cfg_str(config_json, "\"librdkafka_debug\"",  ctx->librdkafka_debug,  sizeof(ctx->librdkafka_debug));
+        /* Основной путь — настоящий разбор JSON. Наивный сканер cfg_str
+         * обрывает значение на первой кавычке и потому портит всё, что
+         * содержит экранирование, — а это ровно то, что бывает в паролях
+         * SASL. Он остаётся только запасным вариантом. */
+        JVal *cfg = json_parse(arena, config_json, strlen(config_json));
+        if (cfg && cfg->type == JV_OBJECT)
+            kafka_cfg_from_json(ctx, cfg);
+        else {
+            LOG_WARN("kafka: connector_config не разобран как JSON-объект — "
+                     "запасной разбор сканером; значения с экранированием "
+                     "(прежде всего пароли) могут быть прочитаны неверно");
+            kafka_cfg_from_scan(ctx, config_json);
+        }
+    }
+
+    /* librdkafka сверяет значения регистронезависимо, но код ниже сравнивает
+     * эти поля как strstr(..., "SSL") / strncmp(..., "SASL", 4) /
+     * strcmp(..., "GSSAPI") — поэтому канон здесь ВЕРХНИЙ регистр. Заодно
+     * чиним разделители: SASL-SSL → SASL_SSL, SCRAM_SHA_256 → SCRAM-SHA-256. */
+    normalize_protocol(ctx->security_protocol);
+    normalize_mechanism(ctx->sasl_mechanism);
+
+    /* Логин без протокола — самая частая ошибка конфигурации: librdkafka тогда
+     * говорит открытым текстом, брокер рвёт соединение, и SASL не выполняется
+     * вовсе. Достраиваем очевидный протокол и сообщаем об этом. */
+    if (!ctx->security_protocol[0] && ctx->sasl_username[0]) {
+        snprintf(ctx->security_protocol, sizeof(ctx->security_protocol), "%s",
+                 (ctx->ssl_ca_location[0] || ctx->ssl_truststore_location[0])
+                     ? "SASL_SSL" : "SASL_PLAINTEXT");
+        LOG_WARN("kafka: задан sasl_username без security_protocol — "
+                 "принимаю %s; укажите явно, если брокер ждёт другое",
+                 ctx->security_protocol);
     }
 
     /* «Читать всё каждый раз»: если явный group_id не задан (осталось значение по
@@ -1118,6 +1285,15 @@ static void *kafka_create(const char *config_json, Arena *arena)
         snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", errstr[0] ? errstr : "consumer init failed");
         return ctx;
     }
+
+    /* Фиксируем выбранный режим аутентификации в логе (без пароля): при разборе
+     * отказа первым делом нужно знать, какой механизм и логин реально ушли в
+     * librdkafka после нормализации и достройки дефолтов. */
+    if (ctx->security_protocol[0] || ctx->sasl_mechanism[0])
+        LOG_INFO("kafka: auth protocol=%s mechanism=%s user=%s",
+                 ctx->security_protocol[0] ? ctx->security_protocol : "PLAINTEXT",
+                 ctx->sasl_mechanism[0]    ? ctx->sasl_mechanism    : "<не задан>",
+                 ctx->sasl_username[0]     ? ctx->sasl_username     : "<не задан>");
 
     /* НЕ подписываемся на consumer-группу при создании: разовое чтение
      * (read_batch/describe) идёт через assign партиций и в группу не вступает,
@@ -1157,6 +1333,7 @@ static void kafka_destroy(void *vctx)
     if (ctx->schema_cache)
         pthread_mutex_destroy(&ctx->schema_cache->mu);
     pthread_mutex_destroy(&ctx->buf_mu);
+
     /* NB: ctx (and ctx->arena) are owned by the HOST — ctx was allocated with
      * arena_calloc(host_arena, ...). Do NOT arena_destroy() the host's arena or
      * free() arena memory here (that corrupted the host heap and crashed the
@@ -1390,6 +1567,17 @@ static int kafka_describe(void *vctx, Arena *a, const char *entity, Schema **out
         sampled++;
     }
 
+    /* Ни одного сообщения и при этом отказ аутентификации: без этой проверки
+     * ниже подставится запасная двухколоночная схема, и шаг выглядел бы
+     * успешным на неверном пароле. */
+    if (!schema && atomic_load(&ctx->auth_failed)) {
+        if (!ctx->last_err[0])
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "ошибка аутентификации SASL (%s)", ctx->brokers);
+        LOG_ERROR("kafka: describe прерван, %s", ctx->last_err);
+        return -1;
+    }
+
     if (!schema) {
         /* Fallback: two-column schema */
         schema = arena_calloc(a, sizeof(Schema));
@@ -1433,10 +1621,18 @@ static int kafka_preflight(KafkaCtx *ctx, const char *topic)
         rd_kafka_metadata(ctx->rk, 0 /*only this topic*/, rkt, &meta, 5000 /*ms*/);
 
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR || !meta) {
-        snprintf(ctx->last_err, sizeof(ctx->last_err),
-                 "kafka: cannot reach brokers (%s): %s",
-                 ctx->brokers, rd_kafka_err2str(err));
-        LOG_ERROR("%s", ctx->last_err);
+        /* Этот же вызов вынуждает librdkafka реально подключиться, поэтому к
+         * этому моменту error_cb уже мог записать отказ SASL. Неверный пароль
+         * снаружи выглядит как недоступность брокера — сохраняем конкретную
+         * причину, иначе оператор будет чинить сеть вместо учётных данных. */
+        if (atomic_load(&ctx->auth_failed) && ctx->last_err[0])
+            LOG_ERROR("kafka: %s", ctx->last_err);
+        else {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "kafka: cannot reach brokers (%s): %s",
+                     ctx->brokers, rd_kafka_err2str(err));
+            LOG_ERROR("%s", ctx->last_err);
+        }
         rd_kafka_topic_destroy(rkt);
         return -1;
     }
@@ -1536,6 +1732,19 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         int64_t elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000
                            + (tn.tv_nsec - t0.tv_nsec) / 1000000;
         if (elapsed_ms >= deadline_ms) break;
+
+        /* Отказ аутентификации, в отличие от обрыва связи, сам не рассосётся:
+         * librdkafka будет переподключаться с тем же неверным паролем до конца
+         * дедлайна и вернёт ноль сообщений — неотличимо от пустого топика.
+         * Поэтому здесь grace-периода нет, падаем сразу. */
+        if (!got_any && atomic_load(&ctx->auth_failed)) {
+            if (!ctx->last_err[0])
+                snprintf(ctx->last_err, sizeof(ctx->last_err),
+                         "ошибка аутентификации SASL (%s)", ctx->brokers);
+            LOG_ERROR("kafka: %s", ctx->last_err);
+            *out = NULL;
+            return -1;
+        }
 
         /* Транзиентный реконнект: librdkafka переподключается сам за секунды, а
          * preflight в начале read_batch уже подтвердил доступность кластера.
@@ -1653,6 +1862,15 @@ static int kafka_read_batch(void *vctx, Arena *a, DfoReadReq *req,
 
     if (msg_count == 0) {
         *out = NULL;
+        /* Отличаем «топик пуст» от «не прошли рукопожатие SASL» — отсюда оба
+         * выглядят как ноль сообщений. */
+        if (atomic_load(&ctx->auth_failed)) {
+            if (!ctx->last_err[0])
+                snprintf(ctx->last_err, sizeof(ctx->last_err),
+                         "ошибка аутентификации SASL (%s)", ctx->brokers);
+            LOG_ERROR("kafka: чтение прервано, %s", ctx->last_err);
+            return -1;
+        }
         return 0; /* no messages yet, caller may retry */
     }
 
@@ -1802,8 +2020,18 @@ static int kafka_ping(void *vctx)
     rd_kafka_resp_err_t err = rd_kafka_metadata(ctx->rk, 1 /*all_topics*/,
                                                  NULL, &meta, 3000 /*ms*/);
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        LOG_WARN("kafka: ping failed: %s", rd_kafka_err2str(err));
-        snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", rd_kafka_err2str(err));
+        /* rd_kafka_metadata отдаёт только общий код («Broker transport
+         * failure»); настоящая причина — отказ SASL — приходит асинхронно в
+         * error_cb и уже лежит в last_err. Дописываем общий код к ней, а не
+         * вместо неё: иначе проба связи покажет невнятный транспортный сбой
+         * там, где на деле не сошёлся пароль. */
+        const char *generic = rd_kafka_err2str(err);
+        if (ctx->last_err[0] && strcmp(ctx->last_err, generic) != 0) {
+            LOG_WARN("kafka: ping failed: %s — %s", generic, ctx->last_err);
+        } else {
+            snprintf(ctx->last_err, sizeof(ctx->last_err), "%s", generic);
+            LOG_WARN("kafka: ping failed: %s", generic);
+        }
         return -1;
     }
     rd_kafka_metadata_destroy(meta);
