@@ -4481,6 +4481,131 @@ static void h_ingest_parquet(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp,200,jb_done(&jb));
 }
 
+/* ── Секреты внутри connector_config шага ────────────────────────────────────
+ * Справочник подключений отдаётся наружу замаскированным (conn_write_public),
+ * а конвейеры — нет: pipeline_to_json пишет connector_config шага байт-в-байт.
+ * У шага с ВСТРОЕННЫМ конфигом (импорт YAML, легаси, MCP) внутри лежит
+ * настоящий sasl_password / ssl_keystore_password, и он уезжал в ответ
+ * GET /api/pipelines любому, кто имеет право смотреть конвейеры.
+ *
+ * Маскируем на выдаче и склеиваем обратно на приёме — как у подключений.
+ * Без второй половины правка конвейера сохранила бы поверх пароля строку
+ * "********". connector_config хранится СТРОКОЙ с JSON внутри, поэтому её
+ * приходится разбирать отдельно от самого конвейера. */
+static bool conn_key_is_secret(const char *k);
+static void conn_write_config_masked(JBuf *jb, JVal *cfg);
+static void conn_write_config_merged(JBuf *jb, JVal *incoming, JVal *stored_cfg);
+static void jval_serialize(JBuf *jb, JVal *v);
+
+/* Есть ли в конфиге непустой секрет — чтобы не переписывать JSON зря. */
+static bool cfg_has_secret(JVal *cfg) {
+    if (!cfg || cfg->type != JV_OBJECT) return false;
+    for (size_t i = 0; i < cfg->nkeys; i++) {
+        if (!conn_key_is_secret(cfg->keys[i])) continue;
+        JVal *v = cfg->vals[i];
+        if (v && v->type == JV_STRING && v->s && v->s[0]) return true;
+    }
+    return false;
+}
+
+/* Ищет сохранённый connector_config шага. Вызывать под g_app.scheduler->mu. */
+static const char *stored_step_cfg_locked(const char *pid, const char *sid) {
+    if (!pid || !pid[0] || !sid || !sid[0] || !g_app.scheduler) return NULL;
+    for (int i = 0; i < g_app.scheduler->npipelines; i++) {
+        Pipeline *p = &g_app.scheduler->pipelines[i];
+        if (strcmp(p->id, pid) != 0) continue;
+        for (int j = 0; j < p->nsteps; j++)
+            if (strcmp(p->steps[j].id, sid) == 0) return p->steps[j].connector_config;
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Переписывает конвейер, применяя к connector_config каждого шага операцию
+ * mask (stored == NULL) или merge (stored — сохранённый конфиг того же шага).
+ * Возвращает NULL, если менять нечего: вызывающий отдаёт исходную строку. */
+static const char *pipeline_json_rewrite_cfg(const char *pj, Arena *a, bool merge,
+                                             const char *pid_for_merge) {
+    JVal *root = json_parse(a, pj, strlen(pj));
+    if (!root || root->type != JV_OBJECT) return NULL;
+    JVal *steps = json_get(root, "steps");
+    if (!steps || steps->type != JV_ARRAY || steps->nitems == 0) return NULL;
+
+    const char *pid = pid_for_merge && pid_for_merge[0]
+                    ? pid_for_merge : json_str(json_get(root, "id"), "");
+
+    JBuf jb; jb_init(&jb, a, strlen(pj) + 256);
+    jb_obj_begin(&jb);
+    for (size_t i = 0; i < root->nkeys; i++) {
+        jb_key(&jb, root->keys[i]);
+        if (strcmp(root->keys[i], "steps") != 0) { jval_serialize(&jb, root->vals[i]); continue; }
+
+        jb_arr_begin(&jb);
+        for (size_t s = 0; s < steps->nitems; s++) {
+            JVal *st = steps->items[s];
+            if (!st || st->type != JV_OBJECT) { jval_serialize(&jb, st); continue; }
+            const char *sid = json_str(json_get(st, "id"), "");
+            jb_obj_begin(&jb);
+            for (size_t k = 0; k < st->nkeys; k++) {
+                jb_key(&jb, st->keys[k]);
+                JVal *v = st->vals[k];
+                if (strcmp(st->keys[k], "connector_config") || !v ||
+                    v->type != JV_STRING || !v->s || !v->s[0]) {
+                    jval_serialize(&jb, v);
+                    continue;
+                }
+                JVal *cfg = json_parse(a, v->s, v->len);
+                if (!cfg || cfg->type != JV_OBJECT) { jval_serialize(&jb, v); continue; }
+
+                JBuf inner; jb_init(&inner, a, v->len + 64);
+                if (merge) {
+                    const char *sc = NULL;
+                    pthread_mutex_lock(&g_app.scheduler->mu);
+                    const char *found = stored_step_cfg_locked(pid, sid);
+                    if (found) sc = arena_strdup(a, found);
+                    pthread_mutex_unlock(&g_app.scheduler->mu);
+                    JVal *stored = (sc && sc[0]) ? json_parse(a, sc, strlen(sc)) : NULL;
+                    if (stored && stored->type != JV_OBJECT) stored = NULL;
+                    conn_write_config_merged(&inner, cfg, stored);
+                } else {
+                    conn_write_config_masked(&inner, cfg);
+                }
+                jb_str(&jb, jb_done(&inner));
+            }
+            jb_obj_end(&jb);
+        }
+        jb_arr_end(&jb);
+    }
+    jb_obj_end(&jb);
+    return jb_done(&jb);
+}
+
+/* Конвейер для выдачи наружу: секреты во встроенных конфигах замаскированы. */
+static const char *pipeline_json_public(const char *pj, Arena *a) {
+    JVal *root = json_parse(a, pj, strlen(pj));
+    if (!root || root->type != JV_OBJECT) return pj;
+    JVal *steps = json_get(root, "steps");
+    if (!steps || steps->type != JV_ARRAY) return pj;
+    bool any = false;
+    for (size_t s = 0; s < steps->nitems && !any; s++) {
+        JVal *st = steps->items[s];
+        if (!st || st->type != JV_OBJECT) continue;
+        JVal *v = json_get(st, "connector_config");
+        if (!v || v->type != JV_STRING || !v->s || !v->s[0]) continue;
+        JVal *cfg = json_parse(a, v->s, v->len);
+        if (cfg_has_secret(cfg)) any = true;
+    }
+    if (!any) return pj;
+    const char *out = pipeline_json_rewrite_cfg(pj, a, false, NULL);
+    return out ? out : pj;
+}
+
+/* Тело запроса на приёме: заглушки секретов заменяются сохранёнными значениями. */
+static const char *pipeline_json_unmask(const char *body, Arena *a, const char *pid) {
+    const char *out = pipeline_json_rewrite_cfg(body, a, true, pid);
+    return out ? out : body;
+}
+
 /* ── GET /api/pipelines ── */
 static void h_pipelines_list(HttpReq *req, HttpResp *resp) {
     (void)req;
@@ -4490,7 +4615,7 @@ static void h_pipelines_list(HttpReq *req, HttpResp *resp) {
     pthread_mutex_lock(&g_app.scheduler->mu);
     for(int i=0;i<g_app.scheduler->npipelines;i++){
         char *pj=pipeline_to_json(&g_app.scheduler->pipelines[i],a);
-        jb_raw(&jb,pj);
+        jb_raw(&jb,pipeline_json_public(pj,a));
     }
     pthread_mutex_unlock(&g_app.scheduler->mu);
     jb_arr_end(&jb);
@@ -4501,7 +4626,13 @@ static void h_pipelines_list(HttpReq *req, HttpResp *resp) {
 static void h_pipeline_create(HttpReq *req, HttpResp *resp) {
     if(!req->body||!req->body_len){http_resp_error(resp,400,"empty body");return;}
     Pipeline p; memset(&p,0,sizeof(p));
-    if(pipeline_from_json(&p,req->body)<0){http_resp_error(resp,400,"invalid pipeline json");return;}
+    /* Тот же POST служит и обновлением, а конвейер уехал в UI с замаскированными
+     * секретами. Возвращаем на их место сохранённые значения — иначе правка
+     * любого поля затёрла бы пароль строкой "********". */
+    Arena *ma=arena_create(4096);
+    const char *body = pipeline_json_unmask(req->body, ma, NULL);
+    if(pipeline_from_json(&p,body)<0){arena_destroy(ma);http_resp_error(resp,400,"invalid pipeline json");return;}
+    arena_destroy(ma);
     if(!p.id[0]) {
         static volatile int _pid_seq = 0;
         int seq = __atomic_fetch_add(&_pid_seq, 1, __ATOMIC_RELAXED);
@@ -4510,8 +4641,8 @@ static void h_pipeline_create(HttpReq *req, HttpResp *resp) {
     scheduler_add(g_app.scheduler,&p);
     Arena *a=arena_create(4096);
     char *pj=pipeline_to_json(&p,a);
-    catalog_save_pipeline(g_app.catalog,p.id,pj);
-    http_resp_json(resp,201,pj);
+    catalog_save_pipeline(g_app.catalog,p.id,pj);   /* в хранилище — с настоящими секретами */
+    http_resp_json(resp,201,pipeline_json_public(pj,a));
     arena_destroy(a);   /* тело уже скопировано в ответ */
     Arena *ba=arena_create(256);
     app_ws_broadcast(&g_app,arena_sprintf(ba,"{\"event\":\"pipeline_created\",\"id\":\"%s\"}",p.id));
@@ -4564,9 +4695,16 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
      * thread stack (HTTP worker threads use a small stack). */
     Pipeline *plp = calloc(1, sizeof(Pipeline));
     if (!plp) { http_resp_error(resp, 500, "out of memory"); return; }
-    if (pipeline_from_json(plp, req->body) < 0) {
-        free(plp); http_resp_error(resp, 400, "invalid pipeline json"); return;
+    /* Конструктор мог загрузить конвейер с замаскированными секретами — с
+     * заглушкой вместо пароля предпросмотр упал бы на аутентификации. Ставим
+     * на её место сохранённое значение, как и при сохранении. */
+    Arena *ma = arena_create(4096);
+    const char *pbody = pipeline_json_unmask(req->body, ma, NULL);
+    if (pipeline_from_json(plp, pbody) < 0) {
+        arena_destroy(ma); free(plp);
+        http_resp_error(resp, 400, "invalid pipeline json"); return;
     }
+    arena_destroy(ma);
     if (plp->nsteps == 0) {
         free(plp); http_resp_error(resp, 400, "pipeline has no steps"); return;
     }
@@ -4789,7 +4927,7 @@ static void h_pipeline_from_template(HttpReq *req, HttpResp *resp) {
     scheduler_add(g_app.scheduler, &p);
     char *pj = pipeline_to_json(&p, a);
     catalog_save_pipeline(g_app.catalog, p.id, pj);
-    http_resp_json(resp, 201, pj);
+    http_resp_json(resp, 201, pipeline_json_public(pj, a));
 
     Arena *ba = arena_create(256);
     app_ws_broadcast(&g_app, arena_sprintf(ba, "{\"event\":\"pipeline_created\",\"id\":\"%s\"}", p.id));
@@ -4808,7 +4946,7 @@ static void h_pipeline_get(HttpReq *req, HttpResp *resp) {
         arena_destroy(a); return;
     }
     Arena *a=arena_create(4096);
-    http_resp_json(resp,200,pipeline_to_json(p,a));
+    http_resp_json(resp,200,pipeline_json_public(pipeline_to_json(p,a),a));
     arena_destroy(a);
 }
 
@@ -5607,7 +5745,20 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
         return -1;
     }
 
-    const char *entity = st->sink_entity[0] ? st->sink_entity : st->target_table;
+    /* Назначение. У Kafka и REST оно живёт в собственном конфиге коннектора
+     * (топик / URL), поэтому форма и не показывает для них поле «Назначение» —
+     * см. makeSinkFieldsHTML в ui/app.js. Но target_table у шага мог остаться
+     * от прежнего типа (переключение с историзации, YAML-импорт, легаси), и
+     * тогда он МОЛЧА перебивал топик из конфига: конвейер писал в топик с
+     * именем таблицы, а предпросмотр показывал правильный. Для таких
+     * коннекторов target_table назначением не считаем — только явный
+     * sink_entity, если он задан. */
+    bool dest_in_cfg = (strcmp(eff_type, "kafka") == 0 || strcmp(eff_type, "json_http") == 0);
+    const char *entity = st->sink_entity[0] ? st->sink_entity
+                       : (dest_in_cfg ? "" : st->target_table);
+    if (dest_in_cfg && !st->sink_entity[0] && st->target_table[0])
+        LOG_INFO("sink step %s: target_table='%s' игнорируется — назначение для '%s' "
+                 "задаётся в конфигурации коннектора", st->id, st->target_table, eff_type);
     int mode = (strcasecmp(st->sink_mode, "overwrite") == 0) ? DFO_SINK_OVERWRITE : DFO_SINK_APPEND;
 
     /* 2. Пагинация источника. exec_stmt МОЛЧА обрезает результат на
@@ -8602,7 +8753,23 @@ static bool conn_key_is_secret(const char *k) {
         "ssl_key_password", "ssl_keystore_password", "ssl_truststore_password",
         "schema_registry_auth", NULL
     };
-    for (int i = 0; SECRETS[i]; i++) if (!strcmp(k, SECRETS[i])) return true;
+    if (!k) return false;
+
+    /* Kafka-коннектор принимает одно свойство в трёх написаниях: snake_case,
+     * точечное имя librdkafka и его же с префиксом "kafka." (см. cfg_get в
+     * kafka_connector.c). Сравнение строго по snake_case означало, что пароль,
+     * записанный как "kafka.sasl.password", коннектор подхватывает и всё
+     * работает, а маскирование считает ключ несекретным и отдаёт значение
+     * открытым текстом. Приводим к канону: срезаем префикс, точки → подчёркивания. */
+    char canon[128];
+    const char *src = (strncmp(k, "kafka.", 6) == 0) ? k + 6 : k;
+    size_t n = strlen(src);
+    if (n >= sizeof(canon)) n = sizeof(canon) - 1;
+    for (size_t i = 0; i < n; i++) canon[i] = (src[i] == '.') ? '_' : src[i];
+    canon[n] = '\0';
+
+    for (int i = 0; SECRETS[i]; i++)
+        if (!strcmp(k, SECRETS[i]) || !strcmp(canon, SECRETS[i])) return true;
     return false;
 }
 

@@ -1418,10 +1418,27 @@ function pbChangeConnType(idx, type) {
 }
 
 function pbUpdateConnConfig(idx, field, val) {
-  const cfg = safeParse(pbStep(idx).connector_config, {});
+  /* Канонизируем ВЕСЬ конфиг при любой правке: иначе к ключу в точечном
+   * написании добавился бы второй, snake_case, и в конфиге осталось бы два
+   * значения одного свойства. */
+  const step = pbStep(idx);
+  const cfg = normalizeConnConfig(safeParse(step.connector_config, {}), stepConnType(step));
   cfg[field] = val;
-  pbStep(idx).connector_config = JSON.stringify(cfg);
+  step.connector_config = JSON.stringify(cfg);
   if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
+}
+
+/* Удаляет ключи из конфига (в отличие от записи пустой строки — конфиг остаётся
+ * чистым, без осиротевших полей). Одна перерисовка на все ключи. */
+function pbDropConnConfigKeys(idx, keys) {
+  const step = pbStep(idx);
+  const cfg = normalizeConnConfig(safeParse(step.connector_config, {}), stepConnType(step));
+  let touched = false;
+  keys.forEach(k => { if (k in cfg) { delete cfg[k]; touched = true; } });
+  if (!touched) return false;
+  step.connector_config = JSON.stringify(cfg);
+  if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
+  return true;
 }
 
 
@@ -1677,6 +1694,76 @@ function stripMaskedSecrets(cfg) {
   return out;
 }
 
+/* Поле секрета показывает заглушку ******** вместо сохранённого значения. Без
+ * очистки по фокусу оператор ставил курсор в конец и дописывал новый пароль —
+ * в конфиг уходило "********новый", сервер такое значение заглушкой уже не
+ * считал и сохранял буквально, а проба связи падала на авторизации.
+ * Очищаем поле при фокусе; если оператор ушёл, ничего не введя, возвращаем
+ * заглушку. Конфиг при этом не трогаем — там остаётся заглушка, и сервер
+ * подставит сохранённое значение (conn_write_config_merged). */
+function connSecretFocus(el) {
+  if (el.value === CONN_SECRET_MASK) { el.value = ''; el.dataset.wasMask = '1'; }
+}
+function connSecretBlur(el) {
+  if (!el.value && el.dataset.wasMask) { el.value = CONN_SECRET_MASK; delete el.dataset.wasMask; }
+}
+
+/* ── Канонизация ключей конфига Kafka ─────────────────────────────────────────
+ * Коннектор принимает одно и то же свойство в трёх написаниях: snake_case из
+ * формы ("sasl_username"), точечное имя librdkafka ("sasl.username") и его же
+ * с префиксом "kafka." — так свойства выглядят в конфигах Java/Spring, откуда
+ * их копируют администраторы (см. cfg_get в kafka_connector.c).
+ *
+ * Форма же читала ТОЛЬКО snake_case. Конфиг, заведённый в точечном написании,
+ * открывался пустым: security_protocol не находился, поэтому блоки SASL и TLS
+ * не рисовались вовсе, а правка любого поля создавала ВТОРОЙ ключ рядом со
+ * старым, и понять, какое значение реально уедет в брокер, было нельзя.
+ *
+ * Таблица повторяет список псевдонимов из cfg_get. Ключи, у которых там нет
+ * точечного имени (topic, data_format, offset_*, schema_registry_*), сюда
+ * намеренно не входят: коннектор их в точечной форме тоже не принимает, и
+ * выдумывать в UI поддержку, которой нет в бэкенде, нельзя. */
+const KAFKA_DOTTED_ALIASES = {
+  'bootstrap.servers':          'brokers',
+  'group.id':                   'group_id',
+  'broker.address.family':      'broker_address_family',
+  'security.protocol':          'security_protocol',
+  'sasl.mechanism':             'sasl_mechanism',
+  'sasl.username':              'sasl_username',
+  'sasl.password':              'sasl_password',
+  'sasl.kerberos.service.name': 'sasl_kerberos_service_name',
+  'sasl.kerberos.principal':    'sasl_kerberos_principal',
+  'sasl.kerberos.keytab':       'sasl_kerberos_keytab',
+  'ssl.ca.location':            'ssl_ca_location',
+  'ssl.certificate.location':   'ssl_certificate_location',
+  'ssl.key.location':           'ssl_key_location',
+  'ssl.key.password':           'ssl_key_password',
+  'ssl.keystore.location':      'ssl_keystore_location',
+  'ssl.keystore.password':      'ssl_keystore_password',
+  'ssl.truststore.location':    'ssl_truststore_location',
+  'ssl.truststore.password':    'ssl_truststore_password',
+  'debug':                      'librdkafka_debug',
+};
+
+/* Приводит конфиг к каноническому snake_case. Возвращает НОВЫЙ объект; если
+ * приводить нечего, возвращает исходный, чтобы не плодить лишних перерисовок.
+ * При конфликте побеждает snake_case — тот же порядок, что и в cfg_get. */
+function normalizeConnConfig(cfg, type) {
+  if (type !== 'kafka' || !cfg || typeof cfg !== 'object') return cfg;
+  let touched = false;
+  const out = {};
+  Object.keys(cfg).forEach(k => {
+    const bare = k.indexOf('kafka.') === 0 ? k.slice(6) : k;
+    const canon = KAFKA_DOTTED_ALIASES[bare];
+    if (canon && canon !== k) { touched = true; if (!(canon in out)) out[canon] = cfg[k]; }
+    else out[k] = cfg[k];
+  });
+  if (!touched) return cfg;
+  /* snake_case из исходного конфига перекрывает то, что пришло из псевдонима. */
+  Object.keys(cfg).forEach(k => { if (!KAFKA_DOTTED_ALIASES[k.indexOf('kafka.') === 0 ? k.slice(6) : k]) out[k] = cfg[k]; });
+  return out;
+}
+
 function makeConnectionPickerHTML(step, idx, dir) {
   /* Подключение не привязано к роли шага: это просто система, куда мы ходим.
    * Показываем весь справочник и для источника, и для приёмника. */
@@ -1791,10 +1878,30 @@ function pbCreateConnectionFor(idx, dir) {
  * фиксируем механизм PLAIN, если он ещё не задан: иначе бэкенд получит пустой
  * sasl.mechanism, а librdkafka по умолчанию уходит в GSSAPI (Kerberos) и падает
  * на отсутствующем keytab. Затем перерисовываем форму (появятся поля SASL/TLS). */
+const KAFKA_SASL_KEYS = ['sasl_mechanism', 'sasl_username', 'sasl_password',
+                         'sasl_kerberos_service_name', 'sasl_kerberos_principal',
+                         'sasl_kerberos_keytab'];
+const KAFKA_TLS_KEYS  = ['ssl_ca_location', 'ssl_certificate_location',
+                         'ssl_key_location', 'ssl_key_password',
+                         'ssl_keystore_location', 'ssl_keystore_password',
+                         'ssl_truststore_location', 'ssl_truststore_password'];
+
 function pbSetKafkaSecurity(idx, val) {
   pbUpdateConnConfig(idx, 'security_protocol', val);
+
+  /* Убираем настройки, к которым новый протокол отношения не имеет. Раньше они
+   * оставались в конфиге, а поля для них исчезали вместе с блоком, — стереть
+   * их через интерфейс было нечем. Для Kafka это ломало ровно тот сценарий,
+   * который заказчик планирует штатно: откат SASL_SSL → SASL_PLAINTEXT
+   * оставлял ssl_keystore_location, а kafka_apply_tls вызывается безусловно,
+   * и librdkafka отказывалась создавать клиент из-за пустого пароля keystore. */
+  const drop = [];
+  if (val.indexOf('SASL') !== 0) drop.push(...KAFKA_SASL_KEYS);
+  if (val.indexOf('SSL') < 0)    drop.push(...KAFKA_TLS_KEYS);
+  if (drop.length) pbDropConnConfigKeys(idx, drop);
+
   if (val.indexOf('SASL') === 0) {
-    const cfg = safeParse(pbStep(idx).connector_config, {});
+    const cfg = normalizeConnConfig(safeParse(pbStep(idx).connector_config, {}), 'kafka');
     if (!cfg.sasl_mechanism) pbUpdateConnConfig(idx, 'sasl_mechanism', 'PLAIN');
   }
   const el = document.getElementById('step-conn-cfg-' + idx);
@@ -1823,6 +1930,14 @@ function kafkaCfgProblems(cfg) {
   const needsTls  = sec === 'SSL' || sec === 'SASL_SSL';
   const needsSasl = sec.indexOf('SASL') === 0;
   if (!(cfg.brokers || '').trim()) block.push('Укажите адрес брокеров (host:port).');
+  /* Новое подключение создаётся с PLAINTEXT, то есть без аутентификации вовсе,
+   * и раньше проходило проверку молча. На боевых кластерах аутентификация
+   * обязательна (PLAIN для внешних систем, SCRAM-SHA-512 для наших), поэтому
+   * отсутствие SASL показываем явно. Не блокируем: локальный или тестовый
+   * брокер без аутентификации — законный случай. */
+  if (!needsSasl)
+    warn.push('Защита соединения — ' + (sec || 'PLAINTEXT') + ': подключение пойдёт БЕЗ аутентификации. '
+            + 'Боевые кластеры её требуют — обычно SASL_SSL с механизмом SCRAM-SHA-512 или PLAIN.');
   if (needsSasl && mech !== 'GSSAPI') {
     if (!(cfg.sasl_username || '').trim()) block.push('Механизм ' + mech + ' требует поле «Пользователь».');
     if (!(cfg.sasl_password || '').trim()) block.push('Механизм ' + mech + ' требует поле «Пароль».');
@@ -2257,6 +2372,11 @@ function pbChangeStepType(idx, type) {
     s.connector_config = '{}';
     if (!s.sink_mode) s.sink_mode = 'append';
     if (s.sink_entity == null) s.sink_entity = '';
+    /* У Kafka и REST назначение задаётся в конфиге коннектора (топик / URL), и
+     * поля «Назначение» для них форма не показывает. Оставшийся от прежнего
+     * типа target_table стереть было нечем, а на прогоне он перебивал топик —
+     * шаг писал в топик с именем таблицы. Сбрасываем при смене типа. */
+    if (s.connector_type === 'kafka' || s.connector_type === 'json_http') s.target_table = '';
   } else if (type === 'transform') {
     /* Unified transform step: SQL by default; language switched in-form. */
     s._ui_type = '';      /* let stepType derive from the filled field */
@@ -2782,7 +2902,11 @@ function makeConnectorConfigHTML(step, idx) {
    * тогда тип знает только справочник. Без этого форма запроса (SQL, режим
    * чтения, топик) для такого шага не рисовалась вовсе. */
   const type = stepConnType(step);
-  const cfg  = safeParse(step.connector_config, {});
+  /* Канонизируем при рендере, чтобы конфиг в точечном написании (или с
+   * префиксом kafka.) сразу показывался в полях, а не выглядел пустым. В
+   * хранимый объект это не пишется — его канонизирует pbUpdateConnConfig при
+   * первой же правке. */
+  const cfg  = normalizeConnConfig(safeParse(step.connector_config, {}), type);
 
   /* Pure SQL transform: no connector / python / scala → nothing to configure
      here (the SQL editor itself is rendered by makeStepCard). */
@@ -2990,7 +3114,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль</label>
-          <input type="password" value="${escAttr(cfg.password || '')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">
+          <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password || '')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">
         </div>
         ${srcExtra}
       </div>
@@ -3029,7 +3153,7 @@ function makeConnectorConfigHTML(step, idx) {
       </select>`);
     if (auth==='basic') {
       f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="api_user">`);
-      f.push(`<label>Пароль</label><input type="password" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
+      f.push(`<label>Пароль</label><input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
     } else if (auth==='bearer') {
       f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="eyJhbGciOiJIUzI1NiJ9">`);
     }
@@ -3087,7 +3211,7 @@ function makeConnectorConfigHTML(step, idx) {
       </select>`);
     if (auth==='basic') {
       f.push(`<label>Пользователь</label><input type="text" value="${escAttr(cfg.user||'')}" oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="svc_eai">`);
-      f.push(`<label>Пароль</label><input type="password" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
+      f.push(`<label>Пароль</label><input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password||'')}" oninput="pbUpdateConnConfig(${idx},'password',this.value)">`);
     } else if (auth==='bearer') {
       f.push(`<label>Токен</label><input type="text" value="${escAttr(cfg.auth_token||'')}" oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)" placeholder="eyJhbGciOiJIUzI1NiJ9">`);
     }
@@ -3142,7 +3266,7 @@ function makeConnectorConfigHTML(step, idx) {
           </div>
           <div class="form-group" style="margin:0;width:50%;align-self:flex-start">
             <label>Пароль</label>
-            <input type="password" value="${escAttr(cfg.password || '')}"
+            <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password || '')}"
                    oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
           </div>
         </div>
@@ -3230,7 +3354,7 @@ function makeConnectorConfigHTML(step, idx) {
           </div>
           <div class="form-group" style="margin:0;width:50%;align-self:flex-start">
             <label>Пароль</label>
-            <input type="password" value="${escAttr(cfg.password || '')}"
+            <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password || '')}"
                    oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
           </div>
         </div>
@@ -3311,7 +3435,7 @@ function makeConnectorConfigHTML(step, idx) {
           </div>
           <div class="form-group" style="margin:0;width:50%;align-self:flex-start">
             <label>Пароль</label>
-            <input type="password" value="${escAttr(cfg.password || '')}"
+            <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password || '')}"
                    oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
           </div>
         </div>
@@ -3405,6 +3529,12 @@ function makeConnectorConfigHTML(step, idx) {
       </div>
 
       <div class="conn-grid">
+        ${/* Формат — свойство ЧТЕНИЯ. Приёмник (kafka_write_batch) data_format не
+             читает вовсе и всегда пишет по одному JSON-объекту на строку, поэтому
+             у приёмника селектор не показываем: выбранные там CSV/Avro молча
+             ничего не меняли, а расследование «почему потребители не читают Avro»
+             уходило не в ту сторону. */''}
+        ${step.is_sink ? '' : `
         <div class="form-group" style="margin:0">
           <label>Формат сообщений</label>
           <select onchange="pbUpdateConnConfig(${idx},'data_format',this.value);pbRerenderStepCfg(${idx})">
@@ -3412,7 +3542,7 @@ function makeConnectorConfigHTML(step, idx) {
             <option value="csv"  ${fmt==='csv' ?'selected':''}>CSV</option>
             <option value="avro" ${fmt==='avro'?'selected':''}>Avro</option>
           </select>
-        </div>
+        </div>`}
         ${step.is_sink ? '' : `
         <div class="form-group" style="margin:0">
           <label>С какого места читать</label>
@@ -3466,7 +3596,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль</label>
-          <input type="password" value="${escAttr(cfg.sasl_password || '')}" placeholder="" autocomplete="off"
+          <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.sasl_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'sasl_password',this.value)">
         </div>`}
         ${!isKerberos ? '' : `
@@ -3504,7 +3634,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль truststore</label>
-          <input type="password" value="${escAttr(cfg.ssl_truststore_password || '')}" placeholder="" autocomplete="off"
+          <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.ssl_truststore_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_truststore_password',this.value)">
         </div>
       </div>
@@ -3521,7 +3651,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль ключа</label>
-          <input type="password" value="${escAttr(cfg.ssl_key_password || '')}" placeholder="" autocomplete="off"
+          <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.ssl_key_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_password',this.value)">
         </div>
       </div>
@@ -3533,11 +3663,13 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Пароль keystore</label>
-          <input type="password" value="${escAttr(cfg.ssl_keystore_password || '')}" placeholder="" autocomplete="off"
+          <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.ssl_keystore_password || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'ssl_keystore_password',this.value)">
         </div>
       </div>` : ''}
-      ${fmt==='avro' ? `
+      ${/* Реестр схем нужен только чтению: sr_fetch_schema и batch_from_avro
+           вызываются из describe/read_batch, приёмник к реестру не обращается. */''}
+      ${(fmt==='avro' && !step.is_sink) ? `
       <div style="font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:.9rem 0 .1rem">Реестр схем (Avro)</div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
@@ -3547,7 +3679,7 @@ function makeConnectorConfigHTML(step, idx) {
         </div>
         <div class="form-group" style="margin:0">
           <label>Авторизация реестра</label>
-          <input type="password" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="" autocomplete="off"
+          <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.schema_registry_auth || '')}" placeholder="" autocomplete="off"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_auth',this.value)">
         </div>
       </div>
@@ -6294,7 +6426,19 @@ function groupStepDefaults(box, type) {
   const row = document.createElement('div');
   row.className = 'conn-grid';          /* та же сетка, что и у полей доступа */
   move.forEach(g => row.appendChild(g));
-  sec.appendChild(title); sec.appendChild(row);
+  sec.appendChild(title);
+  /* Подключение не делится на источник и приёмник, поэтому форма всегда рисует
+   * вариант источника. Для Kafka это значит, что группа, режим чтения и
+   * стартовая позиция видны и тому, кто заводит подключение под выгрузку, —
+   * а приёмник (kafka_write_batch) ни одного из этих ключей не читает. Раньше
+   * об этом ничего не говорилось, и оператор заполнял их впустую. */
+  if (type === 'kafka') {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:.72rem;color:var(--muted);margin:.15rem 0 .45rem';
+    hint.textContent = 'Действуют только для шагов-источников: при выгрузке в Kafka эти параметры не используются.';
+    sec.appendChild(hint);
+  }
+  sec.appendChild(row);
 
   /* Предпросмотр читает данные по параметрам запроса (топик, таблица, запрос) —
    * значит, его место под этими полями, а не в блоке доступа: иначе кнопка
@@ -6379,6 +6523,21 @@ async function saveConnection() {
   const body = collectConnectionForm();
   const st = document.getElementById('conn-status');
   if (!body.name) { showToast('Укажите название подключения', 'warn'); return; }
+
+  /* Проверки конфига Kafka раньше вызывались только из «Подключиться» и
+   * предпросмотра, поэтому заведомо нерабочее подключение (keystore без
+   * пароля, mTLS без ключа, SASL без логина) спокойно сохранялось со словами
+   * «Подключение сохранено», а отказ вылезал уже на регулярном прогоне.
+   * Блокирующие ошибки не пропускаем, предупреждения требуют подтверждения. */
+  if (body.type === 'kafka') {
+    const pr = kafkaCfgProblems(normalizeConnConfig(body.config || {}, 'kafka'));
+    if (pr.block.length) {
+      showToast('Не сохранено: ' + pr.block.join(' '), 'error');
+      return;
+    }
+    if (pr.warn.length && !confirm(pr.warn.join('\n\n') + '\n\nСохранить всё равно?')) return;
+  }
+
   st.textContent = 'Сохранение…';
   try {
     const saved = _connEditId
