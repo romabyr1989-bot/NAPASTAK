@@ -34,6 +34,14 @@ getent passwd "$SVC_USER" >/dev/null || \
   useradd --system --gid "$SVC_USER" --home-dir "$STATE" --shell /sbin/nologin "$SVC_USER"
 
 echo "==> Файлы программы → $PREFIX"
+# Останавливаем ДО копирования. Ядро не даёт перезаписать файл работающего
+# процесса (ETXTBSY, «текстовый файл занят»), поэтому обновление поверх
+# запущенного сервиса падало здесь, оставив каталог наполовину обновлённым.
+# На первой установке юнита ещё нет — тогда просто пропускаем.
+if systemctl is-active --quiet napastak.service 2>/dev/null; then
+  echo "  останавливаю napastak.service на время обновления"
+  systemctl stop napastak.service
+fi
 mkdir -p "$PREFIX"/{bin,lib,ui}
 cp -a "$SRC"/bin/.  "$PREFIX"/bin/
 cp -a "$SRC"/lib/.  "$PREFIX"/lib/
