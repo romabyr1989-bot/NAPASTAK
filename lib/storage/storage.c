@@ -539,6 +539,29 @@ struct Catalog { sqlite3 *db; pthread_mutex_t mu; };
 static inline void _cat_unlock(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }
 #define CAT_GUARD(c) pthread_mutex_t *_catg __attribute__((cleanup(_cat_unlock))) = &(c)->mu; pthread_mutex_lock(_catg)
 
+/* Обёртка над sqlite3_prepare_v2, которая НЕ молчит при отказе.
+ *
+ * Отказ здесь особенно коварен: prepare записывает в *st NULL, а
+ * sqlite3_step(NULL) возвращает SQLITE_MISUSE, а не SQLITE_ROW. Поэтому циклы
+ * вида while (sqlite3_step(st) == SQLITE_ROW) просто не выполняются ни разу, и
+ * функция отдаёт пустой результат с признаком успеха. На практике это выглядит
+ * как «данные пропали» — без единой строки в журнале; первое, что делает
+ * оператор, это переингест, а catalog_register_table делает INSERT OR REPLACE,
+ * то есть затирает метаданные. Так выглядела бы любая неудачная миграция схемы.
+ *
+ * Сигнатура совпадает с sqlite3_prepare_v2 — вызовы отличаются только именем,
+ * поток управления не менялся. Полноценная передача ошибки наружу (каждая
+ * функция каталога со своим кодом возврата) остаётся отдельной работой; здесь
+ * задача в том, чтобы отказ перестал быть невидимым. */
+static int cat_prep(sqlite3 *db, const char *sql, int nbyte,
+                    sqlite3_stmt **st, const char **tail) {
+    int rc = sqlite3_prepare_v2(db, sql, nbyte, st, tail);
+    if (rc != SQLITE_OK)
+        LOG_ERROR("catalog: prepare не удался [%d]: %s — SQL: %s",
+                  rc, sqlite3_errmsg(db), sql ? sql : "(null)");
+    return rc;
+}
+
 static const char *CATALOG_SCHEMA =
     "CREATE TABLE IF NOT EXISTS tables("
     "  name TEXT PRIMARY KEY, schema_json TEXT, created_at INTEGER);"
@@ -588,7 +611,7 @@ Catalog *catalog_open(const char *path) {
      * the platform recovers instead of silently losing the catalog. */
     {
         sqlite3_stmt *qst = NULL; int healthy = 1;
-        if (sqlite3_prepare_v2(c->db, "PRAGMA quick_check", -1, &qst, NULL) == SQLITE_OK) {
+        if (cat_prep(c->db, "PRAGMA quick_check", -1, &qst, NULL) == SQLITE_OK) {
             if (sqlite3_step(qst) == SQLITE_ROW) {
                 const char *r = (const char*)sqlite3_column_text(qst, 0);
                 healthy = (r && strcmp(r, "ok") == 0);
@@ -641,7 +664,7 @@ int catalog_register_table(Catalog *c, const char *name, Schema *schema) {
     Arena *a = arena_create(4096);
     char *sj = schema_to_json(schema, a);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "INSERT OR REPLACE INTO tables(name,schema_json,created_at) VALUES(?,?,?)", -1, &st, NULL);
     sqlite3_bind_text(st,1,name,-1,SQLITE_STATIC);
     sqlite3_bind_text(st,2,sj,-1,SQLITE_TRANSIENT);
@@ -653,7 +676,7 @@ int catalog_register_table(Catalog *c, const char *name, Schema *schema) {
 int catalog_list_tables(Catalog *c, char ***names_out, int *count_out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"SELECT name FROM tables ORDER BY name",-1,&st,NULL);
+    cat_prep(c->db,"SELECT name FROM tables ORDER BY name",-1,&st,NULL);
     int cap=16,n=0;
     char **names = arena_alloc(a, cap*sizeof(char*));
     while (sqlite3_step(st)==SQLITE_ROW) {
@@ -668,7 +691,7 @@ int catalog_list_tables(Catalog *c, char ***names_out, int *count_out, Arena *a)
 int catalog_get_schema(Catalog *c, const char *table, Schema **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"SELECT schema_json FROM tables WHERE name=?",-1,&st,NULL);
+    cat_prep(c->db,"SELECT schema_json FROM tables WHERE name=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
     if (sqlite3_step(st)!=SQLITE_ROW){sqlite3_finalize(st);return -1;}
     const char *sj=(const char*)sqlite3_column_text(st,0);
@@ -695,7 +718,7 @@ int catalog_get_schema(Catalog *c, const char *table, Schema **out, Arena *a) {
 int catalog_drop_table(Catalog *c, const char *name) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"DELETE FROM tables WHERE name=?",-1,&st,NULL);
+    cat_prep(c->db,"DELETE FROM tables WHERE name=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,name,-1,SQLITE_STATIC);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
     return rc==SQLITE_DONE?0:-1;
@@ -704,7 +727,7 @@ int catalog_drop_table(Catalog *c, const char *name) {
 int catalog_update_table_meta(Catalog *c, const char *name, const char *source, int64_t row_count) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "UPDATE tables SET source=?, row_count=? WHERE name=?", -1, &st, NULL);
     sqlite3_bind_text(st, 1, source, -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, row_count);
@@ -720,7 +743,7 @@ int catalog_list_tables_full(Catalog *c, char **json_out, Arena *a) {
     JBuf jb; jb_init(&jb, a, 4096);
     jb_arr_begin(&jb);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT name, COALESCE(source,'ingest'), COALESCE(row_count,0), schema_json"
         " FROM tables ORDER BY name", -1, &st, NULL);
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -763,7 +786,7 @@ int catalog_list_tables_full(Catalog *c, char **json_out, Arena *a) {
 int catalog_save_pipeline(Catalog *c, const char *id, const char *json) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "INSERT OR REPLACE INTO pipelines(id,json,updated_at) VALUES(?,?,?)",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     sqlite3_bind_text(st,2,json,-1,SQLITE_STATIC);
@@ -775,7 +798,7 @@ int catalog_save_pipeline(Catalog *c, const char *id, const char *json) {
 int catalog_load_pipeline(Catalog *c, const char *id, char **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"SELECT json FROM pipelines WHERE id=?",-1,&st,NULL);
+    cat_prep(c->db,"SELECT json FROM pipelines WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     if (sqlite3_step(st)!=SQLITE_ROW){sqlite3_finalize(st);return -1;}
     *out = arena_strdup(a,(const char*)sqlite3_column_text(st,0));
@@ -785,7 +808,7 @@ int catalog_load_pipeline(Catalog *c, const char *id, char **out, Arena *a) {
 int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"SELECT id FROM pipelines ORDER BY updated_at DESC",-1,&st,NULL);
+    cat_prep(c->db,"SELECT id FROM pipelines ORDER BY updated_at DESC",-1,&st,NULL);
     int cap=16,n=0; char **ids=arena_alloc(a,cap*sizeof(char*));
     while(sqlite3_step(st)==SQLITE_ROW){
         if(n==cap){cap*=2;char**nb=arena_alloc(a,cap*sizeof(char*));memcpy(nb,ids,n*sizeof(char*));ids=nb;}
@@ -797,12 +820,12 @@ int catalog_list_pipelines(Catalog *c, char ***ids_out, int *count_out, Arena *a
 int catalog_delete_pipeline(Catalog *c, const char *id) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"DELETE FROM pipelines WHERE id=?",-1,&st,NULL);
+    cat_prep(c->db,"DELETE FROM pipelines WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
     /* Drop the run history together with the pipeline. */
     sqlite3_stmt *rd;
-    if(sqlite3_prepare_v2(c->db,"DELETE FROM pipeline_runs WHERE pipeline_id=?",-1,&rd,NULL)==SQLITE_OK){
+    if(cat_prep(c->db,"DELETE FROM pipeline_runs WHERE pipeline_id=?",-1,&rd,NULL)==SQLITE_OK){
         sqlite3_bind_text(rd,1,id,-1,SQLITE_STATIC);
         sqlite3_step(rd); sqlite3_finalize(rd);
     }
@@ -818,7 +841,7 @@ int catalog_delete_pipeline(Catalog *c, const char *id) {
 int catalog_save_connection(Catalog *c, const char *id, const char *json) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "INSERT OR REPLACE INTO connections(id,json,updated_at) VALUES(?,?,?)",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     sqlite3_bind_text(st,2,json,-1,SQLITE_STATIC);
@@ -830,7 +853,7 @@ int catalog_save_connection(Catalog *c, const char *id, const char *json) {
 int catalog_load_connection(Catalog *c, const char *id, char **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"SELECT json FROM connections WHERE id=?",-1,&st,NULL);
+    cat_prep(c->db,"SELECT json FROM connections WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     if (sqlite3_step(st)!=SQLITE_ROW){sqlite3_finalize(st);return -1;}
     *out = arena_strdup(a,(const char*)sqlite3_column_text(st,0));
@@ -841,7 +864,7 @@ int catalog_load_connection(Catalog *c, const char *id, char **out, Arena *a) {
 int catalog_list_connections(Catalog *c, char **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT json FROM connections ORDER BY updated_at DESC",-1,&st,NULL);
     JBuf jb; jb_init(&jb,a,4096); jb_arr_begin(&jb);
     while(sqlite3_step(st)==SQLITE_ROW){
@@ -855,7 +878,7 @@ int catalog_list_connections(Catalog *c, char **out, Arena *a) {
 int catalog_delete_connection(Catalog *c, const char *id) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"DELETE FROM connections WHERE id=?",-1,&st,NULL);
+    cat_prep(c->db,"DELETE FROM connections WHERE id=?",-1,&st,NULL);
     sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
     return rc==SQLITE_DONE?0:-1;
@@ -864,7 +887,7 @@ int catalog_delete_connection(Catalog *c, const char *id) {
 int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int status, const char *err, int retry_count) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "INSERT INTO pipeline_runs(pipeline_id,started_at,finished_at,status,error_msg,retry_count) VALUES(?,?,?,?,?,?)",
         -1,&st,NULL);
     sqlite3_bind_text(st,1,pid,-1,SQLITE_STATIC);
@@ -879,7 +902,7 @@ int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int statu
 int catalog_list_runs(Catalog *c, const char *pid, char **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT id,started_at,finished_at,status,error_msg,retry_count FROM pipeline_runs "
         "WHERE pipeline_id=? ORDER BY started_at DESC LIMIT 50",-1,&st,NULL);
     sqlite3_bind_text(st,1,pid,-1,SQLITE_STATIC);
@@ -904,7 +927,7 @@ int catalog_save_result(Catalog *c, const char *name, const char *sql_text,
                         int row_count, int64_t *out_id) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "INSERT INTO saved_results(name,sql_text,columns_json,rows_json,row_count,created_at)"
         " VALUES(?,?,?,?,?,?)", -1, &st, NULL);
     sqlite3_bind_text(st,1,name,-1,SQLITE_STATIC);
@@ -923,7 +946,7 @@ int catalog_save_result(Catalog *c, const char *name, const char *sql_text,
 int catalog_list_results(Catalog *c, char **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT id,name,sql_text,columns_json,row_count,created_at FROM saved_results"
         " ORDER BY created_at DESC LIMIT 100", -1, &st, NULL);
     JBuf jb; jb_init(&jb,a,4096); jb_arr_begin(&jb);
@@ -946,7 +969,7 @@ int catalog_list_results(Catalog *c, char **out, Arena *a) {
 int catalog_get_result(Catalog *c, int64_t id, char **out, Arena *a) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT id,name,sql_text,columns_json,rows_json,row_count,created_at"
         " FROM saved_results WHERE id=?", -1, &st, NULL);
     sqlite3_bind_int64(st,1,id);
@@ -968,7 +991,7 @@ int catalog_get_result(Catalog *c, int64_t id, char **out, Arena *a) {
 int catalog_delete_result(Catalog *c, int64_t id) {
     CAT_GUARD(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,"DELETE FROM saved_results WHERE id=?",-1,&st,NULL);
+    cat_prep(c->db,"DELETE FROM saved_results WHERE id=?",-1,&st,NULL);
     sqlite3_bind_int64(st,1,id);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
     return rc==SQLITE_DONE?0:-1;
@@ -993,7 +1016,7 @@ int catalog_register_index(Catalog *c, const char *table,
     CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "INSERT OR REPLACE INTO table_indexes(table_name,col_name,col_idx,created_at)"
         " VALUES(?,?,?,?)", -1, &st, NULL);
     sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
@@ -1009,7 +1032,7 @@ int catalog_list_indexes_json(Catalog *c, const char *table,
     CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT col_name, col_idx, created_at FROM table_indexes"
         " WHERE table_name=? ORDER BY col_idx", -1, &st, NULL);
     sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
@@ -1031,7 +1054,7 @@ int catalog_drop_indexes(Catalog *c, const char *table) {
     CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "DELETE FROM table_indexes WHERE table_name=?", -1, &st, NULL);
     sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
@@ -1044,7 +1067,7 @@ int catalog_has_index(Catalog *c, const char *table, const char *col,
     CAT_GUARD(c);
     catalog_ensure_index_table(c);
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(c->db,
+    cat_prep(c->db,
         "SELECT col_idx FROM table_indexes WHERE table_name=? AND col_name=?",
         -1, &st, NULL);
     sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);

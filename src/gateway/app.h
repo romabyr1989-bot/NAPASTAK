@@ -108,7 +108,7 @@ extern App g_app;
 /* Жизненный цикл сервера: разбор конфига и инициализация подсистем,
  * запуск цикла обслуживания, корректная остановка. */
 void app_init(App *app, const char *config_json);
-void app_run(App *app);
+int  app_run(App *app);   /* 0 — остановлен штатно, -1 — не занят порт */
 void app_stop(App *app);
 /* Рассылка JSON-сообщения всем подключённым WebSocket-клиентам. */
 void app_ws_broadcast(App *app, const char *json_msg);

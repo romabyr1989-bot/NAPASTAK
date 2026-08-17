@@ -768,7 +768,7 @@ static void dispatch_conn(HttpServer *s, int cfd) {
     }
 }
 
-void http_server_run(HttpServer *s) {
+int http_server_run(HttpServer *s) {
     signal(SIGPIPE, SIG_IGN);
     int yes = 1;
 
@@ -783,7 +783,9 @@ void http_server_run(HttpServer *s) {
     struct sockaddr_in addr = {.sin_family=AF_INET,
         .sin_port=htons((uint16_t)main_port), .sin_addr={INADDR_ANY}};
     if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR("bind port %d: %s", main_port, strerror(errno)); return;
+        LOG_ERROR("bind port %d: %s", main_port, strerror(errno));
+        close(lfd);
+        return -1;
     }
     listen(lfd, s->backlog > 0 ? s->backlog : 128);
     s->listenfd = lfd; s->running = 1;
@@ -846,6 +848,7 @@ void http_server_run(HttpServer *s) {
     close(lfd);
     if (s->redirect_fd >= 0) { close(s->redirect_fd); s->redirect_fd = -1; }
     close(evfd);
+    return 0;
 #else
     int epfd = epoll_create1(0); s->epfd = epfd;
     struct epoll_event ev = {.events = EPOLLIN, .data.fd = lfd};

@@ -372,7 +372,18 @@ static void db_schema_check(const char *data_dir) {
         char path[640];
         snprintf(path, sizeof(path), "%s/%s", data_dir, SCHEMA_DBS[i]);
         int v = 0;
-        if (db_user_version(path, &v) != 0) continue;   /* нет файла — чистая установка */
+        /* Различаем «файла нет» и «файл есть, но версию не прочитать». Раньше
+         * оба случая давали continue: битая, недоступная по правам или
+         * заблокированная база молча трактовалась как чистая установка, и
+         * гейтвей стартовал на неизвестной схеме — ровно то, от чего эта
+         * проверка и защищает. */
+        if (access(path, F_OK) != 0) continue;          /* нет файла — чистая установка */
+        if (db_user_version(path, &v) != 0) {
+            LOG_ERROR("%s: файл есть, но версию схемы прочитать не удалось "
+                      "(права, повреждение или блокировка). Запуск отменён, "
+                      "чтобы не работать с неизвестной схемой.", SCHEMA_DBS[i]);
+            exit(78);
+        }
         if (v > NAPASTAK_SCHEMA_VERSION) {
             LOG_ERROR("%s: схема версии %d, эта сборка поддерживает %d. "
                       "База создана более новой версией NAPASTAK — запуск отменён, "
@@ -672,10 +683,11 @@ void app_init(App *app, const char *config_json) {
     }
 }
 
-/* Блокирующий запуск: отдаёт управление циклу HTTP-сервера. */
-void app_run(App *app) {
+/* Блокирующий запуск: отдаёт управление циклу HTTP-сервера.
+ * 0 — сервер отработал и остановлен, -1 — не удалось занять порт. */
+int app_run(App *app) {
     LOG_INFO("NAPASTAK ready — http://localhost:%d", app->port);
-    http_server_run(app->server);
+    return http_server_run(app->server);
 }
 
 /* Корректное завершение: останавливает фоновые потоки/сервисы и закрывает
@@ -761,10 +773,18 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, SIG_IGN); /* graceful reload placeholder */
 
     app_init(&g_app, config_json);
-    app_run(&g_app);  /* blocks until http_server_stop() */
+    int rc = app_run(&g_app);  /* blocks until http_server_stop() */
     if (g_shutdown) {
         LOG_INFO("received signal, shutting down...");
         app_stop(&g_app);
+    }
+    /* Порт занять не удалось — это ОТКАЗ, а не штатный выход. Раньше здесь
+     * безусловно возвращался 0: systemd считал падение нормальным завершением,
+     * юнит тихо становился inactive (dead), а install.sh рапортовал «Готово».
+     * Именно так выглядела установка 2.12 поверх работающей 2.11. */
+    if (rc != 0 && !g_shutdown) {
+        LOG_ERROR("гейтвей не смог занять порт — завершаюсь с ошибкой");
+        return 1;
     }
     return 0;
 }

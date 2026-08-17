@@ -84,5 +84,9 @@ typedef struct HttpServer HttpServer; /* непрозрачный дескрип
 
 /* Создаёт сервер (tls_ctx != NULL — включает HTTPS), запускает/останавливает цикл приёма. */
 HttpServer *http_server_create(Router *r, int port, int backlog, TlsCtx *tls_ctx);
-void        http_server_run(HttpServer *s);   /* blocks */
+/* Блокируется до http_server_stop(). 0 — сервер отработал и остановлен штатно,
+ * -1 — не удалось занять порт (bind/listen). Возврат обязателен: при -1 гейтвей
+ * должен выйти с ненулевым кодом, иначе systemd считает падение штатным
+ * завершением, юнит тихо становится inactive, а install.sh рапортует «Готово». */
+int         http_server_run(HttpServer *s);
 void        http_server_stop(HttpServer *s);

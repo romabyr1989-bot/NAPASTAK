@@ -145,16 +145,43 @@ if [ "$MODE" != "fresh" ] && [ "$SKIP_BACKUP" != "1" ]; then
 fi
 
 # ── Файлы программы ────────────────────────────────────────────────────────
-# bin/lib/ui заменяем ЦЕЛИКОМ, а не cp поверх. cp только добавляет и
-# перезаписывает: коннектор или библиотека, убранные в новой версии, остались бы
-# лежать, а connector_dir сканируется целиком — гейтвей подхватил бы .so от
-# прошлого релиза с чужим ABI. config.json и данные тут не участвуют.
+# bin/lib/ui заменяем ЦЕЛИКОМ, а не cp поверх: cp только добавляет и
+# перезаписывает, поэтому .so коннектора, убранного в новой версии, остался бы
+# лежать и мог быть загружен по имени из сохранённого конвейера — с чужим ABI.
+#
+# Но полная замена сносила бы и то, что оператор положил туда САМ по указанию
+# README: Oracle Instant Client в lib/deps и сторонние коннекторы в lib
+# (plugins_dir = /opt/napastak/lib). После обновления Oracle отваливался молча.
+# Поэтому сначала откладываем всё, чего в новом дистрибутиве НЕТ, а потом
+# возвращаем на место и перечисляем в выводе.
 echo "==> Файлы программы → $PREFIX"
+KEEP=""
+if [ -d "$PREFIX/lib" ]; then
+  KEEP="$(mktemp -d)"
+  kept=0
+  while IFS= read -r f; do
+    [ -e "$SRC/lib/$f" ] && continue          # есть в новой версии — заменится
+    mkdir -p "$KEEP/$(dirname "$f")"
+    cp -a "$PREFIX/lib/$f" "$KEEP/$f"
+    kept=$((kept+1))
+  done <<EOF
+$(cd "$PREFIX/lib" 2>/dev/null && find . -type f -o -type l | sed 's|^\./||')
+EOF
+  [ "$kept" -gt 0 ] && echo "  откладываю $kept файл(ов), которых нет в дистрибутиве"
+fi
+
 rm -rf "$PREFIX/bin" "$PREFIX/lib" "$PREFIX/ui"
 mkdir -p "$PREFIX"/{bin,lib,ui}
 cp -a "$SRC"/bin/.  "$PREFIX"/bin/
 cp -a "$SRC"/lib/.  "$PREFIX"/lib/
 cp -a "$SRC"/ui/.   "$PREFIX"/ui/
+
+if [ -n "$KEEP" ] && [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+  cp -a "$KEEP"/. "$PREFIX"/lib/
+  echo "  сохранено из прежней установки:"
+  (cd "$KEEP" && find . -type f -o -type l) | sed 's|^\./|    lib/|'
+fi
+[ -n "$KEEP" ] && rm -rf "$KEEP"
 printf '%s\n' "$NEW_VERSION" > "$PREFIX/VERSION"
 
 echo "==> Каталоги данных → $STATE"
@@ -230,8 +257,65 @@ systemctl daemon-reload
 systemctl enable "$SVC" >/dev/null 2>&1 || true
 systemctl restart "$SVC"
 
+# ── Проверка, что сервис реально поднялся ──────────────────────────────────
+# Раньше здесь были restart + sleep 1 + status || true, и установщик рапортовал
+# «Готово» с кодом 0, даже когда гейтвей не стартовал: при занятом порте он
+# возвращал 0, systemd считал это штатным выходом и юнит тихо становился
+# inactive (dead). Ровно так выглядела установка поверх недогашенной прежней
+# версии. Теперь ждём фактического active и, если не дождались, показываем
+# журнал и выходим с ошибкой — чтобы автоматика и оператор это заметили.
+echo "==> Проверка запуска"
+# Гейт — ФАКТИЧЕСКИЙ ответ на порту, а не systemctl is-active. Юнит Type=simple,
+# и systemd помечает его active сразу после fork — ещё до того, как процесс
+# упадёт на занятом порте. Проверка по is-active это пропускала: сервис
+# крутился в auto-restart, а установщик рапортовал «Готово» с кодом 0.
+PORT="$(python3 -c "import json;print(json.load(open('$PREFIX/config.json')).get('port',8080))" 2>/dev/null || echo 8080)"
+# Проверяем НАШ процесс, а не «кто-то ответил на порту»: если порт занят чужим
+# сервисом, он и будет отвечать по HTTP, а гейтвей при этом крутится в
+# auto-restart. Признак успеха — живой MainPID юнита, который не перезапускался.
+ready=0
+for _ in $(seq 1 20); do
+  pid="$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)"
+  restarts="$(systemctl show -p NRestarts --value "$SVC" 2>/dev/null || echo 0)"
+  if systemctl is-active --quiet "$SVC" \
+     && [ "${pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null \
+     && [ "${restarts:-0}" -eq 0 ] 2>/dev/null; then
+    # Процесс жив и не перезапускался — даём ему секунду и убеждаемся, что он
+    # не упал сразу после fork (Type=simple помечает active ещё до bind).
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && { ready=1; break; }
+  fi
+  systemctl is-failed --quiet "$SVC" && break
+  sleep 1
+done
+
+# Дополнительно: отвечает ли на порту именно NAPASTAK, а не чужой процесс.
+served_by_us=0
+if [ "$ready" = "1" ] && command -v curl >/dev/null 2>&1; then
+  curl -s -m 5 "http://127.0.0.1:$PORT/" 2>/dev/null | grep -qi "napastak" && served_by_us=1
+fi
+
+if [ "$ready" != "1" ]; then
+  echo "  ! сервис не отвечает на порту $PORT. Последние строки журнала:"
+  journalctl -u "$SVC" --no-pager -n 25 | sed 's/^/    /' || true
+  restarts="$(systemctl show -p NRestarts --value "$SVC" 2>/dev/null || echo '?')"
+  echo "    перезапусков: $restarts"
+  echo ""
+  echo "Файлы установлены, но сервис НЕ работает — установка считается неуспешной."
+  echo "Частая причина: порт $PORT занят другим процессом (проверьте: ss -lntp | grep :$PORT)."
+  if [ "$MODE" = "migrate" ]; then
+    echo "Прежний сервис $OLD_SVC остановлен. Вернуть его: systemctl enable --now $OLD_SVC"
+  fi
+  exit 1
+fi
+if [ "$served_by_us" = "1" ]; then
+  echo "  сервис работает и отвечает на порту $PORT"
+else
+  echo "  ! сервис запущен, но на порту $PORT отвечает не он (или порт закрыт)."
+  echo "    Проверьте: ss -lntp | grep :$PORT"
+fi
+
 echo "==> Готово. Статус:"
-sleep 1
 systemctl --no-pager --full status "$SVC" | head -6 || true
 echo ""
 if [ "$MODE" = "migrate" ]; then
