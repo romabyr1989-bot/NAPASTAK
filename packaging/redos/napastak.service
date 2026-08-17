@@ -15,6 +15,10 @@ Environment=LD_LIBRARY_PATH=/opt/napastak/lib/deps
 ExecStart=/opt/napastak/bin/napastak_gateway -c /opt/napastak/config.json
 Restart=on-failure
 RestartSec=3
+# 78 (EX_CONFIG) — гейтвей отказался стартовать по причине, которая сама не
+# исправится: база от более новой версии NAPASTAK. Перезапуск по кругу такую
+# ошибку не лечит, а только забивает журнал, скрывая первую внятную строку.
+RestartPreventExitStatus=78
 LimitNOFILE=65536
 
 # Защита (данные пишутся только в /var/lib/napastak)

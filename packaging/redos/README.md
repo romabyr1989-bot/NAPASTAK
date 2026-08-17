@@ -67,8 +67,13 @@ systemd-юнит и install.sh используют `LD_LIBRARY_PATH=/opt/napast
   иначе ставит через dnf (`sqlite-libs libcurl openssl-libs zlib`, при PG — `libpq`).
 - Создаёт системного пользователя `napastak`.
 - Кладёт программу в `/opt/napastak` (bin/, lib/, ui/), данные — в `/var/lib/napastak` (data/, pipelines/).
-- Генерирует `config.json` со случайными `jwt_secret` и admin-паролем (печатает пароль).
+- Генерирует `config.json` со случайными `jwt_secret` и admin-паролем (печатает
+  пароль) — **только при первой установке**; существующий конфиг не трогает.
+- Записывает установленную версию в `/opt/napastak/VERSION`.
 - Ставит и запускает systemd-сервис `napastak`.
+
+Если на сервере уже что-то стоит, установщик работает как обновление или как
+перенос со прежней `dataflow-os` — см. «Обновление и перенос прежних установок».
 
 ```bash
 systemctl status napastak
@@ -85,48 +90,82 @@ journalctl -u napastak -f
 /etc/systemd/system/napastak.service
 ```
 
-## Обновление с прежних сборок (dataflow-os)
+## Обновление и перенос прежних установок
 
-Проект переименован в NAPASTAK: сменились имя юнита, пути и системный
-пользователь. `install.sh` ставит рядом, поэтому старую установку нужно
-погасить и перенести данные вручную — иначе на сервере останутся два сервиса,
-а новый стартует с пустой базой.
+`install.sh` сам определяет, что делать, и всё нужное выполняет без ручных шагов.
 
-| было | стало |
-|------|-------|
-| `/opt/dataflow-os` | `/opt/napastak` |
-| `/var/lib/dataflow-os` | `/var/lib/napastak` |
-| `dataflow-os.service` | `napastak.service` |
-| пользователь `dataflow` | пользователь `napastak` |
-| `bin/dfo_gateway` | `bin/napastak_gateway` |
+| что найдено на сервере | режим | что происходит |
+|---|---|---|
+| ничего | чистая установка | генерируются `jwt_secret` и admin-пароль (печатается) |
+| `/opt/napastak` | обновление | данные, конвейеры, `config.json` и секреты сохраняются |
+| `/opt/dataflow-os` | перенос | прежний сервис гасится и выключается, данные, конвейеры и секреты переносятся |
 
 ```bash
-# 1. погасить старый сервис
-sudo systemctl disable --now dataflow-os.service
-
-# 2. поставить новый (создаст пользователя, каталоги, config.json)
-sudo ./install.sh
-
-# 3. перенести данные и конвейеры, вернуть права
-sudo systemctl stop napastak.service
-sudo cp -a /var/lib/dataflow-os/data/.      /var/lib/napastak/data/
-sudo cp -a /var/lib/dataflow-os/pipelines/. /var/lib/napastak/pipelines/
-sudo chown -R napastak:napastak /var/lib/napastak
-
-# 4. перенести секреты (jwt_secret и admin_password), иначе выданные токены
-#    и пароль администратора сменятся
-sudo cp /opt/dataflow-os/config.json /opt/napastak/config.json
-sudo chown napastak:napastak /opt/napastak/config.json && sudo chmod 640 /opt/napastak/config.json
-
-sudo systemctl start napastak.service
+scp napastak-<ver>-linux-x86_64.tar.gz user@server:/tmp/
+ssh user@server 'cd /tmp && tar xzf napastak-*.tar.gz && cd napastak-* && sudo ./install.sh'
 ```
 
-Старый `config.json` содержит пути `/opt/dataflow-os` и `/var/lib/dataflow-os` —
-после копирования поправьте в нём `data_dir`, `plugins_dir` и `connector_dir`
-на `/var/lib/napastak/data` и `/opt/napastak/lib`.
+### Что переживает обновление
 
-Убедившись, что новый сервис работает, удалите старое:
-`sudo rm -rf /opt/dataflow-os /var/lib/dataflow-os && sudo userdel dataflow`.
+Данные таблиц (`wal.bin`, `idx_*.btree`, `schema.json`), базы `catalog.db`,
+`rbac.db`, `audit.db`, инкрементальные курсоры `data/.cursors/*.cur`, конвейеры в
+`/var/lib/napastak/pipelines`, `config.json` целиком (вместе с `jwt_secret` —
+выданные токены остаются действительными — и admin-паролем), а также
+переопределения юнита в `napastak.service.d/`, сделанные через `systemctl edit`.
+
+Начальные конвейеры из дистрибутива кладутся только в ПУСТОЙ каталог: обновление
+не перезатирает правки оператора и не возвращает удалённые им конвейеры.
+
+Имена consumer-групп Kafka (`dfo-*`) при переименовании проекта намеренно не
+менялись — офсеты на брокере остаются за прежними группами, и после обновления
+конвейеры продолжают читать с того места, где остановились.
+
+### Резервная копия и откат
+
+Перед обновлением install.sh складывает программу и базы в
+`/var/backups/napastak/<дата>-<версия>/` (хранятся последние 5; отключается
+`SKIP_BACKUP=1`). Копия снимается ПОСЛЕ остановки сервиса — у остановленного
+процесса SQLite уже свёл `-wal`, поэтому копия целостна.
+
+```bash
+sudo systemctl stop napastak
+sudo rm -rf /opt/napastak/{bin,lib,ui}
+sudo cp -a /var/backups/napastak/<дата>-<версия>/opt-napastak/{bin,lib,ui,VERSION} /opt/napastak/
+sudo cp -a /var/backups/napastak/<дата>-<версия>/data/. /var/lib/napastak/data/   # только если схема менялась
+sudo chown -R napastak:napastak /opt/napastak /var/lib/napastak
+sudo systemctl start napastak
+```
+
+### Версия и схема баз
+
+Версия установленного лежит в `/opt/napastak/VERSION`. Установщик по ней
+отличает обновление от понижения: понижение прерывается с кодом 1 и не трогает
+сервис, потому что новая версия могла поднять схему. Осознанное понижение —
+`sudo FORCE=1 ./install.sh`.
+
+Версия схемы хранится в `PRAGMA user_version` каждой базы. Гейтвей отказывается
+стартовать на базе, созданной более новой версией (выход с кодом 78, юнит помечен
+`RestartPreventExitStatus=78`, поэтому перезапуска по кругу нет) — это защита от
+подмены бинаря руками в обход установщика.
+
+### Перенос: что остаётся после него
+
+Старое дерево НЕ удаляется — это точка отката:
+
+```
+/opt/dataflow-os, /var/lib/dataflow-os, dataflow-os.service (disabled)
+```
+
+Убедившись, что новый сервис работает, удалите:
+
+```bash
+sudo rm -rf /opt/dataflow-os /var/lib/dataflow-os /etc/systemd/system/dataflow-os.service
+sudo userdel dataflow
+```
+
+Вход после переноса — прежним admin-паролем: он переносится вместе с конфигом.
+Пути `data_dir`, `plugins_dir`, `connector_dir` в перенесённом `config.json`
+переписываются на новые автоматически.
 
 Имена переменных окружения (`DFO_TOKEN`, `DFO_REST_URL`, `DFO_PGWIRE_DSN`,
 `DFO_ADMIN_PASSWORD`) и ABI коннекторов не менялись — существующие скрипты и

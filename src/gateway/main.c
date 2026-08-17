@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <signal.h>
+#include <sqlite3.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -319,6 +320,88 @@ static void conn_ticker_stop(void) {
         LOG_WARN("поток обслуживания подключений не завершился за 6 с — не ждём дальше");
 }
 
+/* ── Версия схемы баз ───────────────────────────────────────────────────────
+ * Схемы создаются через CREATE TABLE IF NOT EXISTS, поэтому НОВЫЕ таблицы
+ * появляются сами, а вот изменение существующей (добавленная колонка) так не
+ * применится: код увидит старую таблицу. Чтобы будущие релизы могли обновлять
+ * схему, а не ломаться на ней, версия пишется в PRAGMA user_version.
+ *
+ * Версия одна на весь продукт, а не на подсистему: user_version хранится в
+ * ФАЙЛЕ, а catalog.db открывают сразу трое — catalog, auth и matview, каждый со
+ * своим набором таблиц. Поднимать её нужно при любом изменении схемы любого из
+ * них.
+ *
+ * Файлов три: catalog.db, rbac.db, audit.db (matview и auth живут в catalog.db).
+ */
+#define NAPASTAK_SCHEMA_VERSION 1
+static const char *SCHEMA_DBS[] = { "catalog.db", "rbac.db", "audit.db", NULL };
+
+static int db_user_version(const char *path, int *out) {
+    sqlite3 *db = NULL;
+    /* Только чтение и без создания: несуществующий файл — это чистая установка,
+     * её проверять не надо, схему создадут подсистемы. */
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &st, NULL) == SQLITE_OK
+        && sqlite3_step(st) == SQLITE_ROW) {
+        *out = sqlite3_column_int(st, 0);
+        rc = 0;
+    }
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+    return rc;
+}
+
+/* Отказывается запускаться на базе от более новой версии. Это защита ПОСЛЕ
+ * откола: install.sh не даёт понизить версию, но бинарь могли подменить руками,
+ * и тогда старый код молча работал бы с незнакомой схемой. */
+static void db_schema_check(const char *data_dir) {
+    for (int i = 0; SCHEMA_DBS[i]; i++) {
+        char path[640];
+        snprintf(path, sizeof(path), "%s/%s", data_dir, SCHEMA_DBS[i]);
+        int v = 0;
+        if (db_user_version(path, &v) != 0) continue;   /* нет файла — чистая установка */
+        if (v > NAPASTAK_SCHEMA_VERSION) {
+            LOG_ERROR("%s: схема версии %d, эта сборка поддерживает %d. "
+                      "База создана более новой версией NAPASTAK — запуск отменён, "
+                      "чтобы не повредить данные. Поставьте версию не ниже той, "
+                      "которой создана база, либо восстановите базу из копии "
+                      "(/var/backups/napastak).",
+                      SCHEMA_DBS[i], v, NAPASTAK_SCHEMA_VERSION);
+            /* 78 = EX_CONFIG. Юнит помечен RestartPreventExitStatus=78: сама
+             * собой такая ошибка не исправится, и перезапуск по кругу лишь
+             * забивает журнал, скрывая первую внятную строку. */
+            exit(78);
+        }
+    }
+}
+
+/* Проставляет версию там, где её ещё нет. Вызывается ПОСЛЕ подсистем: на чистой
+ * установке файлы создаются ими, до этого их просто нет. Ноль означает либо
+ * свежую базу, либо базу от релиза до появления версионирования — её схема и
+ * есть версия 1, поэтому в обоих случаях достаточно штампа.
+ * Место для будущих миграций: v < NAPASTAK_SCHEMA_VERSION. */
+static void db_schema_stamp(const char *data_dir) {
+    for (int i = 0; SCHEMA_DBS[i]; i++) {
+        char path[640];
+        snprintf(path, sizeof(path), "%s/%s", data_dir, SCHEMA_DBS[i]);
+        int v = 0;
+        if (db_user_version(path, &v) != 0) continue;
+        if (v == NAPASTAK_SCHEMA_VERSION) continue;
+        sqlite3 *db = NULL;
+        if (sqlite3_open(path, &db) != SQLITE_OK) { if (db) sqlite3_close(db); continue; }
+        char sql[64];
+        snprintf(sql, sizeof(sql), "PRAGMA user_version=%d;", NAPASTAK_SCHEMA_VERSION);
+        if (sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK)
+            LOG_INFO("%s: версия схемы %d → %d", SCHEMA_DBS[i], v, NAPASTAK_SCHEMA_VERSION);
+        sqlite3_close(db);
+    }
+}
+
 /* Инициализация приложения: дефолты, разбор JSON-конфига, создание всех
  * подсистем (catalog/auth/scheduler/matviews/RBAC/audit/cluster), загрузка
  * таблиц и пайплайнов из каталога, запуск HTTP-сервера,
@@ -418,6 +501,10 @@ void app_init(App *app, const char *config_json) {
     log_init(&g_log, stderr, LOG_INFO, json_mode);
     LOG_INFO("NAPASTAK starting — data_dir=%s port=%d", app->data_dir, app->port);
 
+    /* Версия схемы — ДО открытия подсистем: если база от более новой версии,
+     * выходим внятно, а не падаем позже на незнакомой колонке. */
+    db_schema_check(app->data_dir);
+
     /* subsystems */
     app->catalog  = catalog_open(app->db_path);
     app->auth_store = auth_store_create(app->db_path);
@@ -467,6 +554,10 @@ void app_init(App *app, const char *config_json) {
 
     /* materialized views */
     app->matviews = mvs_create(app->catalog, app->data_dir);
+
+    /* Все схемы применены (catalog/auth/matview/rbac/audit) — фиксируем версию.
+     * Именно здесь, а не раньше: на чистой установке файлов до этого нет. */
+    db_schema_stamp(app->data_dir);
 
     /* cluster / replication */
     if (app->cluster_mode) {
