@@ -17,7 +17,7 @@ steps:
       FROM consents_agreements a
       LEFT JOIN cdi_physical_party c ON c.owner_id = a.owner_id
       WHERE a.deleted_ts IS NULL OR a.deleted_ts = ''
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/agr2party/connector.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/agr2party/connector.py"
     python_context_dir: "/tmp/dfo_agr2party_test"
     python_timeout_sec: 600
     target_table: "agreements_agreement2party"

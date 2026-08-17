@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load a JSON file (array of objects, or a single object) into a DataFlow OS table.
+Load a JSON file (array of objects, or a single object) into a NAPASTAK table.
 Replicates applications/json2table.py.
 
 Usage:

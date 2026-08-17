@@ -13,4 +13,4 @@ export DATA_DIR PLUGINS_DIR PORT JWT_SECRET ADMIN_PASSWORD TLS_CERT TLS_KEY
 
 envsubst < /app/config.template.json > /tmp/config.json
 
-exec /app/dfo_gateway -c /tmp/config.json
+exec /app/napastak_gateway -c /tmp/config.json

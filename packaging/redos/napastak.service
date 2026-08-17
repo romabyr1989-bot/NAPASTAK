@@ -1,28 +1,28 @@
 [Unit]
 Description=NAPASTAK gateway (MDM/CDI)
-Documentation=https://github.com/romabyr1989-bot/DataFlow-OS
+Documentation=https://github.com/romabyr1989-bot/NAPASTAK
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=dataflow
-Group=dataflow
+User=napastak
+Group=napastak
 # UI и плагины ищутся относительно рабочего каталога (ui/index.html, lib/*.so)
-WorkingDirectory=/opt/dataflow-os
+WorkingDirectory=/opt/napastak
 # Автономность: рантайм-библиотеки берутся из вложенной папки lib/deps (офлайн)
-Environment=LD_LIBRARY_PATH=/opt/dataflow-os/lib/deps
-ExecStart=/opt/dataflow-os/bin/dfo_gateway -c /opt/dataflow-os/config.json
+Environment=LD_LIBRARY_PATH=/opt/napastak/lib/deps
+ExecStart=/opt/napastak/bin/napastak_gateway -c /opt/napastak/config.json
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
 
-# Защита (данные пишутся только в /var/lib/dataflow-os)
+# Защита (данные пишутся только в /var/lib/napastak)
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/dataflow-os
+ReadWritePaths=/var/lib/napastak
 
 [Install]
 WantedBy=multi-user.target

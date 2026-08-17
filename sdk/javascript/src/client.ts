@@ -1,15 +1,15 @@
-import type { DataFlowConfig, IngestResult, QueryResult, TableInfo } from './types';
+import type { NapastakConfig, IngestResult, QueryResult, TableInfo } from './types';
 
 // ---------------------------------------------------------------------------
 // Error class
 // ---------------------------------------------------------------------------
 
-export class DataFlowError extends Error {
+export class NapastakError extends Error {
   public readonly status: number;
 
   constructor(status: number, message: string) {
     super(message);
-    this.name = 'DataFlowError';
+    this.name = 'NapastakError';
     this.status = status;
     // Restore prototype chain (needed when targeting ES5)
     Object.setPrototypeOf(this, new.target.prototype);
@@ -32,16 +32,16 @@ function buildQueryResult(data: any, durationMs: number): QueryResult {
 }
 
 // ---------------------------------------------------------------------------
-// DataFlowClient
+// NapastakClient
 // ---------------------------------------------------------------------------
 
-export class DataFlowClient {
+export class NapastakClient {
   private readonly baseUrl: string;
   private readonly timeout: number;
   private token: string | undefined;
   private txnId: string | undefined;
 
-  constructor(config: DataFlowConfig) {
+  constructor(config: NapastakConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
     this.timeout = config.timeout ?? 30_000;
     this.token = config.apiKey ?? config.token;
@@ -60,7 +60,7 @@ export class DataFlowClient {
     const data = await resp.json();
     const t = data.token ?? data.access_token ?? data.jwt;
     if (!t) {
-      throw new DataFlowError(200, 'No token returned by server');
+      throw new NapastakError(200, 'No token returned by server');
     }
     this.token = t as string;
   }
@@ -158,7 +158,7 @@ export class DataFlowClient {
    * Execute *fn* inside a server-side transaction.
    * Commits on success, rolls back on any thrown error.
    */
-  async withTransaction<T>(fn: (client: DataFlowClient) => Promise<T>): Promise<T> {
+  async withTransaction<T>(fn: (client: NapastakClient) => Promise<T>): Promise<T> {
     await this.begin();
     try {
       const result = await fn(this);
@@ -205,7 +205,7 @@ export class DataFlowClient {
       } catch {
         // ignore JSON parse failures
       }
-      throw new DataFlowError(resp.status, message);
+      throw new NapastakError(resp.status, message);
     }
 
     return resp;

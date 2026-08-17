@@ -14,7 +14,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW="$ROOT/build/release/bin/dfo_gateway"
+GW="$ROOT/build/release/bin/napastak_gateway"
 PORT=19270
 DATA="$(mktemp -d -t dfo_trig_XXXX)"
 SECRET="trigger-test-$$"

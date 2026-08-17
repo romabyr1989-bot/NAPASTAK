@@ -7,7 +7,7 @@ if TYPE_CHECKING:
 
 
 class Pipeline:
-    """Proxy object for a DataFlow OS pipeline."""
+    """Proxy object for a NAPASTAK pipeline."""
 
     def __init__(self, client: "Client", pipeline_id: Any) -> None:
         self._client = client

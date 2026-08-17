@@ -6,7 +6,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW_BIN="$ROOT/build/release/bin/dfo_gateway"
+GW_BIN="$ROOT/build/release/bin/napastak_gateway"
 PORT=19364
 DATA="$(mktemp -d -t dfo_agr_XXXX)"
 SECRET="agr2party-secret-$$"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parse Greenplum CSV logs (csvlog destination) and load them into DataFlow OS.
+Parse Greenplum CSV logs (csvlog destination) and load them into NAPASTAK.
 Replicates tsmdm_gpdb_logparser/gpdb_logparser.py.
 
 Usage:

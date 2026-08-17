@@ -1,6 +1,6 @@
 # Apache Arrow Flight bridge
 
-`dfo_flight_server` is a small C++ binary that exposes NAPASTAK over the
+`napastak_flight_server` is a small C++ binary that exposes NAPASTAK over the
 [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)
 gRPC protocol. Arrow Flight clients (PyArrow, pandas, polars, Spark,
 DuckDB, BigQuery, Snowflake, R Arrow) can then read NAPASTAK tables
@@ -12,7 +12,7 @@ gateway over plain HTTP and inherits its RBAC.
 
 ```
 ┌───────────────┐  Flight (gRPC)   ┌─────────────────────┐  HTTP   ┌──────────────┐
-│ pyarrow /     │ ───────────────▶ │  dfo_flight_server  │ ──────▶ │ dfo_gateway  │
+│ pyarrow /     │ ───────────────▶ │  napastak_flight_server  │ ──────▶ │ napastak_gateway  │
 │ pandas / dbt  │ ◀─── Arrow IPC ── │  (port 8815)        │ ◀────── │ (port 8080)  │
 └───────────────┘                  └─────────────────────┘          └──────────────┘
 ```
@@ -60,7 +60,7 @@ If you're on macOS 13 Intel:
 ```sh
 make BUILD=release           # base project (no Arrow needed)
 make flight                  # builds src/flight_server via cmake
-DYLD_LIBRARY_PATH=$HOME/miniconda3/lib ./build/release/bin/dfo_flight_server \
+DYLD_LIBRARY_PATH=$HOME/miniconda3/lib ./build/release/bin/napastak_flight_server \
     --gateway http://localhost:8080 \
     --api-key "$JWT_TOKEN" \
     --port 8815

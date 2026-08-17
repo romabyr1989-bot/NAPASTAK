@@ -1,8 +1,8 @@
 services:
-  dfo:
+  napastak:
     build: .
-    image: dataflow-os:latest
-    container_name: dataflow-os
+    image: napastak:latest
+    container_name: napastak
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -16,7 +16,7 @@ services:
       TLS_CERT:       /app/certs/cert.pem
       TLS_KEY:        /app/certs/key.pem
     volumes:
-      - dfo_data:/data
+      - napastak_data:/data
       - ./certs:/app/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsk https://localhost:8443/ || exit 1"]
@@ -25,10 +25,10 @@ services:
       start_period: 20s
       retries: 3
 
-  # TSMDM Proxy — SOAP/REST/CDI protocol translation in front of DFO.
-  # Talks to the `dfo` service over the compose network (http://dfo:8080,
-  # PgWire dfo:5432). The REST port is published on host 18443 because the dfo
-  # service already owns host 8443.
+  # TSMDM Proxy — SOAP/REST/CDI protocol translation in front of NAPASTAK.
+  # Talks to the `napastak` service over the compose network
+  # (http://napastak:8080, PgWire napastak:5432). The REST port is published on
+  # host 18443 because the napastak service already owns host 8443.
   tsmdm-proxy:
     build: services/tsmdm_proxy
     container_name: tsmdm-proxy
@@ -38,11 +38,11 @@ services:
       - "18443:8443"    # REST  (Flask)
       - "8444:8444"     # CDI   (FastAPI)
     environment:
-      DFO_REST_URL:   "http://dfo:8080"
-      DFO_PGWIRE_DSN: "host=dfo port=5432 user=admin password=admin dbname=dataflow"
+      DFO_REST_URL:   "http://napastak:8080"
+      DFO_PGWIRE_DSN: "host=napastak port=5432 user=admin password=admin dbname=napastak"
       DFO_TOKEN:      "${DFO_TOKEN:-}"
     depends_on:
-      - dfo
+      - napastak
 
 volumes:
-  dfo_data:
+  napastak_data:

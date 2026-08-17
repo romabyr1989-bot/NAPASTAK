@@ -1,5 +1,5 @@
 {
-  "name": "dataflow-os",
+  "name": "napastak",
   "version": "0.1.0",
   "description": "JavaScript/TypeScript client for NAPASTAK",
   "main": "dist/index.js",

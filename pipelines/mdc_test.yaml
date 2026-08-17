@@ -15,7 +15,7 @@ steps:
              src_inn, birth_date
       FROM cdi_physical_party
       WHERE source_id IS NOT NULL AND source_id != ''
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/clean_person.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/mdc/clean_person.py"
     python_context_dir: "/tmp/dfo_mdc_test"
     python_timeout_sec: 600
     target_table: "mdc_person_clean"
@@ -24,7 +24,7 @@ steps:
     transform_sql: |
       SELECT source_id, person_source_id, category, src_number
       FROM cdi_id_doc WHERE source_id IS NOT NULL AND source_id != ''
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/clean_id_doc.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/mdc/clean_id_doc.py"
     python_context_dir: "/tmp/dfo_mdc_test"
     python_timeout_sec: 300
     target_table: "mdc_id_doc_clean"
@@ -37,7 +37,7 @@ steps:
              p.cio_inn, p.birth_date, d.cio_number
       FROM mdc_person_clean p
       LEFT JOIN mdc_id_doc_clean d ON d.person_source_id = p.source_id
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/aggregate_docs.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/mdc/aggregate_docs.py"
     python_context_dir: "/tmp/dfo_mdc_test"
     python_timeout_sec: 300
     target_table: "mdc_person_with_docs"
@@ -45,7 +45,7 @@ steps:
 
   - id: generate_match_keys
     transform_sql: "SELECT * FROM mdc_person_with_docs"
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/generate_keys.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/mdc/generate_keys.py"
     python_context_dir: "/tmp/dfo_mdc_test"
     python_timeout_sec: 300
     target_table: "mdc_match_keys"
@@ -73,7 +73,7 @@ steps:
 
   - id: accept_matches
     transform_sql: "SELECT * FROM mdc_person_matches"
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/mdc/accept_matches.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/mdc/accept_matches.py"
     python_context_dir: "/tmp/dfo_mdc_test"
     python_timeout_sec: 300
     target_table: "mdc_master_map"

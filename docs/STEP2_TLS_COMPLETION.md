@@ -127,7 +127,7 @@ curl -k https://localhost:8080/api/tables \
 openssl s_client -connect localhost:8080
 ```
 **Result:** 
-- Subject: `CN=localhost, O=DataFlow, C=RU` ✅
+- Subject: `CN=localhost, O=NAPASTAK, C=RU` ✅
 - Self-signed, valid 365 days ✅
 - Includes SANs: `localhost`, `127.0.0.1` ✅
 
@@ -168,7 +168,7 @@ bash scripts/gen_cert.sh
 
 ### Server Startup
 ```bash
-./build/debug/bin/dfo_gateway -c config.json
+./build/debug/bin/napastak_gateway -c config.json
 # Loads TLS config from config.json
 # Logs "HTTPS server listening on :8080 (with TLS)"
 # All API endpoints now require valid JWT + use encryption
@@ -229,7 +229,7 @@ Server automatically detects and runs HTTP-only mode if TLS paths are empty.
 ### Quick Test
 ```bash
 bash scripts/gen_cert.sh
-./build/debug/bin/dfo_gateway -c config.json &
+./build/debug/bin/napastak_gateway -c config.json &
 sleep 1
 bash /tmp/tls_test.sh  # Runs 6 acceptance tests
 ```

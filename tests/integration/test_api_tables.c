@@ -7,7 +7,7 @@
 #include "framework.h"
 #include <stdio.h>
 
-#define BINARY_DEFAULT "build/debug/bin/dfo_gateway"
+#define BINARY_DEFAULT "build/debug/bin/napastak_gateway"
 #define PORT_DEFAULT   19080
 
 int main(int argc, char **argv) {

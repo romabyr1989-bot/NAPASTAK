@@ -2,7 +2,7 @@
 
 ## Process model
 
-Single `dfo_gateway` binary. Subsystems: epoll HTTP server, scheduler thread,
+Single `napastak_gateway` binary. Subsystems: epoll HTTP server, scheduler thread,
 worker thread pool (N=4), WebSocket broadcast. All thread-safe.
 
 ## Memory model
@@ -25,7 +25,7 @@ data/
 Browser (index.html / style.css / app.js)
    │  HTTP REST + WebSocket
    ▼
-dfo_gateway
+napastak_gateway
    ├── epoll HTTP/1.1 server + WS upgrade
    ├── Router (pattern matching with :params)
    ├── REST API (12 endpoints)

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Smoke test for dfo_mcp_server.
+# Smoke test for napastak_mcp_server.
 # Spawns gateway on a fresh data dir, gets a JWT, then drives the MCP server
 # over stdio: initialize → tools/list → tools/call (query, list_tables, metrics).
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW_BIN="$ROOT/build/release/bin/dfo_gateway"
-MCP_BIN="$ROOT/build/release/bin/dfo_mcp_server"
+GW_BIN="$ROOT/build/release/bin/napastak_gateway"
+MCP_BIN="$ROOT/build/release/bin/napastak_mcp_server"
 PORT=19250
 DATA="$(mktemp -d -t dfo_mcp_test_XXXX)"
 SECRET="mcp-test-secret-$$"
@@ -57,7 +57,7 @@ RESP=$(run_mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protoco
 check "initialize returns protocolVersion" \
   '[[ "$RESP" == *"protocolVersion"*"2024-11-05"* ]]'
 check "initialize returns serverInfo" \
-  '[[ "$RESP" == *"dataflow-os"* ]]'
+  '[[ "$RESP" == *"napastak"* ]]'
 
 # 3. tools/list returns all 10 tools
 RESP=$(run_mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')

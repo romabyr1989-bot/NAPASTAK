@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 
 class Table:
-    """Proxy object for a DataFlow OS table."""
+    """Proxy object for a NAPASTAK table."""
 
     def __init__(self, client: "Client", name: str) -> None:
         self._client = client

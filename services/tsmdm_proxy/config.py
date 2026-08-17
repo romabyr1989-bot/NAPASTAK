@@ -2,7 +2,7 @@
 import os
 
 DFO_REST_URL   = os.getenv("DFO_REST_URL",   "http://localhost:8080")
-DFO_PGWIRE_DSN = os.getenv("DFO_PGWIRE_DSN", "host=localhost port=5432 user=admin password=admin dbname=dataflow")
+DFO_PGWIRE_DSN = os.getenv("DFO_PGWIRE_DSN", "host=localhost port=5432 user=admin password=admin dbname=napastak")
 DFO_TOKEN      = os.getenv("DFO_TOKEN",       "")   # JWT or API key for the REST API
 
 SOAP_PORT      = int(os.getenv("SOAP_PORT",  "3000"))

@@ -1,4 +1,4 @@
-# DataFlow-OS
+# NAPASTAK
 
 A lightweight data platform for secure local deployment and containerized development.
 

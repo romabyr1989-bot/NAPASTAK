@@ -6,4 +6,4 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 [ -d lib/deps ] && export LD_LIBRARY_PATH="$HERE/lib/deps${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec ./bin/dfo_gateway -c "${1:-config.json}"
+exec ./bin/napastak_gateway -c "${1:-config.json}"

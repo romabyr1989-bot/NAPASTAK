@@ -22,7 +22,7 @@ steps:
 
   - id: transform_joker
     transform_sql: "SELECT value FROM cdi_joker_incoming_buf"
-    python_file: "/Users/romanbirukov/Documents/develop/DataFlow-OS/tools/cdi/joker_transform.py"
+    python_file: "/Users/romanbirukov/Documents/DEVELOP/NAPASTAK/tools/cdi/joker_transform.py"
     python_context_dir: "/tmp/dfo_joker_test"
     python_timeout_sec: 300
     target_table: "cdi_physical_party_j1"

@@ -20,7 +20,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW="$ROOT/build/release/bin/dfo_gateway"
+GW="$ROOT/build/release/bin/napastak_gateway"
 SO="$ROOT/build/release/lib/oracle_connector.so"
 SRC="$ROOT/lib/connector/plugins/oracle/oracle_connector.c"
 PORT=19297

@@ -5,7 +5,7 @@ Python client for the [NAPASTAK](https://github.com/your-org/dfo) data platform.
 ## Installation
 
 ```bash
-pip install dataflow-os
+pip install napastak
 # or from source
 pip install -e ".[dev]"
 ```
@@ -13,7 +13,7 @@ pip install -e ".[dev]"
 ## Quick start
 
 ```python
-from dataflow_os import Client
+from napastak import Client
 
 # Authenticate with API key
 client = Client("https://localhost:8080", api_key="dfo_...")
@@ -104,7 +104,7 @@ print(client.health())
 ## Error handling
 
 ```python
-from dataflow_os import AuthError, PermissionError, TableNotFoundError, DataFlowError
+from napastak import AuthError, PermissionError, TableNotFoundError, NapastakError
 
 try:
     df = client.query("SELECT * FROM restricted")
@@ -114,7 +114,7 @@ except PermissionError:
     print("Access denied")
 except TableNotFoundError:
     print("Table does not exist")
-except DataFlowError as e:
+except NapastakError as e:
     print(f"Server error: {e}")
 ```
 
@@ -122,5 +122,5 @@ except DataFlowError as e:
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v --cov=dataflow_os
+pytest tests/ -v --cov=napastak
 ```

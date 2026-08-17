@@ -1,4 +1,4 @@
-export interface DataFlowConfig {
+export interface NapastakConfig {
   baseUrl: string;
   apiKey?: string;
   token?: string;

@@ -1,11 +1,11 @@
-/* main.cc — dfo_flight_server entry point.
+/* main.cc — napastak_flight_server entry point.
  *
  * Bootstraps the gRPC server on a TCP port and serves Flight requests via
  * DfoFlightService. All logs go to stderr — Flight clients communicate over
  * the gRPC port; nothing else should write to stdout.
  *
  * Run:
- *   dfo_flight_server --gateway http://localhost:8080 \
+ *   napastak_flight_server --gateway http://localhost:8080 \
  *                     --port 8815 --api-key dfo_xxx
  */
 #include <arrow/flight/server.h>
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
 
-    std::cerr << "[flight] dfo_flight_server listening on grpc://"
+    std::cerr << "[flight] napastak_flight_server listening on grpc://"
               << cfg.host << ":" << cfg.port
               << "  (gateway=" << cfg.gateway << ")\n";
 

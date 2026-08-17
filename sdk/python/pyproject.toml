@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dataflow-os"
+name = "napastak"
 version = "0.1.0"
-description = "Python client for DataFlow OS"
+description = "Python client for NAPASTAK"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
@@ -15,7 +15,7 @@ dependencies = ["requests>=2.28", "pandas>=1.5"]
 dev = ["pytest>=7.0", "pytest-cov", "responses>=0.23"]
 
 [project.scripts]
-dfo-import-airflow = "dataflow_os.airflow_import:main"
+napastak-import-airflow = "napastak.airflow_import:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["dataflow_os"]
+packages = ["napastak"]

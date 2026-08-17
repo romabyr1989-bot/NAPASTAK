@@ -51,7 +51,7 @@ static void _srv_cleanup(void) {
 
 /*
  * Start the gateway binary in a subprocess.
- * binary  — path to dfo_gateway executable
+ * binary  — path to napastak_gateway executable
  * port    — TCP port to listen on
  * Returns 0 on success, -1 on failure.
  */

@@ -1,13 +1,13 @@
 # NAPASTAK — MCP Server
 
-NAPASTAK ships with `dfo_mcp_server`, a [Model Context Protocol](https://modelcontextprotocol.io)
+NAPASTAK ships with `napastak_mcp_server`, a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the platform's tables, queries, and pipelines to AI agents
 (Claude Desktop, Cursor, Continue, Cline, LangChain, …).
 
 ## What it does
 
 The MCP server is a small stdio binary that translates JSON-RPC tool calls
-into HTTP requests against a running `dfo_gateway`. The agent gets ten
+into HTTP requests against a running `napastak_gateway`. The agent gets ten
 high-level tools instead of raw HTTP endpoints, all rate-limited by the
 gateway's RBAC.
 
@@ -22,7 +22,7 @@ gateway's RBAC.
 2. Start the gateway with a fixed JWT secret (so tokens survive restarts):
 
    ```sh
-   ./build/release/bin/dfo_gateway -c config.local.json
+   ./build/release/bin/napastak_gateway -c config.local.json
    ```
 
 3. Get an API token:
@@ -39,8 +39,8 @@ gateway's RBAC.
    ```json
    {
      "mcpServers": {
-       "dataflow-os": {
-         "command": "/absolute/path/to/build/release/bin/dfo_mcp_server",
+       "napastak": {
+         "command": "/absolute/path/to/build/release/bin/napastak_mcp_server",
          "args": [
            "--gateway", "http://localhost:8080",
            "--api-key", "PASTE_JWT_HERE"
@@ -122,9 +122,9 @@ today.
 Install [`mcptools`](https://github.com/f/mcptools) and run:
 
 ```sh
-mcp tools "stdio:./build/release/bin/dfo_mcp_server --gateway http://localhost:8080 --api-key $TOKEN"
+mcp tools "stdio:./build/release/bin/napastak_mcp_server --gateway http://localhost:8080 --api-key $TOKEN"
 mcp call query --params '{"sql":"SELECT count(*) FROM my_table"}' \
-  "stdio:./build/release/bin/dfo_mcp_server --gateway http://localhost:8080 --api-key $TOKEN"
+  "stdio:./build/release/bin/napastak_mcp_server --gateway http://localhost:8080 --api-key $TOKEN"
 ```
 
 This is also what the smoke test script does without external tooling — see

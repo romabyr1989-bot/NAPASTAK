@@ -1,4 +1,4 @@
-/* dfo_mcp_server — Model Context Protocol server for NAPASTAK.
+/* napastak_mcp_server — Model Context Protocol server for NAPASTAK.
  *
  * Transport: JSON-RPC over stdio (one message per line, separator '\n').
  *   stdin  → requests from the MCP client (Claude Desktop, Cursor, …)
@@ -12,8 +12,8 @@
  * Example client config (~/Library/Application Support/Claude/claude_desktop_config.json):
  *   {
  *     "mcpServers": {
- *       "dataflow-os": {
- *         "command": "/path/to/dfo_mcp_server",
+ *       "napastak": {
+ *         "command": "/path/to/napastak_mcp_server",
  *         "args": ["--gateway", "http://localhost:8080", "--api-key", "<JWT>"]
  *       }
  *     }
@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
 
-    LOG_INFO("dfo_mcp_server starting — gateway=%s mode=%s",
+    LOG_INFO("napastak_mcp_server starting — gateway=%s mode=%s",
              g_mcp.gateway_url,
              g_mcp.mode == MCP_MODE_HTTP ? "http" : "embedded");
 
@@ -103,6 +103,6 @@ int main(int argc, char **argv) {
     }
 
     free(line);
-    LOG_INFO("dfo_mcp_server stopped");
+    LOG_INFO("napastak_mcp_server stopped");
     return 0;
 }

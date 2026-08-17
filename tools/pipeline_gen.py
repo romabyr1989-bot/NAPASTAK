@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate DataFlow OS pipelines from a YAML template + TSV config.
+Generate NAPASTAK pipelines from a YAML template + TSV config.
 
 Usage:
     pipeline_gen.py --gateway URL --token TOKEN --template FILE --config FILE

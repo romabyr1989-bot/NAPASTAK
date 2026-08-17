@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DataFlow OS — демо-наполнение для презентации ("NovaShop", e-commerce аналитика).
+NAPASTAK — демо-наполнение для презентации ("NovaShop", e-commerce аналитика).
 
 Наполняет ВСЕ разделы UI:
   • Таблицы данных   — sales, customers, products, marketing, support_tickets
@@ -199,7 +199,7 @@ def sql_step(sid, name, sql, target, retries=1, delay=5):
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 def main():
-    print(f"\n=== DataFlow OS demo seed → {BASE} ===\n")
+    print(f"\n=== NAPASTAK demo seed → {BASE} ===\n")
     login()
 
     # 1) Таблицы

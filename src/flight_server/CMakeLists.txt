@@ -1,4 +1,4 @@
-# dfo_flight_server — Apache Arrow Flight bridge for DataFlow OS.
+# napastak_flight_server — Apache Arrow Flight bridge for NAPASTAK.
 #
 # Builds a small C++ binary that translates Arrow Flight gRPC requests
 # into HTTP calls against a running gateway. Heavy dependencies are
@@ -16,7 +16,7 @@
 #   Debian: apt install libarrow-flight-dev libgrpc++-dev nlohmann-json3-dev libcurl4-openssl-dev cmake
 
 cmake_minimum_required(VERSION 3.16)
-project(dfo_flight_server CXX)
+project(napastak_flight_server CXX)
 
 set(CMAKE_CXX_STANDARD 20)        # Arrow 24.x uses std::log2p1 (C++20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,18 +40,18 @@ find_package(nlohmann_json REQUIRED)
 find_package(gRPC QUIET)
 
 # ── Target ───────────────────────────────────────────────────
-add_executable(dfo_flight_server
+add_executable(napastak_flight_server
     main.cc
     flight_service.cc
     http_client.cc
     colbatch_to_arrow.cc
 )
 
-target_include_directories(dfo_flight_server PRIVATE
+target_include_directories(napastak_flight_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(dfo_flight_server PRIVATE
+target_link_libraries(napastak_flight_server PRIVATE
     Arrow::arrow_shared
     ArrowFlight::arrow_flight_shared
     CURL::libcurl
@@ -59,11 +59,11 @@ target_link_libraries(dfo_flight_server PRIVATE
 )
 
 if(gRPC_FOUND)
-    target_link_libraries(dfo_flight_server PRIVATE gRPC::grpc++)
+    target_link_libraries(napastak_flight_server PRIVATE gRPC::grpc++)
 endif()
 
 # Verbose output during initial bring-up
-target_compile_options(dfo_flight_server PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(napastak_flight_server PRIVATE -Wall -Wextra -Wpedantic)
 
 # Install rule (so `cmake --install` works for downstream packagers)
-install(TARGETS dfo_flight_server DESTINATION bin)
+install(TARGETS napastak_flight_server DESTINATION bin)

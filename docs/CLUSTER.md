@@ -19,7 +19,7 @@ Replica endpoints are registered programmatically (see `lib/cluster/cluster.c`).
 ## Starting a Standby
 
 ```bash
-./dfo_storage -p 9090 -d ./data_node
+./napastak_storage -p 9090 -d ./data_node
 ```
 
 The standby listens on TCP port 9090 by default and accepts the binary

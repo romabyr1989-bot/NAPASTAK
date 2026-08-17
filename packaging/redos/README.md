@@ -17,12 +17,12 @@ sudo dnf install -y libpq-devel          # коннекторы PostgreSQL / Gre
 sudo dnf install -y librdkafka-devel      # коннектор Kafka (нужен EPEL)
 #   Oracle (ODPI-C) ставится отдельно — см. ниже
 
-git clone <repo> dataflow-os && cd dataflow-os
+git clone <repo> napastak && cd napastak
 make BUILD=release          # сборка всего (gateway + плагины)
-make BUILD=release dist     # → build/release/dist/dataflow-os-<ver>-linux-x86_64.tar.gz
+make BUILD=release dist     # → build/release/dist/napastak-<ver>-linux-x86_64.tar.gz
 
 # установка
-cd build/release/dist && tar xzf dataflow-os-*.tar.gz && cd dataflow-os-*
+cd build/release/dist && tar xzf napastak-*.tar.gz && cd napastak-*
 sudo ./install.sh
 ```
 
@@ -32,11 +32,11 @@ sudo ./install.sh
 ./packaging/redos/build.sh                 # база rockylinux:9 (класс RedOS 8)
 # или на образе самой RedOS (точный ABI):
 BASE_IMAGE=<redos-image> ./packaging/redos/build.sh
-# → ./dist/dataflow-os-<ver>-linux-x86_64.tar.gz
+# → ./dist/napastak-<ver>-linux-x86_64.tar.gz
 
 # разворачивание на сервере
-scp dist/dataflow-os-*.tar.gz user@server:/tmp/
-ssh user@server 'cd /tmp && tar xzf dataflow-os-*.tar.gz && cd dataflow-os-* && sudo ./install.sh'
+scp dist/napastak-*.tar.gz user@server:/tmp/
+ssh user@server 'cd /tmp && tar xzf napastak-*.tar.gz && cd napastak-* && sudo ./install.sh'
 ```
 
 ## Автономная (офлайн) установка
@@ -48,8 +48,8 @@ Docker-сборка (вариант B) ставит зависимости **в�
 бандл self-contained. Папку можно поставить на сервер **без интернета и без dnf**:
 
 ```bash
-scp -r dataflow-os-<ver>-linux-x86_64 user@server:/tmp/
-ssh user@server 'cd /tmp/dataflow-os-* && sudo ./install.sh'   # dnf не нужен — библиотеки вложены
+scp -r napastak-<ver>-linux-x86_64 user@server:/tmp/
+ssh user@server 'cd /tmp/napastak-* && sudo ./install.sh'   # dnf не нужен — библиотеки вложены
 ```
 
 Или запустить прямо из папки, ничего не устанавливая:
@@ -58,21 +58,21 @@ ssh user@server 'cd /tmp/dataflow-os-* && sudo ./install.sh'   # dnf не нуж
 ./run.sh                 # поднимет gateway с LD_LIBRARY_PATH=lib/deps
 ```
 
-systemd-юнит и install.sh используют `LD_LIBRARY_PATH=/opt/dataflow-os/lib/deps`.
+systemd-юнит и install.sh используют `LD_LIBRARY_PATH=/opt/napastak/lib/deps`.
 Если `lib/deps/` нет (сборка не на Linux), install.sh откатывается на `dnf install`.
 
 ## Что делает install.sh
 
 - Рантайм-библиотеки: если вложены в `lib/deps` — ставить ничего не нужно (офлайн);
   иначе ставит через dnf (`sqlite-libs libcurl openssl-libs zlib`, при PG — `libpq`).
-- Создаёт системного пользователя `dataflow`.
-- Кладёт программу в `/opt/dataflow-os` (bin/, lib/, ui/), данные — в `/var/lib/dataflow-os` (data/, pipelines/).
+- Создаёт системного пользователя `napastak`.
+- Кладёт программу в `/opt/napastak` (bin/, lib/, ui/), данные — в `/var/lib/napastak` (data/, pipelines/).
 - Генерирует `config.json` со случайными `jwt_secret` и admin-паролем (печатает пароль).
-- Ставит и запускает systemd-сервис `dataflow-os`.
+- Ставит и запускает systemd-сервис `napastak`.
 
 ```bash
-systemctl status dataflow-os
-journalctl -u dataflow-os -f
+systemctl status napastak
+journalctl -u napastak -f
 # UI: http://<server>:8080  (логин admin)
 # firewalld: firewall-cmd --add-port=8080/tcp --permanent && firewall-cmd --reload
 ```
@@ -80,10 +80,57 @@ journalctl -u dataflow-os -f
 ## Раскладка на сервере
 
 ```
-/opt/dataflow-os/        bin/dfo_gateway  lib/*.so  ui/  config.json   (WorkingDirectory)
-/var/lib/dataflow-os/    data/  pipelines/                              (запись от пользователя dataflow)
-/etc/systemd/system/dataflow-os.service
+/opt/napastak/        bin/napastak_gateway  lib/*.so  ui/  config.json   (WorkingDirectory)
+/var/lib/napastak/    data/  pipelines/                              (запись от пользователя napastak)
+/etc/systemd/system/napastak.service
 ```
+
+## Обновление с прежних сборок (dataflow-os)
+
+Проект переименован в NAPASTAK: сменились имя юнита, пути и системный
+пользователь. `install.sh` ставит рядом, поэтому старую установку нужно
+погасить и перенести данные вручную — иначе на сервере останутся два сервиса,
+а новый стартует с пустой базой.
+
+| было | стало |
+|------|-------|
+| `/opt/dataflow-os` | `/opt/napastak` |
+| `/var/lib/dataflow-os` | `/var/lib/napastak` |
+| `dataflow-os.service` | `napastak.service` |
+| пользователь `dataflow` | пользователь `napastak` |
+| `bin/dfo_gateway` | `bin/napastak_gateway` |
+
+```bash
+# 1. погасить старый сервис
+sudo systemctl disable --now dataflow-os.service
+
+# 2. поставить новый (создаст пользователя, каталоги, config.json)
+sudo ./install.sh
+
+# 3. перенести данные и конвейеры, вернуть права
+sudo systemctl stop napastak.service
+sudo cp -a /var/lib/dataflow-os/data/.      /var/lib/napastak/data/
+sudo cp -a /var/lib/dataflow-os/pipelines/. /var/lib/napastak/pipelines/
+sudo chown -R napastak:napastak /var/lib/napastak
+
+# 4. перенести секреты (jwt_secret и admin_password), иначе выданные токены
+#    и пароль администратора сменятся
+sudo cp /opt/dataflow-os/config.json /opt/napastak/config.json
+sudo chown napastak:napastak /opt/napastak/config.json && sudo chmod 640 /opt/napastak/config.json
+
+sudo systemctl start napastak.service
+```
+
+Старый `config.json` содержит пути `/opt/dataflow-os` и `/var/lib/dataflow-os` —
+после копирования поправьте в нём `data_dir`, `plugins_dir` и `connector_dir`
+на `/var/lib/napastak/data` и `/opt/napastak/lib`.
+
+Убедившись, что новый сервис работает, удалите старое:
+`sudo rm -rf /opt/dataflow-os /var/lib/dataflow-os && sudo userdel dataflow`.
+
+Имена переменных окружения (`DFO_TOKEN`, `DFO_REST_URL`, `DFO_PGWIRE_DSN`,
+`DFO_ADMIN_PASSWORD`) и ABI коннекторов не менялись — существующие скрипты и
+сторонние коннекторы продолжают работать.
 
 ## Рантайм-зависимости (SONAME, должны быть на RedOS 8)
 
@@ -129,9 +176,9 @@ make -C odpi-4.6.1 && sudo cp odpi-4.6.1/lib/libodpic.so* /usr/local/lib/ \
 # со скачанного RPM (basic-пакет) или tar.gz с сайта Oracle:
 sudo dnf install -y oracle-instantclient-basic-*.rpm     # ставит libclntsh.so в /usr/lib/oracle/.../lib
 # и добавьте путь в LD_LIBRARY_PATH сервиса, либо скопируйте libclntsh.so* и его
-# зависимости в /opt/dataflow-os/lib/deps (systemd уже смотрит туда):
-sudo cp /usr/lib/oracle/*/client64/lib/libclntsh.so* /opt/dataflow-os/lib/deps/ && sudo ldconfig
-sudo systemctl restart dataflow-os
+# зависимости в /opt/napastak/lib/deps (systemd уже смотрит туда):
+sudo cp /usr/lib/oracle/*/client64/lib/libclntsh.so* /opt/napastak/lib/deps/ && sudo ldconfig
+sudo systemctl restart napastak
 ```
 Остальные 9 коннекторов работают без каких-либо внешних установок.
 
@@ -156,12 +203,12 @@ enterprise/банковских кластеров. В форме конвейе
    * **Keytab (рекомендуется)** — ops кладёт keytab и задаёт две переменные
      окружения сервиса. librdkafka сама держит билет свежим:
      ```bash
-     sudo install -m 0640 -o dataflow -g dataflow client.keytab /opt/dataflow-os/certs/
-     sudo systemctl edit dataflow-os      # добавить в [Service]:
-     #   Environment=KAFKA_KERBEROS_KEYTAB=/opt/dataflow-os/certs/client.keytab
+     sudo install -m 0640 -o napastak -g napastak client.keytab /opt/napastak/certs/
+     sudo systemctl edit napastak      # добавить в [Service]:
+     #   Environment=KAFKA_KERBEROS_KEYTAB=/opt/napastak/certs/client.keytab
      #   Environment=KAFKA_KERBEROS_PRINCIPAL=svc-dfo@REALM.EXAMPLE.COM
      #   Environment=KRB5_CONFIG=/etc/krb5.conf
-     sudo systemctl restart dataflow-os
+     sudo systemctl restart napastak
      ```
    * **Внешний кэш билетов** — если билет обновляется системно (cron `kinit` /
      `k5start`): ничего в env не задавайте, коннектор возьмёт готовый ccache
@@ -179,7 +226,7 @@ enterprise/банковских кластеров. В форме конвейе
 определяется автоматически (по содержимому, не по расширению), так что банковские
 PKI, выдающие материал в PEM или в Java-совместимом виде, работают без ручной
 подготовки. Пути к файлам задаются в конфиге подключения (CA + клиентский
-cert/key), файлы должны быть читаемы пользователем сервиса `dataflow`.
+cert/key), файлы должны быть читаемы пользователем сервиса `napastak`.
 
 | Формат | CA (`ssl_ca_location`) | Клиент (mTLS) | Как задать |
 |--------|------------------------|---------------|------------|

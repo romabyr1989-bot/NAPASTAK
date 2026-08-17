@@ -3622,14 +3622,14 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>CA‑сертификат</label>
-          <input type="text" value="${escAttr(cfg.ssl_ca_location || '')}" placeholder="/opt/dataflow-os/certs/ca.pem"
+          <input type="text" value="${escAttr(cfg.ssl_ca_location || '')}" placeholder="/opt/napastak/certs/ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'ssl_ca_location',this.value)">
         </div>
       </div>
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Truststore PKCS#12</label>
-          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="/opt/dataflow-os/certs/truststore.p12"
+          <input type="text" value="${escAttr(cfg.ssl_truststore_location || '')}" placeholder="/opt/napastak/certs/truststore.p12"
                  oninput="pbUpdateConnConfig(${idx},'ssl_truststore_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
@@ -3641,12 +3641,12 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>Клиентский сертификат</label>
-          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="/opt/dataflow-os/certs/client.pem"
+          <input type="text" value="${escAttr(cfg.ssl_certificate_location || '')}" placeholder="/opt/napastak/certs/client.pem"
                  oninput="pbUpdateConnConfig(${idx},'ssl_certificate_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
           <label>Клиентский ключ</label>
-          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="/opt/dataflow-os/certs/client.key"
+          <input type="text" value="${escAttr(cfg.ssl_key_location || '')}" placeholder="/opt/napastak/certs/client.key"
                  oninput="pbUpdateConnConfig(${idx},'ssl_key_location',this.value)">
         </div>
         <div class="form-group" style="margin:0">
@@ -3686,7 +3686,7 @@ function makeConnectorConfigHTML(step, idx) {
       <div class="conn-grid">
         <div class="form-group" style="margin:0">
           <label>CA реестра</label>
-          <input type="text" value="${escAttr(cfg.schema_registry_ca_location || '')}" placeholder="/opt/dataflow-os/certs/registry-ca.pem"
+          <input type="text" value="${escAttr(cfg.schema_registry_ca_location || '')}" placeholder="/opt/napastak/certs/registry-ca.pem"
                  oninput="pbUpdateConnConfig(${idx},'schema_registry_ca_location',this.value)">
         </div>
       </div>` : ''}

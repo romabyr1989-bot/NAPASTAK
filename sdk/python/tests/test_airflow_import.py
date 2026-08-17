@@ -1,4 +1,4 @@
-"""Tests for the Airflow → DataFlow OS DAG importer.
+"""Tests for the Airflow → NAPASTAK DAG importer.
 
 Uses synthetic DAG strings parsed via stdlib `ast` — no Airflow needed.
 """
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from dataflow_os.airflow_import import (
+from napastak.airflow_import import (
     DagVisitor,
     OPERATOR_MAPPING,
     airflow_schedule_to_cron,

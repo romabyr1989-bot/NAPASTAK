@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import pandas as pd
 import requests
 
-from .exceptions import AuthError, DataFlowError, PermissionError, TableNotFoundError
+from .exceptions import AuthError, NapastakError, PermissionError, TableNotFoundError
 
 if TYPE_CHECKING:
     from .table import Table
@@ -99,7 +99,7 @@ class Transaction:
 
 
 class Client:
-    """DataFlow OS HTTP client."""
+    """NAPASTAK HTTP client."""
 
     def __init__(
         self,

@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-GW="$PROJECT_ROOT/build/release/bin/dfo_gateway"
+GW="$PROJECT_ROOT/build/release/bin/napastak_gateway"
 PORT=19201
 BASE="http://127.0.0.1:$PORT"
 DATA_DIR="/tmp/dfo_test_rbac_$$"

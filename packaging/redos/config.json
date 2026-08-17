@@ -1,8 +1,8 @@
 {
   "port": 8080,
-  "data_dir": "/var/lib/dataflow-os/data",
-  "plugins_dir": "/opt/dataflow-os/lib",
-  "connector_dir": "/opt/dataflow-os/lib",
+  "data_dir": "/var/lib/napastak/data",
+  "plugins_dir": "/opt/napastak/lib",
+  "connector_dir": "/opt/napastak/lib",
   "auth_enabled": true,
   "jwt_secret": "CHANGE_ME_RUN_INSTALL_SH",
   "admin_password": "CHANGE_ME_RUN_INSTALL_SH",

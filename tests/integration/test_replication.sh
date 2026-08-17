@@ -5,8 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-GW="$PROJECT_ROOT/build/release/bin/dfo_gateway"
-STORAGE="$PROJECT_ROOT/build/release/bin/dfo_storage"
+GW="$PROJECT_ROOT/build/release/bin/napastak_gateway"
+STORAGE="$PROJECT_ROOT/build/release/bin/napastak_storage"
 GW_PORT=19204
 ST_PORT=19290
 BASE="http://127.0.0.1:$GW_PORT"
@@ -50,7 +50,7 @@ STORAGE_RUNNING=0
 if [ -x "$STORAGE" ]; then
     "$STORAGE" -p "$ST_PORT" -d "$ST_DATA_DIR" >"$ST_DATA_DIR/st.log" 2>&1 &
     ST_PID=$!
-    # Wait up to 3s for storage node. dfo_storage speaks a binary cluster
+    # Wait up to 3s for storage node. napastak_storage speaks a binary cluster
     # protocol (proto_recv/proto_send), NOT HTTP — there is no /health
     # endpoint, so liveness == the listen socket accepting a TCP connect.
     for i in $(seq 1 15); do

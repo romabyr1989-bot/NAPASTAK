@@ -1,13 +1,13 @@
 """
-Airflow DAG → DataFlow OS pipeline converter.
+Airflow DAG → NAPASTAK pipeline converter.
 
 Parses Python DAG files using the stdlib `ast` module — does NOT require
 Airflow itself to be installed. Outputs JSON files ready to POST to the
-DataFlow OS gateway at `/api/pipelines`.
+NAPASTAK gateway at `/api/pipelines`.
 
 Usage:
-    dfo-import-airflow ./dags/ --output ./dfo_pipelines/
-    dfo-import-airflow ./dags/ --apply --gateway http://localhost:8080 \\
+    napastak-import-airflow ./dags/ --output ./dfo_pipelines/
+    napastak-import-airflow ./dags/ --apply --gateway http://localhost:8080 \\
                                 --api-key dfo_xxx
 
 The goal is **80% coverage of typical DAGs**, not exact semantic equivalence.
@@ -28,7 +28,7 @@ from typing import Any
 
 # ── Operator → step mapping ──────────────────────────────────────
 # Each entry tells the importer how to translate an Airflow operator.
-#   "type"      — DataFlow OS step type (bash | sql | http | noop | unsupported)
+#   "type"      — NAPASTAK step type (bash | sql | http | noop | unsupported)
 #   "param"     — the kwarg of the operator that holds the payload
 #   "field"     — the resulting step field that receives the payload
 #   "connector" — optional: hint for SQL operators about which DB to use
@@ -208,7 +208,7 @@ _SCHEDULE_PRESETS = {
 
 def airflow_schedule_to_cron(schedule: Any) -> str:
     """Convert an Airflow `schedule` / `schedule_interval` value to a cron
-    expression understood by DataFlow OS, or 'manual' if not periodic."""
+    expression understood by NAPASTAK, or 'manual' if not periodic."""
     if schedule is None or schedule == "@once" or schedule == "None":
         return "manual"
     if isinstance(schedule, str):
@@ -338,8 +338,8 @@ def _summarize_todos(pipeline: dict[str, Any]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="dfo-import-airflow",
-                                description="Convert Airflow DAGs to DataFlow OS pipelines")
+    p = argparse.ArgumentParser(prog="napastak-import-airflow",
+                                description="Convert Airflow DAGs to NAPASTAK pipelines")
     p.add_argument("dags_dir", type=Path,
                    help="Directory with Airflow .py DAG files (recursive)")
     p.add_argument("--output", type=Path, default=Path("./dfo_pipelines"),

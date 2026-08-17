@@ -1,4 +1,4 @@
-# Воспроизводимая сборка DataFlow OS под RedOS 8 / RHEL 9-совместимые.
+# Воспроизводимая сборка NAPASTAK под RedOS 8 / RHEL 9-совместимые.
 #
 # По умолчанию rockylinux:9 — тот же класс, что RedOS 8.02 (glibc 2.34, OpenSSL 3,
 # SONAME libssl.so.3 / libcrypto.so.3 / libsqlite3.so.0 / libcurl.so.4).
@@ -51,4 +51,4 @@ RUN set -e; cd /src/build/release/dist/*/lib; \
     echo "OK: собраны все 10 коннекторов:"; ls -1 *_connector.so | sed 's/^/  /'; \
     echo "вложенные рантайм-.so (lib/deps):"; ls -1 deps/ 2>/dev/null | sed 's/^/  /'
 
-# Готовый дистрибутив: /src/build/release/dist/dataflow-os-*-linux-*.tar.gz
+# Готовый дистрибутив: /src/build/release/dist/napastak-*-linux-*.tar.gz

@@ -25,12 +25,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -s /bin/false -u 1001 dfo
+RUN useradd -r -s /bin/false -u 1001 napastak
 
 WORKDIR /app
 
 # Binary + connector plugins
-COPY --from=builder /src/build/release/bin/dfo_gateway ./dfo_gateway
+COPY --from=builder /src/build/release/bin/napastak_gateway ./napastak_gateway
 COPY --from=builder /src/build/release/lib/*.so        ./lib/
 
 # UI static files
@@ -44,9 +44,9 @@ COPY config.template.json ./config.template.json
 COPY scripts/entrypoint.sh ./entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-RUN mkdir -p /data && chown -R dfo:dfo /data /app
+RUN mkdir -p /data && chown -R napastak:napastak /data /app
 
-USER dfo
+USER napastak
 
 # /data is persisted via named volume; /app is read-only after chown
 VOLUME ["/data"]

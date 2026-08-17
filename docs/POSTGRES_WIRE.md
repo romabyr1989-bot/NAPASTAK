@@ -31,12 +31,12 @@ Gateway log on startup:
 ## Connect
 
 ```sh
-PGPASSWORD=admin psql -h localhost -p 5432 -U admin -d dataflow
+PGPASSWORD=admin psql -h localhost -p 5432 -U admin -d napastak
 
 # or via psycopg
 python -c "
 import psycopg2
-c = psycopg2.connect('host=localhost port=5432 user=admin password=admin dbname=dataflow')
+c = psycopg2.connect('host=localhost port=5432 user=admin password=admin dbname=napastak')
 print(c.cursor().execute('SELECT version()'))
 "
 ```
@@ -174,7 +174,7 @@ dbt-postgres / DBeaver all use it for parameterized queries.
 
 ```python
 import psycopg2
-c = psycopg2.connect("host=localhost port=5432 user=admin password=admin dbname=dataflow")
+c = psycopg2.connect("host=localhost port=5432 user=admin password=admin dbname=napastak")
 cur = c.cursor()
 cur.execute("SELECT name FROM users WHERE age > %s AND age < %s", (28, 40))
 print(cur.fetchall())   # ← real Extended Query: Parse + Bind + Execute

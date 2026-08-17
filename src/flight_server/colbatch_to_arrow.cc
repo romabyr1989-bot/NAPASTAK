@@ -1,6 +1,6 @@
 /* colbatch_to_arrow.cc — JSON query result → arrow::Table.
  *
- * The DataFlow OS gateway returns query results as:
+ * The NAPASTAK gateway returns query results as:
  *   { "columns": ["a", "b", ...],
  *     "rows":    [[1, "x"], [2, "y"]],
  *     "duration_ms": 12 }

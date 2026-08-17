@@ -1,6 +1,6 @@
 # Airflow → NAPASTAK DAG Importer
 
-`dfo-import-airflow` is a Python utility that converts existing Airflow DAG
+`napastak-import-airflow` is a Python utility that converts existing Airflow DAG
 files into NAPASTAK pipeline JSON. The goal is **80% coverage of typical
 DAGs** without trying to be 100% semantically equivalent.
 
@@ -15,16 +15,16 @@ cd sdk/python
 pip install -e .
 ```
 
-The script is registered as `dfo-import-airflow`.
+The script is registered as `napastak-import-airflow`.
 
 ## Quickstart
 
 ```sh
 # 1. Convert DAGs to JSON (offline)
-dfo-import-airflow ~/airflow/dags --output ./dfo_pipelines
+napastak-import-airflow ~/airflow/dags --output ./dfo_pipelines
 
 # 2. Convert AND apply to a running gateway
-dfo-import-airflow ~/airflow/dags --apply \
+napastak-import-airflow ~/airflow/dags --apply \
                    --gateway http://localhost:8080 \
                    --api-key dfo_xxx
 ```
@@ -133,7 +133,7 @@ The resulting pipeline JSON expresses dependencies via `depends_on`:
   steps; group structure is lost.
 - **Recognize custom operators** outside `OPERATOR_MAPPING`. They become
   bash TODO steps. To add support, append to the dict in
-  `sdk/python/dataflow_os/airflow_import.py`.
+  `sdk/python/napastak/airflow_import.py`.
 - **Convert `XCom` references.** Cross-task data passing isn't translated;
   TODOs surface where it appears.
 
@@ -167,4 +167,4 @@ syntax-error resilience.
 - `--diff` flag to compare imported pipelines against ones already running
 - Optional `--strict` mode that fails on any TODO
 - HTTP `POST /api/pipelines/preview-airflow` for the UI drag-and-drop importer
-- Operator mapping plugin discovery (`/etc/dataflow/airflow_operators.toml`)
+- Operator mapping plugin discovery (`/etc/napastak/airflow_operators.toml`)

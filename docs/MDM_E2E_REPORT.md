@@ -8,7 +8,7 @@ subsystem.
 Reproduce:
 - E2E correctness: `tests/integration/test_mdm_e2e.sh` (11/11 PASS)
 - Load: `make BUILD=release build/release/bin/bench_bench_scd2 && \
-  build/release/bin/bench_bench_scd2 build/release/bin/dfo_gateway 19083`
+  build/release/bin/bench_bench_scd2 build/release/bin/napastak_gateway 19083`
 
 ## 1. What works end-to-end
 

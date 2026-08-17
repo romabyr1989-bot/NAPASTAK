@@ -1,4 +1,4 @@
-"""Tests for the DataFlow OS Python SDK.
+"""Tests for the NAPASTAK Python SDK.
 
 Run with:
     pip install -e ".[dev]"
@@ -8,8 +8,8 @@ Run with:
 import pytest
 import responses as resp_lib
 
-from dataflow_os import Client
-from dataflow_os.exceptions import AuthError, PermissionError
+from napastak import Client
+from napastak.exceptions import AuthError, PermissionError
 
 BASE = "http://localhost:8080"
 

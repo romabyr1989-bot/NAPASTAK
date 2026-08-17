@@ -1,3 +1,3 @@
-export { DataFlowClient } from './client';
-export type { DataFlowConfig, QueryResult, TableInfo, IngestResult } from './types';
-export { DataFlowError } from './client';
+export { NapastakClient } from './client';
+export type { NapastakConfig, QueryResult, TableInfo, IngestResult } from './types';
+export { NapastakError } from './client';

@@ -1,14 +1,14 @@
-"""DataFlow OS Python SDK.
+"""NAPASTAK Python SDK.
 
 Top-level imports are lazy: importing the package does not pull in
 optional dependencies (`requests`, `pandas`). Submodules that need
 them raise an informative ImportError when accessed.
 
 Examples:
-    from dataflow_os import Client                    # needs requests
-    from dataflow_os.airflow_import import main       # stdlib only
+    from napastak import Client                    # needs requests
+    from napastak.airflow_import import main       # stdlib only
 """
-from .exceptions import AuthError, PermissionError, TableNotFoundError, DataFlowError
+from .exceptions import AuthError, PermissionError, TableNotFoundError, NapastakError
 
 __all__ = [
     "Client",
@@ -17,7 +17,7 @@ __all__ = [
     "AuthError",
     "PermissionError",
     "TableNotFoundError",
-    "DataFlowError",
+    "NapastakError",
 ]
 __version__ = "0.1.0"
 
@@ -33,4 +33,4 @@ def __getattr__(name):
     if name == "Pipeline":
         from .pipeline import Pipeline
         return Pipeline
-    raise AttributeError(f"module 'dataflow_os' has no attribute {name!r}")
+    raise AttributeError(f"module 'napastak' has no attribute {name!r}")

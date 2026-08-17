@@ -16,7 +16,7 @@
 #include <time.h>
 #include <pthread.h>
 
-#define BINARY_DEFAULT "build/release/bin/dfo_gateway"
+#define BINARY_DEFAULT "build/release/bin/napastak_gateway"
 #define PORT_DEFAULT   19083
 
 static uint64_t now_ns(void) {

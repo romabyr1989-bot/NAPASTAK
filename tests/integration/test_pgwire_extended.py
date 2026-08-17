@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-GW   = ROOT / "build" / "release" / "bin" / "dfo_gateway"
+GW   = ROOT / "build" / "release" / "bin" / "napastak_gateway"
 
 HTTP_PORT = 18185
 PG_PORT   = 15835
@@ -88,7 +88,7 @@ def gateway(tmp_path_factory):
 def conn(gateway):
     c = psycopg2.connect(
         host="localhost", port=PG_PORT,
-        user="admin", password="admin", dbname="dataflow",
+        user="admin", password="admin", dbname="napastak",
     )
     yield c
     c.close()
@@ -139,7 +139,7 @@ def test_compatibility_probes_via_extended(conn):
     cur = conn.cursor()
     cur.execute("SELECT version()")
     (banner,) = cur.fetchone()
-    assert "DataFlow OS" in banner
+    assert "NAPASTAK" in banner
 
 
 def test_information_schema_via_extended(conn):
@@ -163,9 +163,9 @@ def test_two_connections_in_parallel(gateway):
     """Per-connection thread-isolation: two connections each prepare their
     own statement with the same name and don't collide."""
     a = psycopg2.connect(host="localhost", port=PG_PORT,
-                          user="admin", password="admin", dbname="dataflow")
+                          user="admin", password="admin", dbname="napastak")
     b = psycopg2.connect(host="localhost", port=PG_PORT,
-                          user="admin", password="admin", dbname="dataflow")
+                          user="admin", password="admin", dbname="napastak")
     try:
         ca, cb = a.cursor(), b.cursor()
         ca.execute("SELECT name FROM users WHERE id = %s", (1,))

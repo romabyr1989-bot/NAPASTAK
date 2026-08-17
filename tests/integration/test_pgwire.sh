@@ -6,7 +6,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW="$ROOT/build/release/bin/dfo_gateway"
+GW="$ROOT/build/release/bin/napastak_gateway"
 HTTP_PORT=18180
 PG_PORT=15532
 DATA="$(mktemp -d -t dfo_pgw_test_XXXX)"
@@ -34,7 +34,7 @@ for i in {1..30}; do
   sleep 0.2
 done
 
-PSQL="psql -h localhost -p $PG_PORT -U admin -d dataflow -tAc"
+PSQL="psql -h localhost -p $PG_PORT -U admin -d napastak -tAc"
 
 # 1. Handshake + auth + SELECT 1
 RESP=$(PGPASSWORD=admin $PSQL "SELECT 1" 2>&1)
@@ -46,7 +46,7 @@ check "version() mentions NAPASTAK"     "[[ '$RESP' == *NAPASTAK* ]]"
 
 # 3. current_database / current_user
 RESP=$(PGPASSWORD=admin $PSQL "SELECT current_database()" 2>&1)
-check "current_database() returns dataflow" "[[ '$RESP' == 'dataflow' ]]"
+check "current_database() returns napastak" "[[ '$RESP' == 'napastak' ]]"
 RESP=$(PGPASSWORD=admin $PSQL "SELECT current_user" 2>&1)
 check "current_user returns admin"         "[[ '$RESP' == 'admin' ]]"
 
@@ -59,7 +59,7 @@ RESP=$(PGPASSWORD=admin $PSQL "SELECT 42" 2>&1)
 check "SELECT 42 returns 42"               "[[ '$RESP' == '42' ]]"
 
 # 6. BEGIN/SET/COMMIT no-op
-RESP=$(PGPASSWORD=admin psql -h localhost -p $PG_PORT -U admin -d dataflow -tA <<'EOF' 2>&1
+RESP=$(PGPASSWORD=admin psql -h localhost -p $PG_PORT -U admin -d napastak -tA <<'EOF' 2>&1
 BEGIN;
 SET TimeZone='UTC';
 SELECT 7;
@@ -116,7 +116,7 @@ check "Week 3: typed int column returns scalar 1" "[[ '$RESP' == '1' ]]"
 
 # 9. SSL request handled (psql probes SSL on connect by default — already
 #    exercised above but verify by forcing sslmode=disable still works)
-RESP=$(PGPASSWORD=admin psql "host=localhost port=$PG_PORT user=admin dbname=dataflow sslmode=disable" -tAc "SELECT 1" 2>&1)
+RESP=$(PGPASSWORD=admin psql "host=localhost port=$PG_PORT user=admin dbname=napastak sslmode=disable" -tAc "SELECT 1" 2>&1)
 check "sslmode=disable still works"        "[[ '$RESP' == '1' ]]"
 
 # 10. Gateway log shows the listener and the connection event

@@ -11,7 +11,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW="$ROOT/build/release/bin/dfo_gateway"
+GW="$ROOT/build/release/bin/napastak_gateway"
 PORT=19299
 DATA="$(mktemp -d -t dfo_mdm_XXXX)"
 PASS=0; FAIL=0

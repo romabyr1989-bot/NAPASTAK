@@ -4,7 +4,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW_BIN="$ROOT/build/release/bin/dfo_gateway"
+GW_BIN="$ROOT/build/release/bin/napastak_gateway"
 PORT=19350
 DATA="$(mktemp -d -t dfo_cdi_XXXX)"
 SECRET="cdi-$$"

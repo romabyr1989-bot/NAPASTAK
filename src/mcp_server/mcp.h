@@ -1,4 +1,4 @@
-/* mcp.h — shared types/decls for dfo_mcp_server.
+/* mcp.h — shared types/decls for napastak_mcp_server.
  *
  * Implements the Model Context Protocol (https://modelcontextprotocol.io)
  * over JSON-RPC on stdio. Exposes NAPASTAK as a tool provider for AI
@@ -10,7 +10,7 @@
 #include <stdbool.h>
 
 #define MCP_PROTOCOL_VERSION "2024-11-05"
-#define MCP_SERVER_NAME      "dataflow-os"
+#define MCP_SERVER_NAME      "napastak"
 #define MCP_SERVER_VERSION   "0.1.0"
 
 #define MCP_LINE_BUF (256 * 1024)   /* one JSON-RPC message ≤ 256 KB */

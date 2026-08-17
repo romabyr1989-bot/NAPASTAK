@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load an Excel (.xlsx) file (or a folder of them) into a DataFlow OS table.
+Load an Excel (.xlsx) file (or a folder of them) into a NAPASTAK table.
 Replicates applications/xlsx2db.py.
 
 Usage:

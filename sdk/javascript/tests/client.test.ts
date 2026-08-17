@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
-import { DataFlowClient, DataFlowError } from '../src/client';
+import { NapastakClient, NapastakError } from '../src/client';
 
 const BASE = 'http://localhost:8080';
 
@@ -15,8 +15,8 @@ beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-function makeClient(): DataFlowClient {
-  return new DataFlowClient({ baseUrl: BASE, apiKey: 'test-key' });
+function makeClient(): NapastakClient {
+  return new NapastakClient({ baseUrl: BASE, apiKey: 'test-key' });
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ describe('health', () => {
 // ---------------------------------------------------------------------------
 
 describe('error handling', () => {
-  it('throws DataFlowError on 401', async () => {
+  it('throws NapastakError on 401', async () => {
     server.use(
       http.post(`${BASE}/api/tables/query`, () =>
         HttpResponse.json({ error: 'Unauthorized' }, { status: 401 }),
@@ -161,18 +161,18 @@ describe('error handling', () => {
     );
 
     const client = makeClient();
-    await expect(client.query('SELECT 1')).rejects.toBeInstanceOf(DataFlowError);
+    await expect(client.query('SELECT 1')).rejects.toBeInstanceOf(NapastakError);
 
     try {
       await client.query('SELECT 1');
     } catch (e) {
-      if (e instanceof DataFlowError) {
+      if (e instanceof NapastakError) {
         expect(e.status).toBe(401);
       }
     }
   });
 
-  it('throws DataFlowError on 403', async () => {
+  it('throws NapastakError on 403', async () => {
     server.use(
       http.post(`${BASE}/api/tables/query`, () =>
         HttpResponse.json({ error: 'Forbidden' }, { status: 403 }),
@@ -180,11 +180,11 @@ describe('error handling', () => {
     );
 
     const client = makeClient();
-    let caught: DataFlowError | null = null;
+    let caught: NapastakError | null = null;
     try {
       await client.query('SELECT * FROM secret');
     } catch (e) {
-      if (e instanceof DataFlowError) caught = e;
+      if (e instanceof NapastakError) caught = e;
     }
     expect(caught).not.toBeNull();
     expect(caught!.status).toBe(403);

@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <math.h>
 
-#define BINARY_DEFAULT "build/debug/bin/dfo_gateway"
+#define BINARY_DEFAULT "build/debug/bin/napastak_gateway"
 #define PORT_DEFAULT   19081
 
 /* Run a SQL query and return resp (caller must resp_free). */

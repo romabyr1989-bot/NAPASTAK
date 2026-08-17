@@ -1,5 +1,5 @@
 """
-Client to DataFlow OS — two transports, both returning list[dict]:
+Client to NAPASTAK — two transports, both returning list[dict]:
 
   dfo_query(sql, params)        — REST /api/query/named (named params, SELECT-only)
   dfo_pgwire_query(sql, params) — PgWire (psycopg2), for DDL / transactions

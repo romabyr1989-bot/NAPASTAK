@@ -2,8 +2,8 @@
 
 Auto-skips when:
   - pyarrow is not installed
-  - dfo_flight_server binary hasn't been built (Step 2 is opt-in)
-  - the dfo_gateway binary is missing
+  - napastak_flight_server binary hasn't been built (Step 2 is opt-in)
+  - the napastak_gateway binary is missing
 
 When everything is in place: starts a gateway, starts the Flight server
 pointing at it, and runs a basic ListFlights + DoGet exchange via PyArrow.
@@ -23,8 +23,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-GATEWAY = ROOT / "build" / "release" / "bin" / "dfo_gateway"
-FLIGHT  = ROOT / "build" / "release" / "bin" / "dfo_flight_server"
+GATEWAY = ROOT / "build" / "release" / "bin" / "napastak_gateway"
+FLIGHT  = ROOT / "build" / "release" / "bin" / "napastak_flight_server"
 
 GATEWAY_PORT = 19290
 FLIGHT_PORT  = 19291

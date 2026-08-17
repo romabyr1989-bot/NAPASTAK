@@ -53,9 +53,9 @@ MCP_SRCS  = src/mcp_server/main.c src/mcp_server/dispatch.c \
 ALL_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(GW_SRCS))
 LIB_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS))
 
-GATEWAY        = $(BINDIR)/dfo_gateway
-STORAGE_NODE   = $(BINDIR)/dfo_storage
-MCP_SERVER     = $(BINDIR)/dfo_mcp_server
+GATEWAY        = $(BINDIR)/napastak_gateway
+STORAGE_NODE   = $(BINDIR)/napastak_storage
+MCP_SERVER     = $(BINDIR)/napastak_mcp_server
 CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
 PG_PLUGIN      = $(LIBDIR)/pg_connector.so
 PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
@@ -148,7 +148,7 @@ debug:
 # ── Дистрибутив для сервера (RedOS 8 / Linux): tar.gz с бинарём, плагинами,
 # UI, конвейерами, конфигом, systemd-юнитом и install.sh. См. packaging/redos/.
 VERSION   ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
-DIST_NAME := dataflow-os-$(VERSION)-linux-$(shell uname -m)
+DIST_NAME := napastak-$(VERSION)-linux-$(shell uname -m)
 DIST_DIR  := $(OUTDIR)/dist/$(DIST_NAME)
 dist: all
 	@echo "  DIST $(DIST_NAME).tar.gz"
@@ -158,7 +158,7 @@ dist: all
 	@cp $(LIBDIR)/*.so $(DIST_DIR)/lib/
 	@cp -a ui/. $(DIST_DIR)/ui/
 	@cp -a pipelines/. $(DIST_DIR)/pipelines/ 2>/dev/null || true
-	@cp packaging/redos/config.json packaging/redos/dataflow-os.service \
+	@cp packaging/redos/config.json packaging/redos/napastak.service \
 	    packaging/redos/install.sh packaging/redos/run.sh packaging/redos/README.md $(DIST_DIR)/
 	@chmod +x $(DIST_DIR)/install.sh $(DIST_DIR)/run.sh
 	@# Автономность (офлайн-установка): вложить рантайм-.so, кроме glibc/ld-linux,
@@ -167,7 +167,7 @@ dist: all
 	@# хоста может требовать GLIBC-версию новее целевой; берём его из целевой ОС.
 	@if command -v ldd >/dev/null 2>&1; then \
 	  mkdir -p $(DIST_DIR)/lib/deps; \
-	  for b in $(DIST_DIR)/bin/dfo_gateway $(DIST_DIR)/lib/*.so; do ldd "$$b" 2>/dev/null; done \
+	  for b in $(DIST_DIR)/bin/napastak_gateway $(DIST_DIR)/lib/*.so; do ldd "$$b" 2>/dev/null; done \
 	    | awk '/=> \//{print $$3}' | sort -u \
 	    | grep -vE '/(ld-linux|libc|libm|libdl|librt|libpthread|libresolv|libnsl|libgcc_s)\.so' \
 	    | while read -r so; do cp -Lu "$$so" $(DIST_DIR)/lib/deps/ 2>/dev/null || true; done; \
@@ -387,8 +387,8 @@ test-all: test test-sql test-integration
 #   Debian: apt install libarrow-flight-dev libgrpc++-dev nlohmann-json3-dev libcurl4-openssl-dev cmake
 #
 # Then:    make flight
-# Output:  build/release/bin/dfo_flight_server
-FLIGHT_BIN     = $(BINDIR)/dfo_flight_server
+# Output:  build/release/bin/napastak_flight_server
+FLIGHT_BIN     = $(BINDIR)/napastak_flight_server
 FLIGHT_BUILD   = src/flight_server/build
 
 # Auto-detect conda if installed — Arrow C++ via conda-forge is the
@@ -423,7 +423,7 @@ flight: dirs
 	fi
 	@mkdir -p $(FLIGHT_BUILD)
 	@cd $(FLIGHT_BUILD) && cmake $(FLIGHT_CMAKE_ARGS) .. && cmake --build . -j 2>&1
-	@cp $(FLIGHT_BUILD)/dfo_flight_server $(FLIGHT_BIN)
+	@cp $(FLIGHT_BUILD)/napastak_flight_server $(FLIGHT_BIN)
 	@echo "  LD  $(FLIGHT_BIN)"
 	@if [ -n "$(FLIGHT_PREFIX)" ]; then \
 		echo "  HINT: run with DYLD_LIBRARY_PATH=$(FLIGHT_PREFIX)/lib so libarrow*.dylib is found"; \

@@ -34,7 +34,7 @@ Valid for 365 days with SANs: `localhost`, `127.0.0.1`
 ### 3. Start Server
 
 ```bash
-./build/debug/bin/dfo_gateway -c config.json
+./build/debug/bin/napastak_gateway -c config.json
 ```
 
 Expected output:
@@ -79,7 +79,7 @@ openssl s_client -connect localhost:8080
 Should show:
 - Protocol: `TLSv1.3` or higher
 - Cipher: `TLS_AES_256_GCM_SHA384` (or similar strong cipher)
-- Subject: `CN=localhost, O=DataFlow, C=RU`
+- Subject: `CN=localhost, O=NAPASTAK, C=RU`
 
 ## Architecture
 

@@ -13,7 +13,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW_BIN="$ROOT/build/release/bin/dfo_gateway"
+GW_BIN="$ROOT/build/release/bin/napastak_gateway"
 KAFKA_SO="$ROOT/build/release/lib/kafka_connector.so"
 PORT=19394
 DATA="$(mktemp -d -t dfo_avro_XXXX)"

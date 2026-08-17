@@ -8,7 +8,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW_BIN="$ROOT/build/release/bin/dfo_gateway"
+GW_BIN="$ROOT/build/release/bin/napastak_gateway"
 SO="$ROOT/build/release/lib/airbyte_connector.so"
 PORT=19260
 DATA="$(mktemp -d -t dfo_airbyte_test_XXXX)"

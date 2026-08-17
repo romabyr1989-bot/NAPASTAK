@@ -9,7 +9,7 @@
 #include <time.h>
 #include <math.h>
 
-#define BINARY_DEFAULT "build/debug/bin/dfo_gateway"
+#define BINARY_DEFAULT "build/debug/bin/napastak_gateway"
 #define PORT_DEFAULT   19083
 #define SEED_ROWS      50000
 #define QUERY_REPS     50

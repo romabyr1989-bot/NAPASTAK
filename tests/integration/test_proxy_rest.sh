@@ -5,7 +5,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GW_BIN="$ROOT/build/release/bin/dfo_gateway"
+GW_BIN="$ROOT/build/release/bin/napastak_gateway"
 PROXY="$ROOT/services/tsmdm_proxy"
 GPORT=19320; RPORT=18450
 DATA="$(mktemp -d -t dfo_pxrest_XXXX)"

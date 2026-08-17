@@ -3,9 +3,9 @@
 # Запускать из распакованного дистрибутива от root:  sudo ./install.sh
 set -euo pipefail
 
-PREFIX="/opt/dataflow-os"
-STATE="/var/lib/dataflow-os"
-SVC_USER="dataflow"
+PREFIX="/opt/napastak"
+STATE="/var/lib/napastak"
+SVC_USER="napastak"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 [ "$(id -u)" -eq 0 ] || { echo "Нужны права root: sudo ./install.sh"; exit 1; }
@@ -63,7 +63,7 @@ json.dump(c,open(f.replace(".tmp",""),"w"),indent=2,ensure_ascii=False)
 PY
   rm -f "$PREFIX/config.json.tmp"
   echo "  сгенерирован jwt_secret; admin-пароль: $PASS"
-  echo "  (поменять можно в $PREFIX/config.json, далее: systemctl restart dataflow-os)"
+  echo "  (поменять можно в $PREFIX/config.json, далее: systemctl restart napastak)"
 fi
 
 echo "==> Права"
@@ -71,15 +71,15 @@ chown -R "$SVC_USER":"$SVC_USER" "$PREFIX" "$STATE"
 chmod 640 "$PREFIX/config.json"
 
 echo "==> systemd-сервис"
-install -m 644 "$SRC/dataflow-os.service" /etc/systemd/system/dataflow-os.service
+install -m 644 "$SRC/napastak.service" /etc/systemd/system/napastak.service
 systemctl daemon-reload
-systemctl enable dataflow-os.service >/dev/null 2>&1 || true
-systemctl restart dataflow-os.service
+systemctl enable napastak.service >/dev/null 2>&1 || true
+systemctl restart napastak.service
 
 echo "==> Готово. Статус:"
 sleep 1
-systemctl --no-pager --full status dataflow-os.service | head -6 || true
+systemctl --no-pager --full status napastak.service | head -6 || true
 echo ""
 echo "UI:    http://<server>:8080   (логин admin)"
-echo "Логи:  journalctl -u dataflow-os -f"
+echo "Логи:  journalctl -u napastak -f"
 echo "Если включён firewalld:  firewall-cmd --add-port=8080/tcp --permanent && firewall-cmd --reload"

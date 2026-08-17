@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Seed a realistic TSMDM/Joker prod emulation into DataFlow OS engine tables.
+"""Seed a realistic TSMDM/Joker prod emulation into NAPASTAK engine tables.
 
 Generates a wide CDI golden table (cdi_physical_party) that serves all three
 consumers — MDC matching (src_* cols), agr2party (owner_id/party_id JOIN), and
