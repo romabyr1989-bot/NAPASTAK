@@ -161,6 +161,10 @@ dist: all
 	@cp packaging/redos/config.json packaging/redos/napastak.service \
 	    packaging/redos/install.sh packaging/redos/run.sh packaging/redos/README.md $(DIST_DIR)/
 	@chmod +x $(DIST_DIR)/install.sh $(DIST_DIR)/run.sh
+	@# Версия едет файлом: install.sh по нему решает, обновление это или
+	@# понижение, и записывает её рядом с программой на сервере. Внутри ВМ или
+	@# docker-образа .git недоступен, поэтому берём VERSION, переданную сборке.
+	@printf '%s\n' "$(VERSION)" > $(DIST_DIR)/VERSION
 	@# Автономность (офлайн-установка): вложить рантайм-.so, кроме glibc/ld-linux,
 	@# чтобы сервер не требовал dnf/интернет. Только на Linux (нужен ldd).
 	@# libgcc_s НЕ вкладываем: он жёстко связан с системным glibc — вложенный с
