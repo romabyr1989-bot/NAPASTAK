@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* strncasecmp объявлен в <strings.h> по POSIX. В glibc он подтягивается и через
+ * <string.h> при _GNU_SOURCE, поэтому на Linux сборка проходила, а на macOS
+ * падала с «call to undeclared function 'strncasecmp'». */
+#include <strings.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
