@@ -72,6 +72,7 @@ int main(void) {
     rc = avro_decode_record(a, df, dnf, pd, sizeof pd, &v, &n);
     ok(rc == 0 && v[0] && strcmp(v[0], "1.5") == 0, "double 1.5 decoded");
 
+    arena_destroy(a);
     printf("1..%d\n", plan);
     fprintf(stderr, "avro_record: %d/%d passed\n", pass, plan);
     return fail ? 1 : 0;

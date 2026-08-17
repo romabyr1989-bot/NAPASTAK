@@ -41,6 +41,9 @@ int main(void) {
     for(int idx=hm_next(&m,0,&k,&v);idx>=0;idx=hm_next(&m,idx,&k,&v)) count++;
     ok(count>=65, "iteration visits all entries (count=%d)", count);
 
+    /* Слоты таблицы живут в heap, а не в арене — без hm_free ёмкость после
+     * роста (3 КБ) утекала, что и показал LeakSanitizer на Linux. */
+    hm_free(&m);
     arena_destroy(a);
     printf("1..%d\n# pass=%d fail=%d\n",plan,pass,fail);
     return fail>0?1:0;

@@ -31,6 +31,11 @@ void *hm_get(HashMap *m, const char *key);
 bool  hm_del(HashMap *m, const char *key);
 /* Сброс всех записей (ёмкость и арена сохраняются). */
 void  hm_clear(HashMap *m);
+/* Освобождает массив слотов (и копии ключей, если арена не задана).
+ * Таблицу после этого можно снова hm_init. Безопасно для обнулённой структуры
+ * и при повторном вызове. Обязателен для каждой таблицы, которая не живёт до
+ * конца процесса: слоты всегда берутся из heap, даже когда задана арена. */
+void  hm_free(HashMap *m);
 
 /* iterate: idx=0 start; returns next idx or -1 */
 int   hm_next(const HashMap *m, int idx, const char **key_out, void **val_out);

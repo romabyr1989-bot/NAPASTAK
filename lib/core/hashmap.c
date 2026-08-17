@@ -95,6 +95,10 @@ bool hm_del(HashMap *m, const char *key) {
         HMEntry *s = &m->slots[pos];
         if (!s->key) return false;
         if (s->hash == h && strcmp(s->key, key) == 0) {
+            /* Без арены ключ был получен strdup() и принадлежит таблице —
+             * иначе каждое удаление подтекает на длину ключа. Освобождаем
+             * после сдвига: до него строка ещё может читаться. */
+            char *dead = m->arena ? NULL : (char *)s->key;
             s->key = NULL; m->count--;
             /* Сдвигаем следующие элементы на одну позицию назад, пока они не «дома». */
             for (;;) {
@@ -104,6 +108,7 @@ bool hm_del(HashMap *m, const char *key) {
                 m->slots[pos] = *n; m->slots[pos].psl--;
                 pos = npos;
             }
+            free(dead);
             return true;
         }
         if (s->psl < i) return false;
@@ -111,8 +116,28 @@ bool hm_del(HashMap *m, const char *key) {
     return false;
 }
 
-/* Очистка: обнуляет все слоты, сохраняя выделенную ёмкость. */
-void hm_clear(HashMap *m) { memset(m->slots, 0, m->cap * sizeof(HMEntry)); m->count = 0; }
+/* Очистка: обнуляет все слоты, сохраняя выделенную ёмкость.
+ * Ключи без арены освобождаются — раньше memset терял их указатели. */
+void hm_clear(HashMap *m) {
+    if (!m->slots) return;
+    if (!m->arena) {
+        for (uint32_t i = 0; i < m->cap; i++)
+            if (m->slots[i].key) free((void *)m->slots[i].key);
+    }
+    memset(m->slots, 0, m->cap * sizeof(HMEntry));
+    m->count = 0;
+}
+
+/* Освобождение таблицы. Слоты всегда из heap (calloc в hm_init/hm_grow), даже
+ * когда задана арена — арена держит только копии ключей. Без этого вызова
+ * таблица подтекает на всю ёмкость: до появления функции освободить её было
+ * попросту нечем. Идемпотентна и безопасна для {0}-структуры. */
+void hm_free(HashMap *m) {
+    if (!m || !m->slots) return;
+    hm_clear(m);            /* освобождает ключи, если арены нет */
+    free(m->slots);
+    m->slots = NULL; m->cap = 0; m->count = 0;
+}
 
 /* Итератор: idx — индекс следующего слота для проверки (0 в начале).
  * Возвращает следующий idx или -1 в конце. */

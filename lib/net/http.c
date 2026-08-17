@@ -142,11 +142,18 @@ void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
     char *qs = strchr(path, '?');
     if (qs) { req->query = qs + 1; *qs = '\0'; }
 
+    /* Таблица параметров создаётся ОДИН раз на запрос. Раньше hm_init стоял
+     * внутри цикла, и каждый неподошедший маршрут выделял новый массив слотов,
+     * бросая предыдущий: на запросе, совпавшем с последним из ~60 маршрутов,
+     * это давало десяток килобайт утечки. Перед каждой попыткой сопоставления
+     * достаточно очистки — route_match мог оставить параметры от неудачной. */
+    hm_init(&req->params, req->arena, 8);
+
     for (int i = 0; i < r->nroutes; i++) {
         Route *rt = &r->routes[i];
         if (strcmp(rt->method, req->method) != 0 &&
             strcmp(rt->method, "*") != 0) continue;
-        hm_init(&req->params, req->arena, 8);
+        hm_clear(&req->params);
         if (route_match(rt->pattern, path, &req->params)) {
             // Middleware: auth check
             App *app = (App *)r->userdata;
@@ -425,6 +432,15 @@ struct HttpServer {
     _Atomic int active_conns; /* in-flight connection threads (bounds fan-out) */
 };
 
+/* Хэш-таблицы запроса держат слоты в heap, а не в арене — arena_destroy их не
+ * заберёт. Освобождаем на КАЖДОМ выходе из handle_conn, иначе утекает на каждом
+ * запросе. Безопасно для необработанного запроса: структура обнулена, а hm_free
+ * терпит пустые слоты. */
+static void http_req_free_maps(HttpReq *req) {
+    hm_free(&req->headers);
+    hm_free(&req->params);
+}
+
 /* Обрабатывает одно соединение целиком (блокирующе): опциональный TLS,
  * чтение запроса до Content-Length, парсинг, мидлвари и отправка ответа.
  * Для WebSocket-апгрейда fd передаётся в App.ws_clients и не закрывается. */
@@ -510,6 +526,7 @@ static void handle_conn(HttpServer *srv, int fd) {
 
     if (parse_request(a, buf, used, &req) < 0) {
         if (tls) tls_conn_destroy(tls);
+        http_req_free_maps(&req);
         free(buf); close(fd); arena_destroy(a); return;
     }
 
@@ -544,6 +561,7 @@ static void handle_conn(HttpServer *srv, int fd) {
             send(fd, hdrs, strlen(hdrs), MSG_NOSIGNAL);
         }
         if (tls) tls_conn_destroy(tls);
+        http_req_free_maps(&req);
         free(buf); arena_destroy(a); close(fd); return;
     }
 
@@ -563,6 +581,7 @@ static void handle_conn(HttpServer *srv, int fd) {
             pthread_mutex_unlock(&ws_app->ws_mu);
         }
         if (tls) tls_conn_destroy(tls);
+        http_req_free_maps(&req);
         free(buf);
         arena_destroy(a);
         /* fd stays open — owned by ws_clients until client disconnects */
@@ -676,6 +695,7 @@ static void handle_conn(HttpServer *srv, int fd) {
     }
 
     free(resp.body_alloc);   /* владелец копии тела (http_resp_json/_text) */
+    http_req_free_maps(&req);
     free(buf);
     arena_destroy(a);
     close(fd);
