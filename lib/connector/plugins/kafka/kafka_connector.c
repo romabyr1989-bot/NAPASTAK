@@ -260,9 +260,15 @@ static void kafka_error_cb(rd_kafka_t *rk, int err, const char *reason, void *op
 
     if (e == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
         atomic_store(&ctx->all_brokers_down, 1);
-        snprintf(ctx->last_err, sizeof(ctx->last_err),
-                 "all brokers down (%s): %s",
-                 ctx->brokers, reason ? reason : "no reachable broker");
+        /* Отказ аутентификации ВЫЗЫВАЕТ обрыв соединения, и ALL_BROKERS_DOWN
+         * приходит следом. Затирать им уже залатченную причину нельзя: первый
+         * признак — первопричина, второй — лишь её следствие. Иначе неверный
+         * пароль снова выглядит как недоступный брокер — ровно то, что латч
+         * auth_failed и был призван устранить. */
+        if (!atomic_load(&ctx->auth_failed))
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "all brokers down (%s): %s",
+                     ctx->brokers, reason ? reason : "no reachable broker");
         LOG_WARN("kafka: all brokers down: %s", reason ? reason : "");
     } else if (e == RD_KAFKA_RESP_ERR__AUTHENTICATION ||
                e == RD_KAFKA_RESP_ERR_SASL_AUTHENTICATION_FAILED) {
@@ -2052,6 +2058,15 @@ static int kafka_ping(void *vctx)
          * error_cb и уже лежит в last_err. Дописываем общий код к ней, а не
          * вместо неё: иначе проба связи покажет невнятный транспортный сбой
          * там, где на деле не сошёлся пароль. */
+        /* error_cb доставляется ТОЛЬКО когда приложение обслуживает очередь, а
+         * rd_kafka_metadata() её не обслуживает. К этому моменту отказ SASL уже
+         * произошёл, но лежит в очереди неразобранным, и last_err ещё пуст —
+         * ветка ниже уходила в else и затирала настоящую причину общим
+         * транспортным кодом. Прокачиваем очередь, пока причина не появится
+         * (не дольше 200 мс: событие уже в очереди, ждать по сети нечего). */
+        for (int i = 0; i < 10 && !ctx->last_err[0]; i++)
+            rd_kafka_poll(ctx->rk, 20);
+
         const char *generic = rd_kafka_err2str(err);
         if (ctx->last_err[0] && strcmp(ctx->last_err, generic) != 0) {
             LOG_WARN("kafka: ping failed: %s — %s", generic, ctx->last_err);
