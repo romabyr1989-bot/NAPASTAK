@@ -434,8 +434,13 @@ static void *sched_loop(void *arg) {
     Scheduler *s = arg;
     LOG_INFO("scheduler started");
     while(s->running) {
-        /* Проверяем расписание каждые 30 секунд — достаточно для minutely-cron. */
-        sleep(30);
+        /* Проверяем расписание каждые 30 секунд — достаточно для minutely-cron.
+         * Спим ломтями по секунде, сверяя running: scheduler_stop делает
+         * безусловный pthread_join, и на цельном sleep(30) завершение гейтвея
+         * ждало пробуждения потока — в среднем 15 с, до 30. Из-за этого
+         * systemctl stop занимал ~24 с, а обновление на месте (install.sh
+         * останавливает сервис перед копированием) выглядело как зависание. */
+        for (int i = 0; i < 30 && s->running; i++) sleep(1);
         if(!s->running) break;
         int64_t now = (int64_t)time(NULL);
         pthread_mutex_lock(&s->mu);

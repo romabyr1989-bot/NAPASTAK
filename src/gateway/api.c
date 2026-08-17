@@ -5503,8 +5503,13 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
      * commit the topic's offsets and the next read 0 already-consumed messages
      * with a silent green success (S18). An explicit group_id still wins. */
     const char *load_cfg = eff_cfg;
+    /* Написание проверяем во всех формах, которые принимает cfg_get коннектора:
+     * "group.id" ловит и "kafka.group.id". Проверка одного snake_case означала,
+     * что явный "group.id" оператора здесь не виден, мы подставляли свой
+     * group_id — а он при конфликте побеждает — и значение оператора молча
+     * перебивалось вместе с семантикой офсетов. */
     if (!strcmp(conn, "kafka") && eff_cfg[0]
-        && !strstr(eff_cfg, "group_id")) {
+        && !strstr(eff_cfg, "group_id") && !strstr(eff_cfg, "group.id")) {
         const char *cc = eff_cfg;
         const char *close = strrchr(cc, '}');
         if (close) {
@@ -8747,6 +8752,39 @@ static void h_cluster_status(HttpReq *req, HttpResp *resp) {
 
 /* Ключи конфига, значения которых нельзя отдавать в UI открытым текстом
  * (см. схемы плагинов в каталоге lib/connector/plugins). */
+/* Kafka-коннектор принимает одно свойство в трёх написаниях: snake_case,
+ * точечное имя librdkafka и его же с префиксом "kafka." (см. cfg_get в
+ * kafka_connector.c). Приводим к канону: срезаем префикс, точки →
+ * подчёркивания. Пустой результат означает, что канонизировать нечего. */
+static void conn_key_canon(const char *k, char *out, size_t outsz) {
+    out[0] = '\0';
+    if (!k || !outsz) return;
+    const char *src = (strncmp(k, "kafka.", 6) == 0) ? k + 6 : k;
+    size_t n = strlen(src);
+    if (n >= outsz) n = outsz - 1;
+    for (size_t i = 0; i < n; i++) out[i] = (src[i] == '.') ? '_' : src[i];
+    out[n] = '\0';
+}
+
+/* Ищет значение в конфиге, сравнивая ключи по канону, а не побайтово. Нужно
+ * там, где присланный ключ и сохранённый могут быть в разных написаниях одного
+ * свойства: точное сравнение промахивалось, и вызывающий считал, что поля в
+ * прежней записи нет. */
+static JVal *conn_cfg_get_canon(JVal *cfg, const char *k) {
+    if (!cfg || cfg->type != JV_OBJECT || !k) return NULL;
+    JVal *exact = json_get(cfg, k);
+    if (exact) return exact;
+
+    char want[128], have[128];
+    conn_key_canon(k, want, sizeof want);
+    if (!want[0]) return NULL;
+    for (size_t i = 0; i < cfg->nkeys; i++) {
+        conn_key_canon(cfg->keys[i], have, sizeof have);
+        if (!strcmp(want, have)) return cfg->vals[i];
+    }
+    return NULL;
+}
+
 static bool conn_key_is_secret(const char *k) {
     static const char *SECRETS[] = {
         "password", "siebel_password", "auth_token", "sasl_password",
@@ -8755,18 +8793,11 @@ static bool conn_key_is_secret(const char *k) {
     };
     if (!k) return false;
 
-    /* Kafka-коннектор принимает одно свойство в трёх написаниях: snake_case,
-     * точечное имя librdkafka и его же с префиксом "kafka." (см. cfg_get в
-     * kafka_connector.c). Сравнение строго по snake_case означало, что пароль,
-     * записанный как "kafka.sasl.password", коннектор подхватывает и всё
-     * работает, а маскирование считает ключ несекретным и отдаёт значение
-     * открытым текстом. Приводим к канону: срезаем префикс, точки → подчёркивания. */
+    /* Сравнение строго по snake_case означало, что пароль, записанный как
+     * "kafka.sasl.password", коннектор подхватывает и всё работает, а
+     * маскирование считает ключ несекретным и отдаёт значение открытым текстом. */
     char canon[128];
-    const char *src = (strncmp(k, "kafka.", 6) == 0) ? k + 6 : k;
-    size_t n = strlen(src);
-    if (n >= sizeof(canon)) n = sizeof(canon) - 1;
-    for (size_t i = 0; i < n; i++) canon[i] = (src[i] == '.') ? '_' : src[i];
-    canon[n] = '\0';
+    conn_key_canon(k, canon, sizeof canon);
 
     for (int i = 0; SECRETS[i]; i++)
         if (!strcmp(k, SECRETS[i]) || !strcmp(canon, SECRETS[i])) return true;
@@ -8844,7 +8875,13 @@ static void conn_write_config_merged(JBuf *jb, JVal *incoming, JVal *stored_cfg)
             if (conn_key_is_secret(k)) {
                 const char *s = (v && v->type == JV_STRING) ? v->s : "";
                 if (!s[0] || !strcmp(s, CONN_SECRET_MASK)) {
-                    JVal *old = stored_cfg ? json_get(stored_cfg, k) : NULL;
+                    /* Поиск по канону, а не по точному ключу. Конфиг, заведённый
+                     * в точечном написании ("sasl.password"), UI канонизирует и
+                     * присылает как "sasl_password" с маской: точное сравнение
+                     * промахивалось, и вместо сохранённого пароля записывалась
+                     * пустая строка — то есть любое сохранение формы молча
+                     * стирало пароль. */
+                    JVal *old = conn_cfg_get_canon(stored_cfg, k);
                     const char *os = (old && old->type == JV_STRING) ? old->s : "";
                     jb_str(jb, os);
                     continue;

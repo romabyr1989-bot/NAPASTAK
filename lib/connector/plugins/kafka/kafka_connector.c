@@ -502,8 +502,13 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
      *   - проверка соответствия имени хоста (endpoint.identification=https) —
      *     защита от MITM с валидным, но чужим сертификатом. */
     if (strstr(ctx->security_protocol, "SSL")) {
-        rd_kafka_conf_set(conf, "enable.ssl.certificate.verification", "true", errstr, errlen);
-        rd_kafka_conf_set(conf, "ssl.endpoint.identification.algorithm", "https", errstr, errlen);
+        /* Через kset_sec, а не rd_kafka_conf_set: отказ librdkafka по этим двум
+         * свойствам молча оставлял бы соединение БЕЗ проверки сертификата и без
+         * проверки имени хоста — то есть открытым для MITM с чужим валидным
+         * сертификатом. Лучше отказаться создавать клиент, чем работать
+         * незащищённо; причина уйдёт в last_err с builtin.features. */
+        kset_sec(conf, ctx, "enable.ssl.certificate.verification", "true", errstr, errlen);
+        kset_sec(conf, ctx, "ssl.endpoint.identification.algorithm", "https", errstr, errlen);
     }
 
     /* Доверенные корни брокера. Приоритет — у явного truststore (.p12/.pfx с
@@ -547,21 +552,25 @@ static void kafka_apply_tls(rd_kafka_conf_t *conf, KafkaCtx *ctx,
                      "создавать клиент");
         LOG_INFO("kafka: клиентский сертификат в формате PKCS#12 (keystore)");
     } else {
+        /* Тоже через kset_sec: раздельный PEM/DER-путь оставался единственным,
+         * где отказ librdkafka не поднимал cfg_invalid, и mTLS падал позже, на
+         * рукопожатии, с невнятной транспортной ошибкой вместо причины.
+         * Для ssl.key.password kset_sec заодно не печатает значение в last_err. */
         if (ctx->ssl_certificate_location[0]) {
             const char *cert = ctx->ssl_certificate_location;
             if (!kafka_pem_file(cert))
                 cert = kafka_der_cert_to_pem(cert, ctx->ssl_tmp_cert, sizeof ctx->ssl_tmp_cert);
-            rd_kafka_conf_set(conf, "ssl.certificate.location", cert, errstr, errlen);
+            kset_sec(conf, ctx, "ssl.certificate.location", cert, errstr, errlen);
         }
         if (ctx->ssl_key_location[0]) {
             if (kafka_pem_file(ctx->ssl_key_location))
-                rd_kafka_conf_set(conf, "ssl.key.location", ctx->ssl_key_location, errstr, errlen);
+                kset_sec(conf, ctx, "ssl.key.location", ctx->ssl_key_location, errstr, errlen);
             else
                 /* DER-ключ → in-memory PEM (ssl.key.pem), без записи на диск */
                 kafka_der_key_to_conf(conf, ctx->ssl_key_location, errstr, errlen);
         }
         if (ctx->ssl_key_password[0])
-            rd_kafka_conf_set(conf, "ssl.key.password", ctx->ssl_key_password, errstr, errlen);
+            kset_sec(conf, ctx, "ssl.key.password", ctx->ssl_key_password, errstr, errlen);
     }
 }
 

@@ -307,12 +307,16 @@ static void *conn_ticker_loop(void *arg) {
 static void conn_ticker_stop(void) {
     if (!g_conn_ticker_run) return;
     g_conn_ticker_run = 0;
-    for (int i = 0; i < 60; i++) {          /* до ~6 секунд */
-        if (pthread_kill(g_conn_ticker, 0) != 0) return;   /* поток уже вышел */
-        struct timespec ts = { 0, 100 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-    }
-    LOG_WARN("поток обслуживания подключений не завершился за 6 с — не ждём дальше");
+    /* Ждём настоящим join с крайним сроком. Прежняя проба живости через
+     * pthread_kill(tid, 0) не работала: у незаджойненного потока TID остаётся
+     * валидным и после выхода из функции, поэтому она всегда возвращала 0,
+     * цикл каждый раз выкручивал все 6 с и печатал предупреждение даже когда
+     * поток завершился мгновенно. Заодно поток теперь пожинается, а не течёт. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 6;
+    if (pthread_timedjoin_np(g_conn_ticker, NULL, &ts) != 0)
+        LOG_WARN("поток обслуживания подключений не завершился за 6 с — не ждём дальше");
 }
 
 /* Инициализация приложения: дефолты, разбор JSON-конфига, создание всех

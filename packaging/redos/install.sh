@@ -27,6 +27,16 @@ fi
 if ls "$SRC"/lib/oracle_connector.so >/dev/null 2>&1 && ! ls "$SRC"/lib/deps/libclntsh.so* >/dev/null 2>&1; then
   echo "  i Oracle: для подключения установите Oracle Instant Client (libclntsh.so) — см. README"
 fi
+# Kafka + SASL/GSSAPI (Kerberos): librdkafka реализует SCRAM и PLAIN сама, а
+# GSSAPI отдаёт libsasl2, которая грузит механизм ПЛАГИНОМ из /usr/lib64/sasl2.
+# Вложить его в бандл нельзя осмысленно: плагин привязан к версии libsasl2, а
+# Kerberos всё равно требует /etc/krb5.conf, realm и keytab на самом сервере.
+# Поэтому — как с Oracle: предупреждаем, ставится отдельно. SCRAM не затронут.
+if ls "$SRC"/lib/kafka_connector.so >/dev/null 2>&1 \
+   && ! ls /usr/lib64/sasl2/libgssapiv2.so* /usr/lib/sasl2/libgssapiv2.so* >/dev/null 2>&1; then
+  echo "  i Kafka: для SASL/GSSAPI (Kerberos) установите cyrus-sasl-gssapi — см. README → Kerberos"
+  echo "    (SCRAM-SHA-256/512 и PLAIN работают без него)"
+fi
 
 echo "==> Системный пользователь $SVC_USER"
 getent group  "$SVC_USER" >/dev/null || groupadd --system "$SVC_USER"
