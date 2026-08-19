@@ -402,15 +402,65 @@ static void kafka_warn_scram_nonce(const KafkaCtx *ctx)
              rd_kafka_version_str());
 }
 
+/* Невидимые символы в UTF-8, которые regularly попадают в пароль при вставке из
+ * почты, Word или вики. isspace() их не видит — он работает с одним байтом, а
+ * это двух- и трёхбайтовые последовательности. Для SCRAM любой лишний байт
+ * означает другой пароль, а брокер отвечает обезличенным «invalid credentials».
+ * Возвращает человекочитаемое имя найденного символа либо NULL. */
+static const char *kafka_invisible_at(const unsigned char *p, size_t left)
+{
+    if (left >= 2 && p[0] == 0xC2) {
+        if (p[1] == 0xA0) return "неразрывный пробел (U+00A0)";
+        if (p[1] == 0xAD) return "мягкий перенос (U+00AD)";
+    }
+    if (left >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
+        return "метка порядка байтов BOM (U+FEFF)";
+    if (left >= 3 && p[0] == 0xE2 && p[1] == 0x80) {
+        if (p[2] == 0x8B) return "нулевой пробел (U+200B)";
+        if (p[2] == 0x8C) return "非-соединитель (U+200C)";
+        if (p[2] == 0x8D) return "соединитель (U+200D)";
+        if (p[2] == 0x89) return "узкий пробел (U+2009)";
+        if (p[2] == 0xAF) return "узкий неразрывный пробел (U+202F)";
+        if (p[2] >= 0x80 && p[2] <= 0x8A) return "типографский пробел (U+2000..U+200A)";
+    }
+    if (left >= 3 && p[0] == 0xE3 && p[1] == 0x80 && p[2] == 0x80)
+        return "идеографический пробел (U+3000)";
+    return NULL;
+}
+
 static void kafka_warn_edge_space(const char *name, const char *val)
 {
     if (!val || !val[0]) return;
     size_t n = strlen(val);
-    unsigned char first = (unsigned char)val[0], last = (unsigned char)val[n - 1];
-    if (isspace(first) || isspace(last))
+    const unsigned char *u = (const unsigned char *)val;
+
+    /* Однобайтовые: пробел, табуляция, перевод строки. */
+    if (isspace(u[0]) || isspace(u[n - 1])) {
         LOG_WARN("kafka: %s содержит пробельные символы по краям (длина %zu) — "
                  "брокер отвергнет их как неверные учётные данные; "
                  "проверьте, не попал ли перевод строки при вставке", name, n);
+        return;
+    }
+
+    /* Многобайтовые невидимки в начале. */
+    const char *what = kafka_invisible_at(u, n);
+    if (what) {
+        LOG_WARN("kafka: %s начинается с невидимого символа — %s (длина %zu байт). "
+                 "Для SCRAM это другой пароль; брокер ответит «invalid credentials». "
+                 "Обычно попадает при вставке из почты или вики", name, what, n);
+        return;
+    }
+    /* И в конце: проверяем последние 3 байта как возможное начало последовательности. */
+    for (size_t back = 2; back <= 3; back++) {
+        if (n < back) continue;
+        what = kafka_invisible_at(u + n - back, back);
+        if (what) {
+            LOG_WARN("kafka: %s заканчивается невидимым символом — %s (длина %zu байт). "
+                     "Для SCRAM это другой пароль; брокер ответит «invalid credentials». "
+                     "Обычно попадает при вставке из почты или вики", name, what, n);
+            return;
+        }
+    }
 }
 
 static void kset_sec(rd_kafka_conf_t *conf, KafkaCtx *ctx, const char *key,

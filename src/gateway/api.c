@@ -5098,7 +5098,19 @@ static bool conn_val_is_mask(JVal *v) {
     return v && v->type == JV_STRING && !strcmp(v->s, CONN_SECRET_MASK);
 }
 
-static const char *conn_merge_config(Arena *a, JVal *base, JVal *over) {
+/* Слияние «подключение из справочника + переопределения». Переопределения
+ * побеждают, маска сверху означает «значение не присылали».
+ *
+ * from_directory=true — когда база пришла из справочника подключений. В этом
+ * случае СЕКРЕТЫ из переопределений игнорируются: справочник объявлен
+ * источником истины для учётных данных. Без этого забытый в шаге sasl_password
+ * молча побеждал правильный из справочника, а в форме его не видно вовсе —
+ * оператор менял пароль в подключении, прогон продолжал падать, и понять
+ * причину было нечем. Ровно тот же обезличенный «invalid credentials» от
+ * брокера. Отброшенные ключи пишем в лог: молчаливое игнорирование не лучше
+ * молчаливого перекрытия. */
+static const char *conn_merge_config_ex(Arena *a, JVal *base, JVal *over,
+                                        bool from_directory, const char *whose) {
     if (base && base->type != JV_OBJECT) base = NULL;
     if (over && over->type != JV_OBJECT) over = NULL;
 
@@ -5107,8 +5119,8 @@ static const char *conn_merge_config(Arena *a, JVal *base, JVal *over) {
     if (base) {
         for (size_t i = 0; i < base->nkeys; i++) {
             JVal *ov = over ? json_get(over, base->keys[i]) : NULL;
-            /* Маска сверху = «значение не присылали»: оставляем базовое. */
-            if (ov && !conn_val_is_mask(ov)) continue;
+            if (ov && !conn_val_is_mask(ov)
+                   && !(from_directory && conn_key_is_secret(base->keys[i]))) continue;
             jb_key(&jb, base->keys[i]);
             jval_serialize(&jb, base->vals[i]);
         }
@@ -5116,12 +5128,26 @@ static const char *conn_merge_config(Arena *a, JVal *base, JVal *over) {
     if (over) {
         for (size_t i = 0; i < over->nkeys; i++) {
             if (conn_val_is_mask(over->vals[i])) continue;   /* маска — не значение */
+            if (from_directory && conn_key_is_secret(over->keys[i])) {
+                LOG_WARN("%s: ключ '%s' задан прямо в шаге и ИГНОРИРУЕТСЯ — "
+                         "учётные данные берутся из подключения '%s'. Уберите его "
+                         "из шага: в форме он не отображается, а прежде молча "
+                         "перекрывал пароль из справочника",
+                         whose ? whose : "конфиг", over->keys[i],
+                         whose ? whose : "");
+                continue;
+            }
             jb_key(&jb, over->keys[i]);
             jval_serialize(&jb, over->vals[i]);
         }
     }
     jb_obj_end(&jb);
     return jb_done(&jb);
+}
+
+/* Совместимость: слияние без справочника (секреты в переопределениях законны). */
+static const char *conn_merge_config(Arena *a, JVal *base, JVal *over) {
+    return conn_merge_config_ex(a, base, over, false, NULL);
 }
 
 /* Коннектор на время шага. Для подключения из справочника это АРЕНДА постоянной
@@ -5216,7 +5242,10 @@ static int step_effective_connector(App *app, Arena *a, const PipelineStep *st,
     JVal *over = st->connector_config[0]
                ? json_parse(a, st->connector_config, strlen(st->connector_config))
                : NULL;
-    *out_cfg = conn_merge_config(a, json_get(rec, "config"), over);
+    /* from_directory=true: шаг ссылается на подключение из справочника, значит
+     * учётные данные берём только оттуда. */
+    *out_cfg = conn_merge_config_ex(a, json_get(rec, "config"), over,
+                                    true, st->connection_id);
     return 0;
 }
 
@@ -8037,7 +8066,9 @@ static int probe_effective(Arena *a, JVal *root, const char **out_type,
         const char *t = json_str(json_get(rec, "type"), "");
         if (!t[0]) { *err = "у подключения не задан тип коннектора"; return -1; }
         *out_type = t;
-        *out_cfg  = conn_merge_config(a, json_get(rec, "config"), cfg_v);
+        /* Те же правила, что в прогоне: иначе проба проверяет один конфиг, а
+         * шаг выполняется с другим, и «зелёная проба» ничего не гарантирует. */
+        *out_cfg  = conn_merge_config_ex(a, json_get(rec, "config"), cfg_v, true, cid);
         return 0;
     }
 
