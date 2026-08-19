@@ -4493,6 +4493,9 @@ static void h_ingest_parquet(HttpReq *req, HttpResp *resp) {
  * "********". connector_config хранится СТРОКОЙ с JSON внутри, поэтому её
  * приходится разбирать отдельно от самого конвейера. */
 static bool conn_key_is_secret(const char *k);
+static bool conn_key_is_safe(const char *k);
+static void conn_key_canon(const char *k, char *out, size_t outsz);
+static bool conn_val_is_mask(JVal *v);
 static JVal *conn_cfg_get_canon(JVal *cfg, const char *k);
 static void conn_write_config_masked(JBuf *jb, JVal *cfg);
 static void conn_write_config_merged(JBuf *jb, JVal *incoming, JVal *stored_cfg);
@@ -5110,6 +5113,41 @@ static bool conn_val_is_mask(JVal *v) {
  * причину было нечем. Ровно тот же обезличенный «invalid credentials» от
  * брокера. Отброшенные ключи пишем в лог: молчаливое игнорирование не лучше
  * молчаливого перекрытия. */
+/* Есть ли в конфиге СВОЙ секрет (не маска). Если вызывающий прислал пароль, он
+ * его знает — подставлять чужой из справочника не нужно, а значит и запрещать
+ * ему выбирать адрес незачем: утечь нечему. */
+static bool cfg_has_own_secret(JVal *cfg) {
+    if (!cfg || cfg->type != JV_OBJECT) return false;
+    for (size_t i = 0; i < cfg->nkeys; i++) {
+        if (!conn_key_is_secret(cfg->keys[i])) continue;
+        JVal *v = cfg->vals[i];
+        if (v && v->type == JV_STRING && v->s[0] && !conn_val_is_mask(v)) return true;
+    }
+    return false;
+}
+
+/* Ключи, задающие КУДА мы идём и КАК представляемся. Когда сервер подставляет
+ * секрет из справочника, эти ключи обязаны браться оттуда же — иначе тот, кто
+ * пароля не знает, заставит шлюз отправить его на чужой адрес и открытым
+ * текстом (достаточно переопределить brokers и понизить security_protocol до
+ * PLAIN). Ограничение действует ТОЛЬКО при подстановке секрета: конфиг со
+ * своими учётными данными переопределяет что угодно, как и раньше. */
+static bool conn_key_is_destination(const char *k) {
+    static const char *DEST[] = {
+        "brokers", "bootstrap_servers", "security_protocol", "sasl_mechanism",
+        "sasl_username", "ssl_ca_location", "ssl_keystore_location",
+        "ssl_truststore_location", "ssl_certificate_location", "ssl_key_location",
+        "host", "port", "dsn", "url", "siebel_url", "schema_registry_url",
+        "endpoint", "server", NULL
+    };
+    if (!k) return false;
+    char canon[128];
+    conn_key_canon(k, canon, sizeof canon);
+    for (int i = 0; DEST[i]; i++)
+        if (!strcmp(k, DEST[i]) || !strcmp(canon, DEST[i])) return true;
+    return false;
+}
+
 static const char *conn_merge_config_ex(Arena *a, JVal *base, JVal *over,
                                         bool from_directory, const char *whose) {
     if (base && base->type != JV_OBJECT) base = NULL;
@@ -5121,14 +5159,32 @@ static const char *conn_merge_config_ex(Arena *a, JVal *base, JVal *over,
         for (size_t i = 0; i < base->nkeys; i++) {
             JVal *ov = over ? json_get(over, base->keys[i]) : NULL;
             if (ov && !conn_val_is_mask(ov)
-                   && !(from_directory && conn_key_is_secret(base->keys[i]))) continue;
+                   && !(from_directory && (conn_key_is_secret(base->keys[i])
+                                        || conn_key_is_destination(base->keys[i])))) continue;
             jb_key(&jb, base->keys[i]);
             jval_serialize(&jb, base->vals[i]);
         }
     }
     if (over) {
         for (size_t i = 0; i < over->nkeys; i++) {
+            /* jb_key имена ключей НЕ экранирует (см. lib/core/json.c) — ключ с
+             * кавычкой сломал бы итоговый JSON, коннектор не разобрал бы его и
+             * молча ушёл на запасной сканер. conn_save такие ключи отсеивает,
+             * но конфиг шага сюда приходит и другими путями. */
+            if (!conn_key_is_safe(over->keys[i])) {
+                LOG_WARN("%s: ключ с недопустимым именем пропущен",
+                         whose ? whose : "конфиг");
+                continue;
+            }
             if (conn_val_is_mask(over->vals[i])) continue;   /* маска — не значение */
+            if (from_directory && conn_key_is_destination(over->keys[i])) {
+                LOG_WARN("%s: ключ '%s' задаёт адрес или способ аутентификации и "
+                         "ИГНОРИРУЕТСЯ — при использовании подключения из "
+                         "справочника они берутся только оттуда. Иначе пароль "
+                         "подключения ушёл бы на подменённый адрес",
+                         whose ? whose : "конфиг", over->keys[i]);
+                continue;
+            }
             if (from_directory && conn_key_is_secret(over->keys[i])) {
                 /* Отбрасываем ТОЛЬКО если в справочнике есть чем заменить.
                  * Иначе конфигурация, где пароль намеренно живёт в шаге, а не в
@@ -8081,9 +8137,15 @@ static int probe_effective(Arena *a, JVal *root, const char **out_type,
         const char *t = json_str(json_get(rec, "type"), "");
         if (!t[0]) { *err = "у подключения не задан тип коннектора"; return -1; }
         *out_type = t;
-        /* Те же правила, что в прогоне: иначе проба проверяет один конфиг, а
-         * шаг выполняется с другим, и «зелёная проба» ничего не гарантирует. */
-        *out_cfg  = conn_merge_config_ex(a, json_get(rec, "config"), cfg_v, true, cid);
+        /* Подставляем из справочника ТОЛЬКО когда вызывающий не прислал своего
+         * секрета. Редактор подключения — это тот же виртуальный «шаг», и он
+         * всегда шлёт connection_id редактируемой записи: считая его признаком
+         * «база из справочника» безусловно, мы проверяли бы СОХРАНЁННЫЙ пароль
+         * вместо только что введённого — оператор не смог бы проверить новый.
+         * А если свой секрет прислан, подставлять нечего, и запрещать выбор
+         * адреса незачем: утечь нечему. */
+        bool own = cfg_has_own_secret(cfg_v);
+        *out_cfg  = conn_merge_config_ex(a, json_get(rec, "config"), cfg_v, !own, cid);
         return 0;
     }
 

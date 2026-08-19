@@ -82,7 +82,7 @@ else
   ls "$SRC"/lib/pg_connector.so "$SRC"/lib/gp_connector.so >/dev/null 2>&1 && \
     { dnf -y install libpq >/dev/null 2>&1 || echo "  ! libpq не установлен (нужен для PG/Greenplum)"; }
   ls "$SRC"/lib/kafka_connector.so >/dev/null 2>&1 && \
-    { dnf -y install epel-release >/dev/null 2>&1
+    { dnf -y install epel-release >/dev/null 2>&1 || true   # нет EPEL — не повод падать
       if dnf -y install librdkafka >/dev/null 2>&1; then
         # В EPEL/RedOS 8 лежит 1.6.1 — она НЕСОВМЕСТИМА со SCRAM на брокерах
         # Kafka 4.0+ и Confluent Platform 8.0+ (дефект nonce #4895). Ставим, но

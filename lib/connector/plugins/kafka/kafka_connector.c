@@ -417,7 +417,7 @@ static const char *kafka_invisible_at(const unsigned char *p, size_t left)
         return "метка порядка байтов BOM (U+FEFF)";
     if (left >= 3 && p[0] == 0xE2 && p[1] == 0x80) {
         if (p[2] == 0x8B) return "нулевой пробел (U+200B)";
-        if (p[2] == 0x8C) return "非-соединитель (U+200C)";
+        if (p[2] == 0x8C) return "несоединитель (U+200C)";
         if (p[2] == 0x8D) return "соединитель (U+200D)";
         if (p[2] == 0x89) return "узкий пробел (U+2009)";
         if (p[2] == 0xAF) return "узкий неразрывный пробел (U+202F)";
