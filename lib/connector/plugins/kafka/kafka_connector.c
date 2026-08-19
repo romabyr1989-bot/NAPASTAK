@@ -284,6 +284,21 @@ static void kafka_error_cb(rd_kafka_t *rk, int err, const char *reason, void *op
                  ctx->sasl_username[0]  ? ctx->sasl_username  : "<не задан>",
                  reason ? reason : rd_kafka_err2str(e));
         LOG_ERROR("kafka: %s", ctx->last_err);
+        /* Брокер отвечает одинаковым «invalid credentials» на четыре разные
+         * причины, и по тексту их не различить. Перечисляем их один раз рядом
+         * с ошибкой, иначе разбор упирается в перебор вслепую. Особенно первая:
+         * учётные данные SCRAM в Kafka хранятся ОТДЕЛЬНО для каждого механизма,
+         * и пользователь, заведённый только с SCRAM-SHA-256, при подключении по
+         * SHA-512 получает ровно это сообщение. */
+        LOG_ERROR("kafka: возможные причины (сообщение брокера одинаково для всех): "
+                  "1) у пользователя '%s' на брокере нет учётных данных для "
+                  "механизма %s — проверьте: kafka-configs.sh --describe "
+                  "--entity-type users --entity-name %s; "
+                  "2) пробельные символы по краям логина или пароля; "
+                  "3) неверный пароль; 4) не тот пользователь.",
+                  ctx->sasl_username[0] ? ctx->sasl_username : "<не задан>",
+                  ctx->sasl_mechanism[0] ? ctx->sasl_mechanism : "<не задан>",
+                  ctx->sasl_username[0] ? ctx->sasl_username : "<user>");
     } else {
         LOG_WARN("kafka: error_cb [%s]: %s",
                  rd_kafka_err2name(e), reason ? reason : "");
@@ -362,6 +377,20 @@ static const char *kafka_der_cert_to_pem(const char *der_path, char *slot, size_
 static bool kafka_secret_key(const char *key)
 {
     return strstr(key, "password") != NULL;
+}
+
+/* Предупреждает о пробельных символах по краям значения. Их не видно ни в
+ * форме, ни в логе, а брокер отвергает такие учётные данные с тем же текстом,
+ * что и настоящую опечатку — различить без подсказки невозможно. */
+static void kafka_warn_edge_space(const char *name, const char *val)
+{
+    if (!val || !val[0]) return;
+    size_t n = strlen(val);
+    unsigned char first = (unsigned char)val[0], last = (unsigned char)val[n - 1];
+    if (isspace(first) || isspace(last))
+        LOG_WARN("kafka: %s содержит пробельные символы по краям (длина %zu) — "
+                 "брокер отвергнет их как неверные учётные данные; "
+                 "проверьте, не попал ли перевод строки при вставке", name, n);
 }
 
 static void kset_sec(rd_kafka_conf_t *conf, KafkaCtx *ctx, const char *key,
@@ -1336,6 +1365,16 @@ static void *kafka_create(const char *config_json, Arena *arena)
                  ctx->security_protocol[0] ? ctx->security_protocol : "PLAINTEXT",
                  ctx->sasl_mechanism[0]    ? ctx->sasl_mechanism    : "<не задан>",
                  ctx->sasl_username[0]     ? ctx->sasl_username     : "<не задан>");
+
+    /* Пробелы по краям логина или пароля брокер отвергает как неверные учётные
+     * данные, а в форме их не видно — при вставке из почты или таблицы туда
+     * regularly попадает хвостовой перевод строки. Сообщение брокера при этом
+     * ровно то же, что при настоящей опечатке, поэтому предупреждаем отдельно.
+     * Значения НЕ печатаем: пароль уходит и в лог, и в UI. */
+    kafka_warn_edge_space("sasl_username", ctx->sasl_username);
+    kafka_warn_edge_space("sasl_password", ctx->sasl_password);
+    kafka_warn_edge_space("ssl_keystore_password", ctx->ssl_keystore_password);
+    kafka_warn_edge_space("ssl_truststore_password", ctx->ssl_truststore_password);
 
     /* НЕ подписываемся на consumer-группу при создании: разовое чтение
      * (read_batch/describe) идёт через assign партиций и в группу не вступает,
