@@ -4493,6 +4493,7 @@ static void h_ingest_parquet(HttpReq *req, HttpResp *resp) {
  * "********". connector_config хранится СТРОКОЙ с JSON внутри, поэтому её
  * приходится разбирать отдельно от самого конвейера. */
 static bool conn_key_is_secret(const char *k);
+static JVal *conn_cfg_get_canon(JVal *cfg, const char *k);
 static void conn_write_config_masked(JBuf *jb, JVal *cfg);
 static void conn_write_config_merged(JBuf *jb, JVal *incoming, JVal *stored_cfg);
 static void jval_serialize(JBuf *jb, JVal *v);
@@ -5129,13 +5130,27 @@ static const char *conn_merge_config_ex(Arena *a, JVal *base, JVal *over,
         for (size_t i = 0; i < over->nkeys; i++) {
             if (conn_val_is_mask(over->vals[i])) continue;   /* маска — не значение */
             if (from_directory && conn_key_is_secret(over->keys[i])) {
-                LOG_WARN("%s: ключ '%s' задан прямо в шаге и ИГНОРИРУЕТСЯ — "
-                         "учётные данные берутся из подключения '%s'. Уберите его "
-                         "из шага: в форме он не отображается, а прежде молча "
-                         "перекрывал пароль из справочника",
+                /* Отбрасываем ТОЛЬКО если в справочнике есть чем заменить.
+                 * Иначе конфигурация, где пароль намеренно живёт в шаге, а не в
+                 * подключении, после обновления осталась бы вовсе без пароля —
+                 * «sasl.username and sasl.password must be set». Чинить одну
+                 * ловушку, создавая другую, нельзя. */
+                JVal *have = conn_cfg_get_canon(base, over->keys[i]);
+                const char *hv = (have && have->type == JV_STRING) ? have->s : NULL;
+                if (hv && hv[0]) {
+                    LOG_WARN("%s: ключ '%s' задан прямо в шаге и ИГНОРИРУЕТСЯ — "
+                             "берётся из подключения '%s'. Уберите его из шага: "
+                             "в форме он не отображается, а прежде молча "
+                             "перекрывал пароль из справочника",
+                             whose ? whose : "конфиг", over->keys[i],
+                             whose ? whose : "справочника");
+                    continue;
+                }
+                LOG_WARN("%s: секрет '%s' задан в шаге, а в подключении '%s' его "
+                         "нет — использую значение из шага. Перенесите его в "
+                         "подключение: в форме шага это поле не отображается",
                          whose ? whose : "конфиг", over->keys[i],
-                         whose ? whose : "");
-                continue;
+                         whose ? whose : "справочника");
             }
             jb_key(&jb, over->keys[i]);
             jval_serialize(&jb, over->vals[i]);
