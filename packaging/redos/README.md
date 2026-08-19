@@ -266,6 +266,48 @@ enterprise/банковских кластеров. В форме конвейе
 Проверено end-to-end против MIT KDC + Apache Kafka с SASL/GSSAPI-листенером
 (оба режима: keytab и внешний ccache).
 
+### Kafka: требование к версии librdkafka при SCRAM
+
+**Для брокеров Kafka 4.0+ и Confluent Platform 8.0+ нужна librdkafka не ниже
+2.6.1.** Системный пакет RedOS 8 (`librdkafka-1.6.1`) с ними несовместим по SCRAM.
+
+Причина. librdkafka до 2.6.1 приклеивала клиентский nonce второй раз в
+client-final-message — дефект живёт с версии 0.0.99 (исправление #4895).
+Брокеры Apache Kafka 3.8.1-3.9.x это прощали: сверяли nonce через `endsWith`.
+В Kafka 4.0 вернули строгое `equals` (`ScramSaslServer.java`), и рукопожатие
+отвергается с текстом `Authentication failed ... due to invalid credentials`,
+неотличимым от неверного пароля. Confluent Platform 8.0 построен на Kafka 4.0.
+
+Проверено на стенде, один и тот же пользователь и пароль:
+
+| librdkafka | Confluent 8.0.0 | Apache Kafka 3.9.1 |
+|---|---|---|
+| 1.6.1 | отказ | работает |
+| 2.6.1 | работает | работает |
+
+Коннектор предупреждает об этом в журнале при старте, если механизм SCRAM, а
+библиотека старше 2.6.1.
+
+Замена без переустановки:
+
+```bash
+sudo systemctl stop napastak
+sudo cp /opt/napastak/lib/deps/librdkafka.so.1 /opt/napastak/lib/deps/librdkafka.so.1.bak
+sudo cp librdkafka.so.1 /opt/napastak/lib/deps/
+sudo systemctl start napastak
+journalctl -u napastak | grep "librdkafka"     # должно быть 2.6.1
+```
+
+Собрать самостоятельно (нужен gcc-c++):
+
+```bash
+curl -fsSL https://github.com/confluentinc/librdkafka/archive/refs/tags/v2.6.1.tar.gz | tar xz
+cd librdkafka-2.6.1 && ./configure --prefix=/usr/local --enable-ssl --enable-sasl --enable-zlib
+make -j$(nproc) && sudo make install
+```
+
+PLAIN и GSSAPI дефект не затрагивает — nonce есть только в SCRAM.
+
 ### Kafka: TLS/mTLS — форматы сертификатов
 
 Коннектор Kafka читает сертификаты в разных форматах — формат каждого файла

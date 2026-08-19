@@ -745,6 +745,23 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
     /* Версия транспорта в лог: слинкованная librdkafka зависит от хоста (напр.
      * homebrew 2.14.x vs системная 1.6.1 на RedOS/EL) и определяет поведение
      * негоциации версий API — фиксируем её явно для диагностики стенда. */
+    /* librdkafka до 2.6.1 приклеивала клиентский nonce второй раз в
+     * client-final-message (дефект с версии 0.0.99, исправление #4895). Брокеры
+     * Apache Kafka 3.8.1-3.9.x это прощали — сверяли nonce через endsWith. В
+     * Kafka 4.0 вернули строгое equals (ScramSaslServer.java), и SCRAM с такой
+     * библиотекой падает с «invalid credentials» — текстом, неотличимым от
+     * неверного пароля. Confluent Platform 8.0 построен на Kafka 4.0, там это
+     * воспроизводится всегда. Предупреждаем ДО попытки, иначе разбор уходит в
+     * проверку учётных данных, с которыми всё в порядке. */
+    if (rd_kafka_version() < 0x020601ff &&
+        strncmp(ctx->sasl_mechanism, "SCRAM", 5) == 0)
+        LOG_WARN("kafka: librdkafka %s содержит дефект nonce в SCRAM "
+                 "(исправлен в 2.6.1). Брокеры Kafka 4.0+ и Confluent 8.0+ "
+                 "отвергают такое рукопожатие как «invalid credentials», хотя "
+                 "пароль верный. Если аутентификация не проходит — обновите "
+                 "lib/deps/librdkafka.so.1 до 2.6.1 или новее.",
+                 rd_kafka_version_str());
+
     LOG_INFO("kafka: librdkafka %s (0x%08x), offset_start_mode=%s",
              rd_kafka_version_str(), rd_kafka_version(),
              ctx->offset_start_mode[0] ? ctx->offset_start_mode : "logical");
