@@ -177,6 +177,49 @@ dist: all
 	    | while read -r so; do cp -Lu "$$so" $(DIST_DIR)/lib/deps/ 2>/dev/null || true; done; \
 	  echo "  bundled $$(ls $(DIST_DIR)/lib/deps 2>/dev/null | wc -l | tr -d ' ') runtime .so → lib/deps"; \
 	fi
+	@# librdkafka вкладываем ТУ, С КОТОРОЙ СЛИНКОВАЛИСЬ, а не ту, что нашёл ldd.
+	@# ldd резолвит через кэш компоновщика, где системная /usr/lib64 побеждает
+	@# /usr/local, даже когда сборка шла против свежей из pkg-config. Иначе
+	@# получается сборка, собранная с 2.6.1, но везущая 1.6.1.
+	@if command -v pkg-config >/dev/null 2>&1; then \
+	  rk=$$(PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --variable=libdir rdkafka 2>/dev/null); \
+	  if [ -n "$$rk" ] && [ -f "$$rk/librdkafka.so.1" ] && [ -d $(DIST_DIR)/lib/deps ]; then \
+	    cp -L "$$rk/librdkafka.so.1" $(DIST_DIR)/lib/deps/librdkafka.so.1; \
+	    echo "  librdkafka взята из $$rk (та, с которой слинкованы плагины)"; \
+	  fi; \
+	fi
+	@# Проверка версии librdkafka. Вкладывается то, что ldd нашёл на СБОРОЧНОЙ
+	@# машине, а системный пакет RedOS 8 — 1.6.1. Она несовместима со SCRAM на
+	@# брокерах Kafka 4.0+ и Confluent Platform 8.0+: дефект nonce (#4895,
+	@# исправлен в 2.6.1), а в Kafka 4.0 убрано послабление endsWith. Выпустить
+	@# релиз с 1.6.1 — значит отдать заведомо нерабочую для них сборку, и заметить
+	@# это можно только в бою. Поэтому падаем здесь.
+	@# Версию берём у самой библиотеки через rd_kafka_version(): разбор строк из
+	@# .so недостоверен — в 1.6.1 самая «старшая» версионная строка это 1.2.11.
+	@if [ -f $(DIST_DIR)/lib/deps/librdkafka.so.1 ]; then \
+	  probe=$$(mktemp -d); \
+	  printf '%s\n' '#include <stdio.h>' '#include <dlfcn.h>' \
+	    'int main(int c,char**v){void*h=dlopen(v[1],RTLD_LAZY);if(!h)return 2;' \
+	    'int(*f)(void)=dlsym(h,"rd_kafka_version");if(!f)return 2;' \
+	    'printf("%d\n",f());return 0;}' > $$probe/p.c; \
+	  if $(CC) -o $$probe/p $$probe/p.c -ldl 2>/dev/null \
+	     && v=$$($$probe/p $(DIST_DIR)/lib/deps/librdkafka.so.1 2>/dev/null) && [ -n "$$v" ]; then \
+	    if [ "$$v" -lt 33948159 ]; then \
+	      printf '  !! librdkafka %d.%d.%d в бандле — нужна не ниже 2.6.1.\n' \
+	             $$((v>>24&255)) $$((v>>16&255)) $$((v>>8&255)); \
+	      echo "     1.6.1 ломает SCRAM на Kafka 4.0+ / Confluent 8.0+ (дефект nonce #4895)."; \
+	      echo "     Соберите свежую и повторите с PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:"; \
+	      echo "       curl -fsSL https://github.com/confluentinc/librdkafka/archive/refs/tags/v2.6.1.tar.gz | tar xz"; \
+	      echo "       cd librdkafka-2.6.1 && ./configure --prefix=/usr/local --enable-ssl --enable-sasl --enable-zlib"; \
+	      echo "       make -j$$(nproc) && sudo make install && sudo ldconfig"; \
+	      rm -rf $$probe; exit 1; \
+	    fi; \
+	    printf '  librdkafka %d.%d.%d — ок (>= 2.6.1)\n' $$((v>>24&255)) $$((v>>16&255)) $$((v>>8&255)); \
+	  else \
+	    echo "  ! версию librdkafka определить не удалось — проверьте вручную (нужна >= 2.6.1)"; \
+	  fi; \
+	  rm -rf $$probe; \
+	fi
 	@tar -C $(OUTDIR)/dist -czf $(OUTDIR)/dist/$(DIST_NAME).tar.gz $(DIST_NAME)
 	@echo "  → $(OUTDIR)/dist/$(DIST_NAME).tar.gz"
 

@@ -382,6 +382,26 @@ static bool kafka_secret_key(const char *key)
 /* Предупреждает о пробельных символах по краям значения. Их не видно ни в
  * форме, ни в логе, а брокер отвергает такие учётные данные с тем же текстом,
  * что и настоящую опечатку — различить без подсказки невозможно. */
+/* librdkafka до 2.6.1 приклеивает клиентский nonce второй раз в
+ * client-final-message (дефект с версии 0.0.99, исправление #4895). Брокеры
+ * Apache Kafka 3.8.1-3.9.x это прощали — сверяли nonce через endsWith. В
+ * Kafka 4.0 вернули строгое equals (ScramSaslServer.java), и SCRAM с такой
+ * библиотекой падает с «invalid credentials» — текстом, неотличимым от
+ * неверного пароля. Confluent Platform 8.0 построен на Kafka 4.0.
+ * Предупреждаем ДО попытки: иначе разбор уходит в проверку учётных данных,
+ * с которыми всё в порядке. Зовётся и для источника, и для приёмника. */
+static void kafka_warn_scram_nonce(const KafkaCtx *ctx)
+{
+    if (rd_kafka_version() >= 0x020601ff) return;
+    if (strncmp(ctx->sasl_mechanism, "SCRAM", 5) != 0) return;
+    LOG_WARN("kafka: librdkafka %s содержит дефект nonce в SCRAM "
+             "(исправлен в 2.6.1). Брокеры Kafka 4.0+ и Confluent Platform 8.0+ "
+             "отвергают такое рукопожатие как «invalid credentials», хотя "
+             "пароль верный. Если аутентификация не проходит — обновите "
+             "lib/deps/librdkafka.so.1 до 2.6.1 или новее.",
+             rd_kafka_version_str());
+}
+
 static void kafka_warn_edge_space(const char *name, const char *val)
 {
     if (!val || !val[0]) return;
@@ -753,14 +773,7 @@ static rd_kafka_t *make_consumer(KafkaCtx *ctx, char *errstr, size_t errlen)
      * неверного пароля. Confluent Platform 8.0 построен на Kafka 4.0, там это
      * воспроизводится всегда. Предупреждаем ДО попытки, иначе разбор уходит в
      * проверку учётных данных, с которыми всё в порядке. */
-    if (rd_kafka_version() < 0x020601ff &&
-        strncmp(ctx->sasl_mechanism, "SCRAM", 5) == 0)
-        LOG_WARN("kafka: librdkafka %s содержит дефект nonce в SCRAM "
-                 "(исправлен в 2.6.1). Брокеры Kafka 4.0+ и Confluent 8.0+ "
-                 "отвергают такое рукопожатие как «invalid credentials», хотя "
-                 "пароль верный. Если аутентификация не проходит — обновите "
-                 "lib/deps/librdkafka.so.1 до 2.6.1 или новее.",
-                 rd_kafka_version_str());
+    kafka_warn_scram_nonce(ctx);
 
     LOG_INFO("kafka: librdkafka %s (0x%08x), offset_start_mode=%s",
              rd_kafka_version_str(), rd_kafka_version(),
@@ -2185,6 +2198,11 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
     const char *topic = (entity && entity[0]) ? entity : ctx->topic_name;
     if (!topic || !topic[0]) { LOG_ERROR("kafka sink: no topic"); return -1; }
     if (!ctx->brokers[0])    { LOG_ERROR("kafka sink: no brokers"); return -1; }
+
+    /* Приёмник аутентифицируется так же, как источник — предупреждение о
+     * дефекте nonce нужно и здесь, иначе запись в Kafka по SCRAM падает без
+     * подсказки. */
+    kafka_warn_scram_nonce(ctx);
 
     char errstr[512];
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
