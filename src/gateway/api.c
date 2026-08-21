@@ -5081,6 +5081,7 @@ static const char *connector_so_name(const char *conn) {
     if (!conn) return "";
     if (!strcmp(conn, "postgresql") || !strcmp(conn, "postgres")) return "pg";
     if (!strcmp(conn, "greenplum")) return "gp";
+    if (!strcmp(conn, "sqlserver")) return "mssql";
     return conn;
 }
 
@@ -5238,7 +5239,8 @@ typedef struct {
 static bool connector_keeps_session(const char *type) {
     return !strcmp(type, "postgresql") || !strcmp(type, "postgres")
         || !strcmp(type, "greenplum")  || !strcmp(type, "oracle")
-        || !strcmp(type, "kafka");
+        || !strcmp(type, "kafka")
+        || !strcmp(type, "mssql")      || !strcmp(type, "sqlserver");
 }
 
 static bool step_conn_open(StepConn *sc, const PipelineStep *st, const char *type,
@@ -8925,7 +8927,10 @@ static bool conn_key_is_safe(const char *k) {
 static bool conn_type_is_known(const char *t) {
     static const char *TYPES[] = {
         "csv", "parquet", "json_http", "postgresql", "postgres", "greenplum",
-        "oracle", "kafka", "siebel", "soap", "xml", NULL
+        "oracle", "kafka", "siebel", "soap", "xml",
+        /* MS SQL Server. Принимаем оба написания: "mssql" — как в инвентаре
+         * заказчика (dbtype), "sqlserver" — как называют его в документации. */
+        "mssql", "sqlserver", NULL
     };
     for (int i = 0; TYPES[i]; i++) if (!strcmp(t, TYPES[i])) return true;
     return false;

@@ -66,6 +66,7 @@ GP_PLUGIN      = $(LIBDIR)/gp_connector.so
 ORACLE_PLUGIN  = $(LIBDIR)/oracle_connector.so
 XML_PLUGIN     = $(LIBDIR)/xml_connector.so
 SOAP_PLUGIN    = $(LIBDIR)/soap_connector.so
+MSSQL_PLUGIN   = $(LIBDIR)/mssql_connector.so
 
 # Detect librdkafka
 _RDKAFKA_LOCAL := $(shell test -d /usr/local/opt/librdkafka/include && echo /usr/local/opt/librdkafka)
@@ -79,6 +80,22 @@ else
   KAFKACFLAGS  := $(shell pkg-config --cflags rdkafka 2>/dev/null)
   KAFKALDFLAGS := $(shell pkg-config --libs rdkafka 2>/dev/null)
   HAS_RDKAFKA  := $(if $(KAFKALDFLAGS),yes,no)
+endif
+
+# Detect unixODBC (MS SQL Server через ODBC; конкретный драйвер — FreeTDS из
+# бандла или msodbcsql18, ставится отдельно; см. mssql_connector.c).
+_ODBC_LOCAL := $(shell test -f /usr/local/include/sql.h && echo /usr/local)
+_ODBC_BREW  := $(shell test -f /opt/homebrew/include/sql.h && echo /opt/homebrew)
+_ODBC_SYS   := $(shell test -f /usr/include/sql.h && echo /usr)
+ODBC_PREFIX := $(or $(_ODBC_LOCAL),$(_ODBC_BREW),$(_ODBC_SYS))
+ifneq ($(ODBC_PREFIX),)
+  ODBCCFLAGS  = -I$(ODBC_PREFIX)/include
+  ODBCLDFLAGS = -L$(ODBC_PREFIX)/lib -lodbc
+  HAS_ODBC    = yes
+else
+  ODBCCFLAGS  := $(shell pkg-config --cflags odbc 2>/dev/null)
+  ODBCLDFLAGS := $(shell pkg-config --libs odbc 2>/dev/null)
+  HAS_ODBC    := $(if $(ODBCLDFLAGS),yes,no)
 endif
 
 # Detect libpq — homebrew keg-only or pkg-config
@@ -113,7 +130,7 @@ else
 endif
 
 .PHONY: all clean run test dirs release debug dist \
-        test-integration test-sql test-all bench flight gp oracle
+        test-integration test-sql test-all bench flight gp oracle mssql
 
 # `make` без цели собирает всё (иначе default goal стал бы первый файловый
 # таргет — конвенция-таргет gp, что собирало только один плагин).
@@ -130,11 +147,15 @@ endif
 ifeq ($(HAS_ODPI),yes)
   _ALL_TARGETS += $(ORACLE_PLUGIN)
 endif
+ifeq ($(HAS_ODBC),yes)
+  _ALL_TARGETS += $(MSSQL_PLUGIN)
+endif
 
 # Convenience targets to build a single new connector explicitly:
 #   make gp       — Greenplum plugin (needs libpq)
 #   make oracle   — Oracle plugin    (needs ODPI-C; runtime Instant Client)
 gp:     dirs $(GP_PLUGIN)
+mssql:  dirs $(MSSQL_PLUGIN)
 oracle: dirs $(ORACLE_PLUGIN)
 
 all: $(_ALL_TARGETS)
@@ -365,6 +386,12 @@ $(ORACLE_PLUGIN): lib/connector/plugins/oracle/oracle_connector.c \
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) $(ORACLECFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(ORACLELDFLAGS) \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# MS SQL Server (нужен unixODBC; сам драйвер — FreeTDS или msodbcsql18 в рантайме)
+$(MSSQL_PLUGIN): lib/connector/plugins/mssql/mssql_connector.c \
+                 $(OUTDIR)/lib/core/log.o $(OUTDIR)/lib/core/arena.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) $(ODBCCFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(ODBCLDFLAGS)
 
 # ── Unit tests ──
 TEST_SRCS = $(wildcard tests/unit/*.c)
