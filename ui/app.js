@@ -1455,6 +1455,7 @@ const CONN_REQUEST_KEYS = {
   postgresql: ['read_mode','table','query','cursor_column','cdc_slot','primary_key'],
   greenplum:  ['read_mode','table','query','cursor_column','primary_key'],
   oracle:     ['read_mode','table','query','cursor_column','primary_key'],
+  mssql:      ['read_mode','table','query','cursor_column','primary_key'],
   kafka:      ['topic','group_id','offset_reset','offset_start_mode','isolation_level','data_format'],
   json_http:  ['data_path','post_body','page_param','page_type','page_size','total_field'],
   xml:        ['row_tag','root_tag','data_path','post_body','page_param','page_size'],
@@ -1517,6 +1518,7 @@ const CONN_FIELD_WIDTH = {
     offset_value: 'xs', partition: 'xs',
   },
   oracle:    { schema: 'm' },              /* TSMDM_IN и подобные длиннее */
+  mssql:     { schema: 'm' },
   greenplum: { schema: 'm' },
 };
 
@@ -2282,21 +2284,23 @@ const MATCH_RULES_STARTER =
       metric_function: 'word_similarity', operator: '>=', threshold: 0.80, normalize: 'name' }
   ], null, 2);
 
-const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','kafka','siebel','xml','soap'];
+const CONNECTOR_TYPES = ['csv','parquet','json_http','postgresql','greenplum','oracle','mssql','kafka','siebel','xml','soap'];
 
 /* Human-readable connector list for the unified «Источник» sub-selector. */
 const SOURCE_OPTIONS = [
   ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
+  ['mssql','MS SQL Server'],
   ['kafka','Kafka'], ['json_http','HTTP / REST'], ['soap','SOAP'], ['xml','XML'],
   ['csv','CSV'], ['parquet','Parquet'], ['siebel','Siebel / EIM'],
 ];
 
 /* Connectors that can act as sinks (write_batch in ABI v2). */
-const SINK_TYPES = ['csv','json_http','postgresql','kafka','greenplum','oracle','parquet','siebel','xml','soap'];
+const SINK_TYPES = ['csv','json_http','postgresql','kafka','greenplum','oracle','mssql','parquet','siebel','xml','soap'];
 
 /* Human-readable sink list for the unified «Приёмник» sub-selector. */
 const SINK_OPTIONS = [
   ['postgresql','PostgreSQL'], ['greenplum','Greenplum'], ['oracle','Oracle'],
+  ['mssql','MS SQL Server'],
   ['kafka','Kafka'], ['json_http','HTTP / Webhook'], ['soap','SOAP'], ['xml','XML'],
   ['csv','CSV'], ['parquet','Parquet'], ['siebel','Siebel / EIM'],
 ];
@@ -2495,6 +2499,7 @@ function makeSinkFieldsHTML(step, idx) {
     postgresql: ['Таблица назначения', 'public.export_table'],
     greenplum:  ['Таблица назначения', 'stg_customers'],
     oracle:     ['Таблица назначения', 'ORDERS_EXPORT'],
+    mssql:      ['Таблица назначения', 'dbo.orders_export'],
     kafka:      ['Топик',              'dfo_export'],
   }[step.connector_type] || ['Назначение', ''];
   const mode = step.sink_mode || 'append';
@@ -3393,6 +3398,92 @@ function makeConnectorConfigHTML(step, idx) {
              (pb-steppreview-N) — вторая кнопка здесь давала два одинаковых
              действия и результат появлялся не под нажатой кнопкой. */
           idx === CONN_FORM_IDX ? `
+        <div class="conn-actions" style="display:flex;margin-top:.4rem">
+          <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
+                  onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
+        </div>` : ''}
+      </div>
+      <div id="pb-dbpreview-${idx}" style="margin-top:.75rem"></div>`}
+    </div>`;
+
+  if (type === 'mssql') return `
+    <div class="conn-group">
+      <div class="conn-group-title">Подключение к MS SQL Server</div>
+      <div class="conn-grid">
+        <div style="display:contents">
+          <div class="form-group" style="margin:0">
+            <label>Сервер</label>
+            <input type="text" value="${escAttr(cfg.host || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'host',this.value)" placeholder="sql.prod.internal">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Порт</label>
+            <input type="text" value="${escAttr(cfg.port || '1433')}"
+                   oninput="pbUpdateConnConfig(${idx},'port',this.value)" placeholder="1433">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>База данных</label>
+            <input type="text" value="${escAttr(cfg.database || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'database',this.value)" placeholder="TSMDM">
+          </div>
+        </div>
+        <div style="display:contents">
+          <div class="form-group" style="margin:0">
+            <label>Пользователь</label>
+            <input type="text" value="${escAttr(cfg.user || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'user',this.value)" placeholder="tsmdm_user">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Схема</label>
+            <input type="text" value="${escAttr(cfg.schema || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'schema',this.value)" placeholder="dbo">
+          </div>
+          <div class="form-group" style="margin:0;width:50%;align-self:flex-start">
+            <label>Пароль</label>
+            <input type="password" onfocus="connSecretFocus(this)" onblur="connSecretBlur(this)" value="${escAttr(cfg.password || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'password',this.value)" placeholder="">
+          </div>
+        </div>
+      </div>
+      ${/* Драйвер ODBC — отдельным рядом: по умолчанию FreeTDS из бандла,
+           офлайн-установка работает без доустановок. Кто поставил драйвер
+           Microsoft, пишет сюда «ODBC Driver 18 for SQL Server» — код от этого
+           не меняется. Версию протокола не показываем: auto подходит всем
+           серверам от 7.0 до 2022, а ручной выбор нужен исключительно редко. */''}
+      <div class="conn-grid" style="margin-top:.6rem">
+        <div class="form-group" style="margin:0">
+          <label>Драйвер ODBC</label>
+          <input type="text" value="${escAttr(cfg.odbc_driver || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'odbc_driver',this.value)" placeholder="FreeTDS">
+        </div>
+      </div>
+      <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+        <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
+                style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
+                onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
+      </div>
+      ${step.is_sink ? '' : `
+      <div class="conn-grid" style="margin-top:.6rem">
+        <div class="form-group" style="margin:0">
+          <label>Режим чтения</label>
+          <select onchange="pbUpdateConnConfig(${idx},'read_mode',this.value);if(this.value!=='cursor')pbUpdateConnConfig(${idx},'cursor_column','');pbRerenderStepCfg(${idx})">
+            <option value="full"   ${(cfg.read_mode||'full')==='full' ?'selected':''}>Все строки</option>
+            <option value="cursor" ${cfg.read_mode==='cursor'         ?'selected':''}>Только новые строки</option>
+          </select>
+        </div>
+        ${cfg.read_mode==='cursor' ? `
+        <div class="form-group" style="margin:0;flex:2">
+          <label>Поле-отметка</label>
+          <input type="text" value="${escAttr(cfg.cursor_column || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'cursor_column',this.value)" placeholder="updated_at">
+        </div>` : ''}
+      </div>
+      <div class="form-group" style="margin:.6rem 0 0">
+        <label>Запрос к источнику</label>
+        <textarea class="mono-textarea" rows="3"
+                  placeholder="dbo.clients  либо  SELECT * FROM dbo.clients WHERE updated_at &gt; DATEADD(day,-7,GETDATE())"
+                  oninput="pbUpdateConnConfig(${idx},'table',this.value)">${escHtml(cfg.query || cfg.table || '')}</textarea>
+        ${idx === CONN_FORM_IDX ? `
         <div class="conn-actions" style="display:flex;margin-top:.4rem">
           <button type="button" class="btn btn-sm" style="min-width:150px;justify-content:center"
                   onclick="event.stopPropagation();pbPreviewSource(${idx})">▶ Выполнить</button>
@@ -6215,6 +6306,7 @@ let _mvPage = 0;
 
 const CONN_TYPE_LABELS = {
   postgresql: 'PostgreSQL', greenplum: 'Greenplum', oracle: 'Oracle',
+  mssql: 'MS SQL Server',
   kafka: 'Kafka', csv: 'CSV-файл', parquet: 'Parquet-файл',
   json_http: 'JSON по HTTP', xml: 'XML', soap: 'SOAP', siebel: 'Siebel',
 };

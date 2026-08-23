@@ -191,7 +191,12 @@ static void *ms_create(const char *cfg, Arena *a)
 
     char host[256]="", port[16]="1433", database[128]="", user[128]="", pass[256]="";
     char driver[128]="FreeTDS", dsn[MS_MAX_DSN]="", bsz[16]="8192", enc[16]="";
-    char tdsver[16]="7.4", trust[16]="", charset[32]="UTF-8";
+    /* auto, а не 7.4: 7.4 понимают только 2012+, и на 2008 или 2000 соединение
+     * с жёстко заданной версией просто не встанет. При auto FreeTDS сам
+     * договаривается с сервером о наибольшей общей версии протокола, покрывая
+     * весь ряд от 7.0 (SQL Server 7.0) до 7.4. Кому нужен конкретный диалект —
+     * задаёт tds_version в конфиге явно. */
+    char tdsver[16]="auto", trust[16]="", charset[32]="UTF-8";
 
     cfg_get(cfg, "host",          host,     sizeof(host),     "");
     cfg_get(cfg, "port",          port,     sizeof(port),     "1433");
@@ -202,7 +207,7 @@ static void *ms_create(const char *cfg, Arena *a)
     cfg_get(cfg, "dsn",           dsn,      sizeof(dsn),      "");
     cfg_get(cfg, "batch_size",    bsz,      sizeof(bsz),      "8192");
     cfg_get(cfg, "encrypt",       enc,      sizeof(enc),      "");
-    cfg_get(cfg, "tds_version",   tdsver,   sizeof(tdsver),   "7.4");
+    cfg_get(cfg, "tds_version",   tdsver,   sizeof(tdsver),   "auto");
     cfg_get(cfg, "trust_server_certificate", trust, sizeof(trust), "");
     cfg_get(cfg, "client_charset", charset, sizeof(charset), "UTF-8");
     cfg_get(cfg, "schema",        ctx->schema,        sizeof(ctx->schema),        "dbo");
@@ -280,9 +285,16 @@ static void *ms_create(const char *cfg, Arena *a)
                       raw, sizeof(raw)) == 0)
             ctx->srv_major = atoi(raw);
     }
+    const char *paging = ctx->srv_major >= 11 ? "OFFSET/FETCH"
+                       : ctx->srv_major >= 9  ? "ROW_NUMBER()"
+                                              : "вложенный TOP";
     LOG_INFO("mssql: подключено к %s (мажорная версия %d, драйвер %s, пагинация %s)",
-             host[0] ? host : "dsn", ctx->srv_major, driver,
-             ctx->srv_major >= 11 ? "OFFSET/FETCH" : "ROW_NUMBER()");
+             host[0] ? host : "dsn", ctx->srv_major, driver, paging);
+    if (ctx->srv_major > 0 && ctx->srv_major < 9)
+        LOG_WARN("mssql: сервер версии %d (2000 или старше) — пагинация через "
+                 "вложенный TOP. Она устойчива ТОЛЬКО при уникальной колонке "
+                 "сортировки; на дубликатах страницы могут повторять строки. "
+                 "Задайте cursor_column с уникальным значением.", ctx->srv_major);
     return ctx;
 }
 
@@ -497,16 +509,37 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     } else {
         long long off = cur ? atoll(cur) : 0;
         if (ctx->srv_major >= 11) {
+            /* 2012+ */
             snprintf(sql, sizeof(sql),
                      "SELECT * FROM %s.%s ORDER BY %s "
                      "OFFSET %lld ROWS FETCH NEXT %lld ROWS ONLY",
                      qs, qt, qo, off, (long long)limit);
-        } else {
-            /* 2008 R2 и старше: OFFSET/FETCH нет. */
+        } else if (ctx->srv_major >= 9) {
+            /* 2005-2008 R2: OFFSET/FETCH ещё нет, ROW_NUMBER() уже есть. */
             snprintf(sql, sizeof(sql),
                      "SELECT * FROM (SELECT ROW_NUMBER() OVER (ORDER BY %s) AS _rn, * "
                      "FROM %s.%s) t WHERE t._rn > %lld AND t._rn <= %lld",
                      qo, qs, qt, off, off + (long long)limit);
+        } else {
+            /* 2000 и старше (major 8 и ниже): нет ни OFFSET/FETCH, ни
+             * ROW_NUMBER(). Остаётся вложенный TOP: берём первые off+limit
+             * строк по возрастанию, из них — последние limit по убыванию, и
+             * снова разворачиваем. Дороже предыдущих вариантов, но это
+             * единственный переносимый способ на таких серверах.
+             * ВАЖНО: устойчиво только при УНИКАЛЬНОМ ключе сортировки —
+             * на дубликатах страницы могут повторять строки. Предупреждаем. */
+            if (off == 0) {
+                snprintf(sql, sizeof(sql),
+                         "SELECT TOP %lld * FROM %s.%s ORDER BY %s",
+                         (long long)limit, qs, qt, qo);
+            } else {
+                snprintf(sql, sizeof(sql),
+                         "SELECT * FROM (SELECT TOP %lld * FROM "
+                         "(SELECT TOP %lld * FROM %s.%s ORDER BY %s ASC) AS a "
+                         "ORDER BY %s DESC) AS b ORDER BY %s ASC",
+                         (long long)limit, off + (long long)limit,
+                         qs, qt, qo, qo, qo);
+            }
         }
     }
 
@@ -571,9 +604,13 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
  * Создаёт таблицу при отсутствии и льёт строки. При заданном primary_key
  * запись идемпотентна через MERGE — повторный прогон не плодит дубликаты.
  *
- * Все колонки создаются как NVARCHAR(MAX): значения приходят текстом (см.
- * read_batch), а угадывать типы по содержимому — источник тихих потерь
- * точности. Оператор при необходимости готовит таблицу заранее сам. */
+ * Все колонки создаются текстовыми: значения приходят текстом (см. read_batch),
+ * а угадывать типы по содержимому — источник тихих потерь точности. Оператор
+ * при необходимости готовит таблицу заранее сам.
+ *
+ * Тип зависит от версии: NVARCHAR(MAX) появился в 2005, на 2000 и старше его
+ * нет — там NTEXT. Без этого различия приёмник на старом сервере не смог бы
+ * даже создать таблицу. */
 static int ms_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode)
 {
@@ -591,7 +628,8 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
     if (ncols <= 0) return -1;
     if (ncols > MS_MAX_COLS) ncols = MS_MAX_COLS;
 
-    /* Таблица при отсутствии. NVARCHAR(MAX) — см. комментарий выше. */
+    /* Таблица при отсутствии. Текстовый тип — по версии, см. комментарий выше. */
+    const char *text_type = (ctx->srv_major >= 9) ? "NVARCHAR(MAX)" : "NTEXT";
     char ddl[MS_MAX_SQL];
     int n = snprintf(ddl, sizeof(ddl),
                      "IF OBJECT_ID('%s.%s','U') IS NULL CREATE TABLE %s.%s (",
@@ -599,8 +637,8 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
     for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ddl); c++) {
         char qc[160];
         ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
-        n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, "%s%s NVARCHAR(MAX)",
-                      c ? ", " : "", qc);
+        n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, "%s%s %s",
+                      c ? ", " : "", qc, text_type);
     }
     if (n > 0 && (size_t)n < sizeof(ddl)) snprintf(ddl + n, sizeof(ddl) - (size_t)n, ")");
     if (ms_exec(ctx, ddl) != 0) return -1;
