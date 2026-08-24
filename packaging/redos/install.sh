@@ -100,6 +100,33 @@ fi
 if ls "$SRC"/lib/oracle_connector.so >/dev/null 2>&1 && ! ls "$SRC"/lib/deps/libclntsh.so* >/dev/null 2>&1; then
   echo "  i Oracle: для подключения установите Oracle Instant Client (libclntsh.so) — см. README"
 fi
+# MS SQL: драйвер ODBC. libodbc вкладывается автоматически (коннектор с ней
+# слинкован), а САМ ДРАЙВЕР unixODBC ищет по записи в odbcinst.ini. Если драйвер
+# вложен в бандл — регистрируем его под именем NAPASTAK-FreeTDS, чтобы не
+# конфликтовать с системной записью и не зависеть от того, стоит ли freetds на
+# сервере. Имя по умолчанию в коннекторе — FreeTDS, поэтому регистрируем и его,
+# если такой записи ещё нет.
+if ls "$SRC"/lib/mssql_connector.so >/dev/null 2>&1; then
+  if [ -f "$SRC/lib/deps/libtdsodbc.so" ]; then
+    ODBCINST=/etc/odbcinst.ini
+    touch "$ODBCINST"
+    if ! grep -q "^\[NAPASTAK-FreeTDS\]" "$ODBCINST" 2>/dev/null; then
+      printf '\n[NAPASTAK-FreeTDS]\nDescription = FreeTDS из поставки NAPASTAK\nDriver = %s/lib/deps/libtdsodbc.so\nSetup = %s/lib/deps/libtdsodbc.so\n' \
+             "$PREFIX" "$PREFIX" >> "$ODBCINST"
+      echo "  i MS SQL: драйвер ODBC зарегистрирован как [NAPASTAK-FreeTDS]"
+    fi
+    # И под именем по умолчанию, если системного FreeTDS нет.
+    if ! grep -q "^\[FreeTDS\]" "$ODBCINST" 2>/dev/null; then
+      printf '\n[FreeTDS]\nDescription = FreeTDS\nDriver = %s/lib/deps/libtdsodbc.so\nSetup = %s/lib/deps/libtdsodbc.so\n' \
+             "$PREFIX" "$PREFIX" >> "$ODBCINST"
+    fi
+  elif ! grep -q "^\[FreeTDS\]" /etc/odbcinst.ini 2>/dev/null \
+       && ! ls /usr/lib64/libtdsodbc.so* /usr/lib/*/odbc/libtdsodbc.so* >/dev/null 2>&1; then
+    echo "  i MS SQL: драйвера ODBC нет ни в бандле, ни в системе."
+    echo "    Установите: sudo dnf install -y unixODBC freetds  — либо укажите в"
+    echo "    подключении свой драйвер (поле «Драйвер ODBC»). См. README → MS SQL."
+  fi
+fi
 # Kafka + SASL/GSSAPI (Kerberos): librdkafka реализует SCRAM и PLAIN сама, а
 # GSSAPI отдаёт libsasl2, которая грузит механизм ПЛАГИНОМ из /usr/lib64/sasl2.
 # Вложить его в бандл нельзя осмысленно: плагин привязан к версии libsasl2, а

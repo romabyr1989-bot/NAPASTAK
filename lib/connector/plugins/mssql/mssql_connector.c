@@ -615,9 +615,21 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode)
 {
     MsCtx *ctx = (MsCtx *)vctx;
-    if (!ctx || ctx->dbc == SQL_NULL_HDBC || !entity || !batch || !schema) return -1;
+    if (!ctx || ctx->dbc == SQL_NULL_HDBC || !batch || !schema) return -1;
     if (batch->nrows <= 0) return 0;
     (void)a;
+
+    /* Пустое имя назначения ловим здесь, а не отдаём в SQL. Иначе идентификатор
+     * сворачивается в «[]», и SQL Server отвечает «An object or column name is
+     * missing or empty» — по этому тексту невозможно понять, что не заполнено
+     * поле «Таблица назначения» у шага. */
+    if (!entity || !entity[0]) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "не задана таблица назначения: заполните «Таблица назначения» "
+                 "у шага-приёмника (например dbo.orders_export)");
+        LOG_ERROR("mssql: %s", ctx->last_err);
+        return -1;
+    }
 
     char sch[128], tab[256], qs[160], qt[300];
     ms_split_entity(ctx, entity, sch, sizeof(sch), tab, sizeof(tab));

@@ -209,6 +209,29 @@ dist: all
 	    echo "  librdkafka взята из $$rk (та, с которой слинкованы плагины)"; \
 	  fi; \
 	fi
+	@# Драйвер FreeTDS для MS SQL. Коннектор линкуется с libodbc, и её ldd найдёт
+	@# сам, а вот САМ ДРАЙВЕР (libtdsodbc.so) unixODBC грузит через dlopen по
+	@# записи в odbcinst.ini — в зависимостях его нет, и бандлер его не заметит.
+	@# Та же ловушка, что с плагином GSSAPI у libsasl2. Без него офлайн-установка
+	@# получила бы коннектор, который не может подключиться ни к чему.
+	@if [ -f $(DIST_DIR)/lib/mssql_connector.so ] && [ -d $(DIST_DIR)/lib/deps ]; then \
+	  tds=""; \
+	  for c in /usr/lib64/libtdsodbc.so.0 /usr/lib64/libtdsodbc.so \
+	           /usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so /usr/local/lib/libtdsodbc.so; do \
+	    [ -f "$$c" ] && { tds="$$c"; break; }; \
+	  done; \
+	  if [ -n "$$tds" ]; then \
+	    cp -L "$$tds" $(DIST_DIR)/lib/deps/libtdsodbc.so; \
+	    echo "  драйвер FreeTDS вложен ($$tds)"; \
+	    for so in $$(ldd "$$tds" 2>/dev/null | awk '/=> \//{print $$3}'); do \
+	      case "$$so" in */ld-linux*|*/libc.so*|*/libm.so*|*/libdl.so*|*/librt.so*|\
+	                     */libpthread.so*|*/libgcc_s.so*) continue;; esac; \
+	      cp -Lu "$$so" $(DIST_DIR)/lib/deps/ 2>/dev/null || true; \
+	    done; \
+	  else \
+	    echo "  ! libtdsodbc.so не найден — MS SQL потребует установки freetds на сервере"; \
+	  fi; \
+	fi
 	@# Проверка версии librdkafka. Вкладывается то, что ldd нашёл на СБОРОЧНОЙ
 	@# машине, а системный пакет RedOS 8 — 1.6.1. Она несовместима со SCRAM на
 	@# брокерах Kafka 4.0+ и Confluent Platform 8.0+: дефект nonce (#4895,
