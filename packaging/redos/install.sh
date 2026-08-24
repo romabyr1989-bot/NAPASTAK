@@ -97,8 +97,13 @@ else
 fi
 # Oracle: коннектор и libodpic грузятся из бандла, но подключение требует
 # проприетарный Oracle Instant Client (libclntsh.so) — см. README → Oracle.
-if ls "$SRC"/lib/oracle_connector.so >/dev/null 2>&1 && ! ls "$SRC"/lib/deps/libclntsh.so* >/dev/null 2>&1; then
-  echo "  i Oracle: для подключения установите Oracle Instant Client (libclntsh.so) — см. README"
+if ls "$SRC"/lib/oracle_connector.so >/dev/null 2>&1; then
+  if ls "$SRC"/lib/deps/libclntsh.so* >/dev/null 2>&1; then
+    echo "  i Oracle: клиент Instant Client вложен в поставку — доустанавливать нечего"
+    echo "    (условия его использования: ORACLE_INSTANT_CLIENT_LICENSE в этой папке)"
+  else
+    echo "  i Oracle: для подключения установите Oracle Instant Client (libclntsh.so) — см. README"
+  fi
 fi
 # MS SQL: драйвер ODBC. libodbc вкладывается автоматически (коннектор с ней
 # слинкован), а САМ ДРАЙВЕР unixODBC ищет по записи в odbcinst.ini. Если драйвер

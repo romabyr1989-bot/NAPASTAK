@@ -66,6 +66,9 @@ GP_PLUGIN      = $(LIBDIR)/gp_connector.so
 ORACLE_PLUGIN  = $(LIBDIR)/oracle_connector.so
 XML_PLUGIN     = $(LIBDIR)/xml_connector.so
 SOAP_PLUGIN    = $(LIBDIR)/soap_connector.so
+# Путь к Oracle Instant Client для вкладывания в поставку (см. цель dist).
+ORACLE_IC ?=
+
 MSSQL_PLUGIN   = $(LIBDIR)/mssql_connector.so
 
 # Detect librdkafka
@@ -230,6 +233,43 @@ dist: all
 	    done; \
 	  else \
 	    echo "  ! libtdsodbc.so не найден — MS SQL потребует установки freetds на сервере"; \
+	  fi; \
+	fi
+	@# Oracle Instant Client. ODPI-C — только обёртка: сам клиент Oracle она
+	@# ищет через dlopen по libclntsh.so, и без него коннектор отвечает
+	@# «DPI-1047: Cannot locate a 64-bit Oracle Client library». В закрытом
+	@# контуре доустановить его неоткуда, поэтому вкладываем в поставку.
+	@# Берётся минимальный набор Basic Light: сама libclntsh, libclntshcore,
+	@# libnnz (криптография) и libociicus (юникод без ICU). Остальные файлы
+	@# пакета — утилиты и символические ссылки на те же библиотеки.
+	@if [ -d $(DIST_DIR)/lib/deps ]; then \
+	  ic=""; \
+	  for d in $(ORACLE_IC) /opt/oracle/instantclient_* /usr/lib/oracle/*/client64/lib \
+	           $$HOME/oracle-ic/instantclient_*; do \
+	    [ -f "$$d/libclntsh.so" ] && { ic="$$d"; break; }; \
+	  done; \
+	  if [ -n "$$ic" ]; then \
+	    for f in libclntsh.so libclntshcore.so libnnz.so libociicus.so; do \
+	      for real in "$$ic"/$${f}* ; do \
+	        [ -f "$$real" ] && [ ! -L "$$real" ] && cp -Lu "$$real" $(DIST_DIR)/lib/deps/ 2>/dev/null || true; \
+	      done; \
+	    done; \
+	    ( cd $(DIST_DIR)/lib/deps && \
+	      for real in libclntsh.so.* libclntshcore.so.*; do \
+	        [ -f "$$real" ] || continue; \
+	        base=$${real%%.so.*}; ln -sf "$$real" "$$base.so"; \
+	      done ) 2>/dev/null || true; \
+	    for so in $$(ldd "$$ic/libclntsh.so" 2>/dev/null | awk '/=> \//{print $$3}'); do \
+	      case "$$so" in */ld-linux*|*/libc.so*|*/libm.so*|*/libdl.so*|*/librt.so*|\
+	                     */libpthread.so*|*/libgcc_s.so*|*/libresolv.so*) continue;; esac; \
+	      cp -Lu "$$so" $(DIST_DIR)/lib/deps/ 2>/dev/null || true; \
+	    done; \
+	    cp -f "$$ic"/BASIC_LITE_LICENSE $(DIST_DIR)/ORACLE_INSTANT_CLIENT_LICENSE 2>/dev/null || \
+	      cp -f "$$ic"/*LICENSE* $(DIST_DIR)/ORACLE_INSTANT_CLIENT_LICENSE 2>/dev/null || true; \
+	    echo "  Oracle Instant Client вложен ($$ic)"; \
+	  else \
+	    echo "  ! Oracle Instant Client не найден — коннектор Oracle потребует его установки"; \
+	    echo "    (укажите путь: make dist ORACLE_IC=/путь/к/instantclient_XX_YY)"; \
 	  fi; \
 	fi
 	@# Проверка версии librdkafka. Вкладывается то, что ldd нашёл на СБОРОЧНОЙ

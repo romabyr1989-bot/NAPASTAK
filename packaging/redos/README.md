@@ -329,21 +329,36 @@ PostgreSQL и Oracle). `decimal`, `numeric` и `money` намеренно НЕ �
 пустой. Оборотная сторона: очень большой `batch_size` держит блокировки на
 таблице до конца пачки; по умолчанию 8192 строки.
 
-### Oracle: Instant Client (единственная невложимая зависимость)
+### Oracle: клиент вложен в поставку
 
-`oracle_connector.so` и `libodpic.so` **загружаются офлайн из бандла**, но само
-подключение к Oracle требует проприетарный **Oracle Instant Client** (`libclntsh.so`),
-который нельзя распространять в бандле. Установите его на сервере один раз:
+`oracle_connector.so` — только обёртка над ODPI-C, а сам клиент Oracle она
+ищет через `dlopen` по имени `libclntsh.so`. Без него коннектор отвечает
+`DPI-1047: Cannot locate a 64-bit Oracle Client library`, и доустановить его в
+закрытом контуре неоткуда. Поэтому **Instant Client Basic Light вложен в
+поставку**: `libclntsh`, `libclntshcore`, `libnnz` и `libociicus` лежат в
+`lib/deps`, куда systemd-сервис и так смотрит через `LD_LIBRARY_PATH`. Ничего
+доустанавливать не требуется.
+
+Из-за этого поставка весит около 55 МБ вместо 15 — почти весь прирост даёт
+одна `libclntsh.so` (95 МБ в распакованном виде).
+
+Условия использования клиента — в файле `ORACLE_INSTANT_CLIENT_LICENSE` в
+корне поставки; он распространяется по лицензии Oracle OTN, разрешающей
+передачу в составе приложения.
+
+Свой клиент вместо вложенного ставится обычным образом — коннектор возьмёт тот,
+который найдёт первым по `LD_LIBRARY_PATH`:
 
 ```bash
-# со скачанного RPM (basic-пакет) или tar.gz с сайта Oracle:
-sudo dnf install -y oracle-instantclient-basic-*.rpm     # ставит libclntsh.so в /usr/lib/oracle/.../lib
-# и добавьте путь в LD_LIBRARY_PATH сервиса, либо скопируйте libclntsh.so* и его
-# зависимости в /opt/napastak/lib/deps (systemd уже смотрит туда):
-sudo cp /usr/lib/oracle/*/client64/lib/libclntsh.so* /opt/napastak/lib/deps/ && sudo ldconfig
+sudo rm /opt/napastak/lib/deps/libclntsh.so*     # убрать вложенный
+sudo cp /usr/lib/oracle/*/client64/lib/libclntsh.so* /opt/napastak/lib/deps/
 sudo systemctl restart napastak
 ```
-Остальные 9 коннекторов работают без каких-либо внешних установок.
+
+Сборка вкладывает клиент, если находит его на машине сборки в `/opt/oracle/`,
+`/usr/lib/oracle/*/client64/lib` или по пути из переменной:
+`make dist ORACLE_IC=/путь/к/instantclient_XX_YY`. Если не найден — печатается
+предупреждение, и поставка собирается без него.
 
 ### Kafka: Kerberos (GSSAPI)
 
