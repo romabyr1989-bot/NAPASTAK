@@ -43,7 +43,8 @@ static ColType infer_type(const char *s) {
  * одну ". Возвращает массив, n_out — число полей. Если err != NULL, в него
  * записывается ненулевое значение при ошибке парсинга (незакрытая кавычка,
  * мусор после закрывающей кавычки); в этом случае возвращается NULL. */
-static char **split_line_ex(Arena *a, const char *line, char delim, int *n_out, int *err) {
+static char **split_line_ex_q(Arena *a, const char *line, char delim,
+                              int *n_out, int *err, unsigned char *quoted) {
     if (err) *err = 0;
     int cap=16; char **parts=arena_alloc(a,cap*sizeof(char*)); int n=0;
     const char *p = line;
@@ -79,10 +80,35 @@ static char **split_line_ex(Arena *a, const char *line, char delim, int *n_out, 
             field = arena_strndup(a, start, flen);
         }
         if (n==cap){cap*=2;char**nb=arena_alloc(a,cap*sizeof(char*));memcpy(nb,parts,n*sizeof(char*));parts=nb;}
+        if (quoted) quoted[n] = in_quote ? 1u : 0u;
         parts[n++]=field; (void)flen;
         if (*p==delim) p++; else break;
     }
     *n_out=n; return parts;
+}
+
+/* Прежняя сигнатура — там, где закавыченность не нужна. */
+static char **split_line_ex(Arena *a, const char *line, char delim, int *n_out, int *err) {
+    return split_line_ex_q(a, line, delim, n_out, err, NULL);
+}
+
+/* Читает ОДНУ CSV-запись, уважая кавычки: перевод строки внутри закавыченного
+ * поля — часть значения. Раньше строки читались fgets, то есть ровно по одной
+ * физической строке, поэтому многострочное поле (адрес в две строки) рвалось
+ * пополам: split_line_ex видел незакрытую кавычку и возвращал ошибку, а из-за
+ * неё весь файл становился нечитаемым — схема не выводилась, read_batch падал.
+ * Возвращает buf либо NULL на конце файла. */
+static char *csv_read_record(FILE *f, char *buf, size_t cap) {
+    size_t n = 0; int in_q = 0, c = EOF;
+    while ((c = fgetc(f)) != EOF) {
+        if (n + 2 >= cap) break;      /* запись длиннее буфера — как и прежде, обрезаем */
+        if (c == '"') in_q = !in_q;   /* "" внутри поля переключает дважды — итог верный */
+        if (c == '\n' && !in_q) { buf[n++] = '\n'; break; }
+        buf[n++] = (char)c;
+    }
+    if (n == 0) return NULL;
+    buf[n] = '\0';
+    return buf;
 }
 
 /* Создаёт контекст: разбирает JSON-конфиг (path/delimiter/header) и выводит
@@ -110,7 +136,7 @@ static void *csv_create(const char *cfg, Arena *a) {
     FILE *f = fopen(ctx->path, "r");
     if (!f) return ctx;
     char line[65536];
-    if (fgets(line, sizeof(line), f)) {
+    if (csv_read_record(f, line, sizeof(line))) {
         int n; int perr=0; char **hdrs=split_line_ex(a,line,ctx->delimiter,&n,&perr);
         if (perr || !hdrs) { fclose(f); return ctx; } /* malformed header — leave schema NULL */
         ctx->ncols=n;
@@ -210,10 +236,12 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     }
 
     char line[65536]; int row=0;
-    if (ctx->has_header) fgets(line,sizeof(line),f); /* skip header */
-    for (long long s=0; s<start && fgets(line,sizeof(line),f); s++) ;  /* перемотка на курсор */
-    while (row<BATCH_SIZE && fgets(line,sizeof(line),f)) {
-        int n; int perr=0; char **vals=split_line_ex(a,line,ctx->delimiter,&n,&perr);
+    if (ctx->has_header) csv_read_record(f,line,sizeof(line)); /* skip header */
+    for (long long s=0; s<start && csv_read_record(f,line,sizeof(line)); s++) ;  /* перемотка на курсор */
+    unsigned char vq[MAX_COLS];
+    while (row<BATCH_SIZE && csv_read_record(f,line,sizeof(line))) {
+        int n; int perr=0; memset(vq,0,sizeof vq);
+        char **vals=split_line_ex_q(a,line,ctx->delimiter,&n,&perr,vq);
         /* RFC-4180 strictness: a quote-parse error (unterminated/stray quote) is a
          * hard failure — do not silently succeed with a truncated/garbled row. */
         if (perr || !vals) { fclose(f); return -1; }
@@ -223,7 +251,12 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         for(int c=0;c<ncols;c++){
             /* Trailing fields absent in this short row => real NULL (sentinel). */
             const char *v = (c < n) ? vals[c] : DFO_NULL_SENTINEL;
-            if(!v||!*v||strcasecmp(v,"null")==0||strcasecmp(v,"na")==0
+            /* Закавыченное поле — ВСЕГДА текст: "" это пустая строка, а "NULL"
+             * и "NA" — обычные значения. Без этой развилки их нельзя было
+             * загрузить в принципе, они молча превращались в NULL. Для
+             * незакавыченных полей соглашение прежнее (пусто/null/na → NULL). */
+            int vquoted = (c < n) && vq[c];
+            if(!v || (!vquoted && (!*v||strcasecmp(v,"null")==0||strcasecmp(v,"na")==0))
                ||strcmp(v,DFO_NULL_SENTINEL)==0){
                 bit_set(batch->null_bitmap[c],row);
                 /* For TEXT-backed columns also materialise the sentinel so that

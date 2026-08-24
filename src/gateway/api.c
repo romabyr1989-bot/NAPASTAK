@@ -234,6 +234,24 @@ static char **split_line_rfc4180_q(Arena *a, const char *line, char delim,
     *n_out=n; return parts;
 }
 
+/* Находит конец CSV-записи, УВАЖАЯ кавычки: перевод строки внутри закавыченного
+ * поля — часть значения, а не конец строки. Тело раньше резалось по '\n' ДО
+ * разбора кавычек, поэтому валидный по RFC4180 многострочный столбец (адрес в
+ * две строки, комментарий с переносом) отвергался как «bad quoting» — загрузить
+ * такие данные было нельзя вовсе. Возвращает указатель на завершающий перевод
+ * строки либо end. */
+static const char *csv_record_end(const char *p, const char *end) {
+    int in_q = 0;
+    for (; p < end; p++) {
+        if (*p == '"') {
+            if (in_q && p + 1 < end && p[1] == '"') { p++; continue; }
+            in_q = !in_q; continue;
+        }
+        if (*p == '\n' && !in_q) return p;
+    }
+    return end;
+}
+
 /* Прежняя сигнатура — для мест, которым закавыченность поля не нужна. */
 static char **split_line_rfc4180(Arena *a, const char *line, char delim, int *n_out, int *err) {
     return split_line_rfc4180_q(a, line, delim, n_out, err, NULL);
@@ -4315,8 +4333,7 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         char *vrow = arena_alloc(va, 65536);
         const char *vp = nl + 1;
         while (vp < body + req->body_len) {
-            const char *vne = memchr(vp, '\n', (size_t)(body + req->body_len - vp));
-            if (!vne) vne = body + req->body_len;
+            const char *vne = csv_record_end(vp, body + req->body_len);
             size_t vrlen = (size_t)(vne - vp);
             if (vrlen == 0 || (vrlen == 1 && vp[0] == '\r')) { vp = vne + 1; continue; }
             /* Reject an over-long row LOUDLY instead of silently truncating it to
@@ -4371,8 +4388,7 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     char *row_copy = arena_alloc(a, 65536);
 
     while (p < body + req->body_len) {
-        const char *ne = memchr(p, '\n', (size_t)(body + req->body_len - p));
-        if (!ne) ne = body + req->body_len;
+        const char *ne = csv_record_end(p, body + req->body_len);
         size_t rlen = (size_t)(ne - p);
         if (rlen == 0 || (rlen == 1 && p[0] == '\r')) { p = ne + 1; continue; }
         if (rlen >= 65536) rlen = 65535;
@@ -4384,7 +4400,8 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
          * A short row pads the missing tail with the NULL sentinel so it
          * round-trips as a true NULL, not "". */
         int nfields = 0; int perr = 0;
-        char **fields = split_line_rfc4180(a, row_copy, delim, &nfields, &perr);
+        unsigned char *fq = arena_calloc(a, (size_t)MAX_COLS + 1);
+        char **fields = split_line_rfc4180_q(a, row_copy, delim, &nfields, &perr, fq);
         if (perr || !fields) {
             arena_destroy(a);
             http_resp_error(resp, 400, "malformed CSV row (bad quoting)");
@@ -4400,9 +4417,17 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
             /* Map a present-but-empty field (",,") to NULL too, not just a
              * missing trailing one — otherwise "" silently coerces to 0 in
              * numeric aggregates (inflating COUNT, deflating AVG/MIN). */
-            const char *cv = (col < nfields && fields[col] && fields[col][0])
-                             ? fields[col] : DFO_NULL_SENTINEL;
-            if (strcmp(cv, DFO_NULL_SENTINEL) == 0) {
+            /* Соглашение COPY ... CSV из PostgreSQL: НЕзакавыченное пустое поле —
+             * это NULL, а "" — настоящая пустая строка. Раньше пустым считалось
+             * и то и другое, поэтому пустую строку нельзя было загрузить в
+             * принципе: она всегда превращалась в NULL. Незакавыченное пустое
+             * по-прежнему NULL — иначе "" молча коерсится в 0 в агрегатах. */
+            const char *cv;
+            if (col >= nfields || !fields[col])            cv = DFO_NULL_SENTINEL;
+            else if (fields[col][0])                       cv = fields[col];
+            else if (fq[col])                              cv = "";   /* явное "" */
+            else                                           cv = DFO_NULL_SENTINEL;
+            if (cv != NULL && strcmp(cv, DFO_NULL_SENTINEL) == 0) {
                 /* True NULL (missing tail or explicit sentinel): flag the
                  * null_bitmap so the stored cell is a real NULL, matching how
                  * SQL-materialized NULLs are persisted. */
