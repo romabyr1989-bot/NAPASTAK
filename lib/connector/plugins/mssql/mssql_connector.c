@@ -295,13 +295,23 @@ static void *ms_create(const char *cfg, Arena *a)
                 n += snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
                               "ClientCharset=%s;", charset);
             }
-            if (n > 0 && (size_t)n < sizeof(ctx->dsn)) {
-                if (enc[0])   snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
-                                       "Encrypt=%s;", enc);
-                size_t l = strlen(ctx->dsn);
-                if (trust[0]) snprintf(ctx->dsn + l, sizeof(ctx->dsn) - l,
-                                       "TrustServerCertificate=%s;", trust);
+            /* Шифрование канала называется у драйверов ПО-РАЗНОМУ, и чужой
+             * ключ просто игнорируется — настройка молча не работает, что и
+             * обнаружилось на проверке: «Encrypt=no» не отключал шифрование.
+             * У Microsoft это Encrypt=yes|no плюс TrustServerCertificate,
+             * у FreeTDS — Encryption=require|off (проверку сертификата он не
+             * выполняет вовсе, поэтому доверие там задавать нечем). */
+            bool is_tds = strcasestr(drv, "freetds") || strcasestr(drv, "tds");
+            if (n > 0 && (size_t)n < sizeof(ctx->dsn) && enc[0]) {
+                bool on = (strcasecmp(enc, "yes") == 0 || strcasecmp(enc, "true") == 0 ||
+                           strcasecmp(enc, "require") == 0 || strcmp(enc, "1") == 0);
+                n += snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
+                              is_tds ? "Encryption=%s;" : "Encrypt=%s;",
+                              is_tds ? (on ? "require" : "off") : (on ? "yes" : "no"));
             }
+            if (n > 0 && (size_t)n < sizeof(ctx->dsn) && trust[0] && !is_tds)
+                snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
+                         "TrustServerCertificate=%s;", trust);
         }
 
         SQLCHAR outstr[1024];
@@ -645,6 +655,88 @@ static int ms_column_list(MsCtx *ctx, const char *sch, const char *tab,
     return 0;
 }
 
+/* Исполняет готовый SELECT и собирает батч. Общая часть для чтения таблицы и
+ * произвольного запроса: разбор результата, схема из выдачи, NULL и длинные
+ * значения — всё одинаково, различается только сам SQL. */
+static int ms_fetch_sql(MsCtx *ctx, Arena *a, const char *sql, const char *bind_cur,
+                        int64_t limit, bool warn_truncate, ColBatch **out)
+{
+    SQLHSTMT st = SQL_NULL_HSTMT;
+    if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &st))) return -1;
+    if (bind_cur && bind_cur[0])
+        SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                         strlen(bind_cur), 0, (SQLPOINTER)bind_cur,
+                         (SQLLEN)strlen(bind_cur), NULL);
+    if (!ms_ok(SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS))) {
+        ms_diag(ctx, SQL_HANDLE_STMT, st, "чтение батча");
+        SQLFreeHandle(SQL_HANDLE_STMT, st);
+        return -1;
+    }
+
+    SQLSMALLINT ncols = 0;
+    SQLNumResultCols(st, &ncols);
+    if (ncols <= 0) { SQLFreeHandle(SQL_HANDLE_STMT, st); return -1; }
+    if (ncols > MS_MAX_COLS) ncols = MS_MAX_COLS;
+
+    Schema *sc = arena_calloc(a, sizeof(Schema));
+    sc->ncols = ncols;
+    sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
+    for (SQLSMALLINT c = 0; c < ncols; c++) {
+        SQLCHAR nm[256] = ""; SQLSMALLINT nlen = 0;
+        SQLDescribeCol(st, (SQLUSMALLINT)(c + 1), nm, sizeof(nm), &nlen,
+                       NULL, NULL, NULL, NULL);
+        sc->cols[c].name     = arena_strdup(a, (const char *)nm);
+        sc->cols[c].type     = COL_TEXT;   /* значения всегда текстом, см. шапку */
+        sc->cols[c].nullable = true;
+    }
+
+    ColBatch *batch = arena_calloc(a, sizeof(ColBatch));
+    batch->schema = sc; batch->ncols = ncols; batch->nrows = 0;
+    for (SQLSMALLINT c = 0; c < ncols; c++)
+        batch->values[c] = arena_alloc(a, (size_t)limit * sizeof(char *));
+
+    for (SQLSMALLINT c = 0; c < ncols; c++)
+        batch->null_bitmap[c] = arena_calloc(a, ((size_t)limit + 7) / 8);
+
+    int rows = 0;
+    char last_cursor[256] = "";
+    while (rows < limit && SQLFetch(st) == SQL_SUCCESS) {
+        for (SQLSMALLINT c = 0; c < ncols; c++) {
+            SQLLEN ind = 0;
+            const char *val = ms_get_text(ctx, a, st, (SQLUSMALLINT)(c + 1), &ind);
+            if (ind == SQL_NULL_DATA) {
+                /* NULL и пустая строка — разные значения. Отмечаем в битовой
+                 * карте и кладём общий для проекта маркер: без него запись в
+                 * приёмник превращала бы NULL в «», ломая IS NULL и внешние
+                 * ключи (та же ошибка уже была в write_batch). */
+                batch->null_bitmap[c][rows / 8] |= (uint8_t)(1u << (rows % 8));
+                ((char **)batch->values[c])[rows] = (char *)DFO_NULL_SENTINEL;
+                continue;
+            }
+            if (!val) val = "";
+            ((char **)batch->values[c])[rows] = arena_strdup(a, val);
+            /* Отметка для следующей страницы — значение колонки курсора. */
+            if (ctx->cursor_column[0] &&
+                !strcasecmp(sc->cols[c].name, ctx->cursor_column))
+                snprintf(last_cursor, sizeof(last_cursor), "%s", val);
+        }
+        rows++;
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+
+    batch->nrows = rows;
+    *out = batch;
+    (void)last_cursor;   /* курсор наружу отдаёт вызывающий по значению колонки */
+
+    /* Выборка уперлась в предел и продолжения не будет — молчать нельзя:
+     * оператор считал бы, что получил все строки своего запроса. */
+    if (warn_truncate && rows >= (int)limit)
+        LOG_WARN("mssql: запрос вернул %d строк — это предел выборки. Остальные "
+                 "строки НЕ прочитаны: у произвольного запроса нет устойчивого "
+                 "порядка, поэтому постранично он читается только с заданным "
+                 "полем-отметкой. Задайте отметку или сузьте запрос.", rows);
+    return 0;
+}
 static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                          const char *entity, ColBatch **out)
 {
@@ -661,6 +753,41 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     if (ctx->batch_size > 0 && limit > ctx->batch_size) limit = ctx->batch_size;
     if (limit > BATCH_SIZE) limit = BATCH_SIZE;
     const char *cur = (req && req->cursor) ? req->cursor : NULL;
+
+    /* ── Произвольный запрос вместо имени таблицы ──────────────────────────
+     * Когда в поле источника написан SQL, а не имя таблицы, вызывающий
+     * передаёт его отдельным полем filter, а entity оставляет пустым (так же
+     * устроен коннектор PostgreSQL). Раньше mssql это поле игнорировал:
+     * подставлялось пустое имя таблицы, и запрос оператора молча не
+     * исполнялся — при том что форма прямо предлагает писать сюда SELECT.
+     *
+     * Постранично читать произвольный запрос можно только при заданном
+     * поле-отметке: срез по нему устойчив на любой версии сервера. Без
+     * отметки порядок строк в запросе не определён, поэтому OFFSET разъезжался
+     * бы между страницами — вместо этого берём одну порцию и предупреждаем,
+     * если она уперлась в предел. */
+    const char *filter = (req && req->filter && req->filter[0]) ? req->filter : NULL;
+    if (filter) {
+        char sql[MS_MAX_SQL];
+        if (ctx->cursor_column[0]) {
+            char qc[160];
+            ms_quote_ident(ctx->cursor_column, qc, sizeof(qc));
+            if (cur && cur[0] && strcmp(cur, "0") != 0)
+                snprintf(sql, sizeof(sql),
+                         "SELECT TOP %lld * FROM (%s) AS q WHERE q.%s > ? ORDER BY q.%s",
+                         (long long)limit, filter, qc, qc);
+            else
+                snprintf(sql, sizeof(sql),
+                         "SELECT TOP %lld * FROM (%s) AS q ORDER BY q.%s",
+                         (long long)limit, filter, qc);
+        } else {
+            snprintf(sql, sizeof(sql), "SELECT TOP %lld * FROM (%s) AS q",
+                     (long long)limit, filter);
+        }
+        return ms_fetch_sql(ctx, a, sql,
+                            (ctx->cursor_column[0] && cur && cur[0] && strcmp(cur, "0") != 0) ? cur : NULL,
+                            limit, !ctx->cursor_column[0], out);
+    }
 
     char sch[128], tab[256], qs[160], qt[300];
     ms_split_entity(ctx, entity, sch, sizeof(sch), tab, sizeof(tab));
@@ -763,72 +890,9 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         }
     }
 
-    SQLHSTMT st = SQL_NULL_HSTMT;
-    if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &st))) return -1;
-    if (ctx->cursor_column[0] && cur && cur[0])
-        SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
-                         strlen(cur), 0, (SQLPOINTER)cur, (SQLLEN)strlen(cur), NULL);
-    if (!ms_ok(SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS))) {
-        ms_diag(ctx, SQL_HANDLE_STMT, st, "чтение батча");
-        SQLFreeHandle(SQL_HANDLE_STMT, st);
-        return -1;
-    }
-
-    SQLSMALLINT ncols = 0;
-    SQLNumResultCols(st, &ncols);
-    if (ncols <= 0) { SQLFreeHandle(SQL_HANDLE_STMT, st); return -1; }
-    if (ncols > MS_MAX_COLS) ncols = MS_MAX_COLS;
-
-    Schema *sc = arena_calloc(a, sizeof(Schema));
-    sc->ncols = ncols;
-    sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
-    for (SQLSMALLINT c = 0; c < ncols; c++) {
-        SQLCHAR nm[256] = ""; SQLSMALLINT nlen = 0;
-        SQLDescribeCol(st, (SQLUSMALLINT)(c + 1), nm, sizeof(nm), &nlen,
-                       NULL, NULL, NULL, NULL);
-        sc->cols[c].name     = arena_strdup(a, (const char *)nm);
-        sc->cols[c].type     = COL_TEXT;   /* значения всегда текстом, см. шапку */
-        sc->cols[c].nullable = true;
-    }
-
-    ColBatch *batch = arena_calloc(a, sizeof(ColBatch));
-    batch->schema = sc; batch->ncols = ncols; batch->nrows = 0;
-    for (SQLSMALLINT c = 0; c < ncols; c++)
-        batch->values[c] = arena_alloc(a, (size_t)limit * sizeof(char *));
-
-    for (SQLSMALLINT c = 0; c < ncols; c++)
-        batch->null_bitmap[c] = arena_calloc(a, ((size_t)limit + 7) / 8);
-
-    int rows = 0;
-    char last_cursor[256] = "";
-    while (rows < limit && SQLFetch(st) == SQL_SUCCESS) {
-        for (SQLSMALLINT c = 0; c < ncols; c++) {
-            SQLLEN ind = 0;
-            const char *val = ms_get_text(ctx, a, st, (SQLUSMALLINT)(c + 1), &ind);
-            if (ind == SQL_NULL_DATA) {
-                /* NULL и пустая строка — разные значения. Отмечаем в битовой
-                 * карте и кладём общий для проекта маркер: без него запись в
-                 * приёмник превращала бы NULL в «», ломая IS NULL и внешние
-                 * ключи (та же ошибка уже была в write_batch). */
-                batch->null_bitmap[c][rows / 8] |= (uint8_t)(1u << (rows % 8));
-                ((char **)batch->values[c])[rows] = (char *)DFO_NULL_SENTINEL;
-                continue;
-            }
-            if (!val) val = "";
-            ((char **)batch->values[c])[rows] = arena_strdup(a, val);
-            /* Отметка для следующей страницы — значение колонки курсора. */
-            if (ctx->cursor_column[0] &&
-                !strcasecmp(sc->cols[c].name, ctx->cursor_column))
-                snprintf(last_cursor, sizeof(last_cursor), "%s", val);
-        }
-        rows++;
-    }
-    SQLFreeHandle(SQL_HANDLE_STMT, st);
-
-    batch->nrows = rows;
-    *out = batch;
-    (void)last_cursor;   /* курсор наружу отдаёт вызывающий по значению колонки */
-    return 0;
+    return ms_fetch_sql(ctx, a, sql,
+                        (ctx->cursor_column[0] && cur && cur[0]) ? cur : NULL,
+                        limit, false, out);
 }
 
 /* ── write_batch (приёмник) ────────────────────────────────────────────────
@@ -853,6 +917,35 @@ static void ms_autocommit_back(MsCtx *ctx, int had_tx) {
     if (had_tx)
         SQLSetConnectAttr(ctx->dbc, SQL_ATTR_AUTOCOMMIT,
                           (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+}
+
+/* Ключ идемпотентности: список колонок через запятую. Возвращает их число,
+ * имена — в out[]. Пустая настройка означает обычную вставку. */
+static int ms_split_keys(const char *csv, char out[][160], int maxn)
+{
+    int n = 0;
+    const char *p = csv;
+    while (*p && n < maxn) {
+        while (*p == ' ' || *p == ',') p++;
+        const char *b = p;
+        while (*p && *p != ',') p++;
+        const char *e = p;
+        while (e > b && e[-1] == ' ') e--;
+        if (e > b) {
+            size_t len = (size_t)(e - b);
+            if (len > 159) len = 159;
+            memcpy(out[n], b, len); out[n][len] = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+static bool ms_is_key_col(const char *name, char keys[][160], int nkeys)
+{
+    for (int i = 0; i < nkeys; i++)
+        if (strcasecmp(name, keys[i]) == 0) return true;
+    return false;
 }
 
 static int ms_write_batch(void *vctx, Arena *a, const char *entity,
@@ -884,8 +977,38 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
     if (ncols <= 0) return -1;
     if (ncols > MS_MAX_COLS) ncols = MS_MAX_COLS;
 
-    /* Таблица при отсутствии. Текстовый тип — по версии, см. комментарий выше. */
+    char keys[8][160];
+    int nkeys = ctx->primary_key[0]
+              ? ms_split_keys(ctx->primary_key, keys, 8) : 0;
+
+    /* Ключ обязан существовать среди колонок батча, иначе запрос не соберётся,
+     * а оператор получит ошибку сервера вместо внятного объяснения. */
+    for (int k = 0; k < nkeys; k++) {
+        bool found = false;
+        for (int c = 0; c < ncols; c++)
+            if (strcasecmp(schema->cols[c].name, keys[k]) == 0) { found = true; break; }
+        if (!found) {
+            snprintf(ctx->last_err, sizeof(ctx->last_err),
+                     "колонка ключа «%s» отсутствует в данных источника; "
+                     "исправьте «Ключ идемпотентности» в настройках подключения",
+                     keys[k]);
+            LOG_ERROR("mssql: %s", ctx->last_err);
+            return -1;
+        }
+    }
+
+
+    /* Таблица при отсутствии. Текстовый тип — по версии, см. комментарий выше.
+     *
+     * Колонки КЛЮЧА — исключение: их нельзя создавать ни NTEXT, ни
+     * NVARCHAR(MAX). NTEXT вообще запрещено сравнивать («The text, ntext, and
+     * image data types cannot be compared or sorted»), из-за чего на сервере
+     * 2000 идемпотентная запись падала бы на первом же WHERE по ключу; а
+     * NVARCHAR(MAX) сравнивать можно, но нельзя проиндексировать, и поиск
+     * совпадения шёл бы полным перебором таблицы. NVARCHAR(450) сравнивается,
+     * индексируется и существует во всех поддерживаемых версиях. */
     const char *text_type = (ctx->srv_major >= 9) ? "NVARCHAR(MAX)" : "NTEXT";
+    const char *key_type  = "NVARCHAR(450)";
     char ddl[MS_MAX_SQL];
     int n = snprintf(ddl, sizeof(ddl),
                      "IF OBJECT_ID('%s.%s','U') IS NULL CREATE TABLE %s.%s (",
@@ -894,7 +1017,8 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
         char qc[160];
         ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
         n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, "%s%s %s",
-                      c ? ", " : "", qc, text_type);
+                      c ? ", " : "", qc,
+                      ms_is_key_col(schema->cols[c].name, keys, nkeys) ? key_type : text_type);
     }
     if (n > 0 && (size_t)n < sizeof(ddl)) snprintf(ddl + n, sizeof(ddl) - (size_t)n, ")");
     if (ms_exec(ctx, ddl) != 0) return -1;
@@ -925,19 +1049,91 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
         }
     }
 
-    /* Вставка построчно через подготовленный запрос: значения уходят
-     * параметрами, а не склейкой в текст — иначе кавычка в данных ломает SQL. */
+    /* Стратегия записи. Без ключа — обычная вставка. С ключом — запись должна
+     * быть идемпотентной: повторный прогон конвейера обязан обновлять строку,
+     * а не плодить дубликаты.
+     *
+     * MERGE появился в SQL Server 2008. На 2005 и старше его нет, поэтому там
+     * тот же результат достигается парой «UPDATE, и если ничего не обновилось —
+     * INSERT». Подсказка HOLDLOCK в MERGE обязательна: без неё две записи в одну
+     * таблицу могут разойтись между проверкой и вставкой и вставить дубликат
+     * ключа, что MERGE как раз и должен предотвращать. */
+    int nnonkey = 0;
+    for (int c = 0; c < ncols; c++)
+        if (!ms_is_key_col(schema->cols[c].name, keys, nkeys)) nnonkey++;
+
+    /* Все колонки ключевые — обновлять нечего, достаточно не вставлять
+     * повторно. MERGE без ветки MATCHED допустим. */
+    bool merge_mode  = (nkeys > 0 && ctx->srv_major >= 10);
+    bool upsert_pair = (nkeys > 0 && ctx->srv_major < 10);
+
     char ins[MS_MAX_SQL];
-    n = snprintf(ins, sizeof(ins), "INSERT INTO %s.%s (", qs, qt);
-    for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++) {
-        char qc[160];
-        ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
-        n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%s%s", c ? ", " : "", qc);
+    if (merge_mode) {
+        n = snprintf(ins, sizeof(ins), "MERGE INTO %s.%s WITH (HOLDLOCK) AS t USING (SELECT ", qs, qt);
+        for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++) {
+            char qc[160]; ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%s? AS %s", c ? ", " : "", qc);
+        }
+        n += snprintf(ins + n, sizeof(ins) - (size_t)n, ") AS s ON (");
+        for (int k = 0; k < nkeys && n > 0 && (size_t)n < sizeof(ins); k++) {
+            char qk[160]; ms_quote_ident(keys[k], qk, sizeof(qk));
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n,
+                          "%st.%s = s.%s", k ? " AND " : "", qk, qk);
+        }
+        n += snprintf(ins + n, sizeof(ins) - (size_t)n, ")");
+        if (nnonkey > 0) {
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n, " WHEN MATCHED THEN UPDATE SET ");
+            int w = 0;
+            for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++) {
+                if (ms_is_key_col(schema->cols[c].name, keys, nkeys)) continue;
+                char qc[160]; ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+                n += snprintf(ins + n, sizeof(ins) - (size_t)n,
+                              "%st.%s = s.%s", w++ ? ", " : "", qc, qc);
+            }
+        }
+        n += snprintf(ins + n, sizeof(ins) - (size_t)n, " WHEN NOT MATCHED THEN INSERT (");
+        for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++) {
+            char qc[160]; ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%s%s", c ? ", " : "", qc);
+        }
+        n += snprintf(ins + n, sizeof(ins) - (size_t)n, ") VALUES (");
+        for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++) {
+            char qc[160]; ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%ss.%s", c ? ", " : "", qc);
+        }
+        snprintf(ins + n, sizeof(ins) - (size_t)n, ");");   /* MERGE требует точку с запятой */
+    } else {
+        /* Обычная вставка: значения уходят параметрами, а не склейкой в текст —
+         * иначе кавычка в данных ломает SQL. */
+        n = snprintf(ins, sizeof(ins), "INSERT INTO %s.%s (", qs, qt);
+        for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++) {
+            char qc[160];
+            ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%s%s", c ? ", " : "", qc);
+        }
+        n += snprintf(ins + n, sizeof(ins) - (size_t)n, ") VALUES (");
+        for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++)
+            n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%s?", c ? ", " : "");
+        snprintf(ins + n, sizeof(ins) - (size_t)n, ")");
     }
-    n += snprintf(ins + n, sizeof(ins) - (size_t)n, ") VALUES (");
-    for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ins); c++)
-        n += snprintf(ins + n, sizeof(ins) - (size_t)n, "%s?", c ? ", " : "");
-    snprintf(ins + n, sizeof(ins) - (size_t)n, ")");
+
+    /* Пара «UPDATE, затем INSERT» для серверов без MERGE. Порядок параметров у
+     * UPDATE иной: сначала неключевые колонки, затем ключевые в WHERE. */
+    char upd[MS_MAX_SQL] = "";
+    if (upsert_pair && nnonkey > 0) {
+        int m = snprintf(upd, sizeof(upd), "UPDATE %s.%s SET ", qs, qt);
+        int w = 0;
+        for (int c = 0; c < ncols && m > 0 && (size_t)m < sizeof(upd); c++) {
+            if (ms_is_key_col(schema->cols[c].name, keys, nkeys)) continue;
+            char qc[160]; ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+            m += snprintf(upd + m, sizeof(upd) - (size_t)m, "%s%s = ?", w++ ? ", " : "", qc);
+        }
+        m += snprintf(upd + m, sizeof(upd) - (size_t)m, " WHERE ");
+        for (int k = 0; k < nkeys && m > 0 && (size_t)m < sizeof(upd); k++) {
+            char qk[160]; ms_quote_ident(keys[k], qk, sizeof(qk));
+            m += snprintf(upd + m, sizeof(upd) - (size_t)m, "%s%s = ?", k ? " AND " : "", qk);
+        }
+    }
 
     SQLHSTMT st = SQL_NULL_HSTMT;
     if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &st))) {
@@ -952,7 +1148,13 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
 
     int written = 0;
     SQLLEN *inds = calloc((size_t)ncols, sizeof(SQLLEN));
-    if (!inds) { SQLFreeHandle(SQL_HANDLE_STMT, st); ms_autocommit_back(ctx, had_tx); return -1; }
+    /* Отдельные индикаторы для UPDATE: ODBC держит указатель на них до
+     * исполнения, поэтому переиспользовать массив вставки нельзя. */
+    SQLLEN *uinds = calloc((size_t)ncols, sizeof(SQLLEN));
+    if (!inds || !uinds) {
+        free(inds); free(uinds);
+        SQLFreeHandle(SQL_HANDLE_STMT, st); ms_autocommit_back(ctx, had_tx); return -1;
+    }
     for (int r = 0; r < batch->nrows; r++) {
         for (int c = 0; c < ncols; c++) {
             const uint8_t *bm = batch->null_bitmap[c];
@@ -994,12 +1196,57 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
                 goto insert_done;
             }
         }
+        /* Сервер без MERGE: сперва пробуем обновить существующую строку и лишь
+         * при её отсутствии вставляем. Порядок параметров у UPDATE другой,
+         * поэтому привязываем их отдельно. */
+        if (upsert_pair && upd[0]) {
+            SQLHSTMT us = SQL_NULL_HSTMT;
+            if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &us))) goto insert_done;
+            if (!ms_ok(SQLPrepare(us, (SQLCHAR *)upd, SQL_NTS))) {
+                ms_diag(ctx, SQL_HANDLE_STMT, us, "подготовка обновления");
+                SQLFreeHandle(SQL_HANDLE_STMT, us); goto insert_done;
+            }
+            SQLUSMALLINT pi = 1;
+            bool bind_ok = true;
+            for (int pass = 0; pass < 2 && bind_ok; pass++) {
+                for (int c = 0; c < ncols && bind_ok; c++) {
+                    bool iskey = ms_is_key_col(schema->cols[c].name, keys, nkeys);
+                    if ((pass == 0) == iskey) continue;      /* сначала неключевые, затем ключевые */
+                    const uint8_t *bm = batch->null_bitmap[c];
+                    int isnull = (bm && ((bm[r / 8] >> (r % 8)) & 1u));
+                    char *v = isnull ? NULL : ((char **)batch->values[c])[r];
+                    if (!v) {
+                        uinds[pi - 1] = SQL_NULL_DATA;
+                        bind_ok = ms_ok(SQLBindParameter(us, pi, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                        MS_TEXT_SQL_TYPE(0), 1, 0, (SQLPOINTER)"", 0, &uinds[pi - 1]));
+                    } else {
+                        uinds[pi - 1] = (SQLLEN)strlen(v);
+                        bind_ok = ms_ok(SQLBindParameter(us, pi, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                        MS_TEXT_SQL_TYPE(uinds[pi - 1]),
+                                        uinds[pi - 1] ? (SQLULEN)uinds[pi - 1] : 1, 0,
+                                        v, uinds[pi - 1], &uinds[pi - 1]));
+                    }
+                    pi++;
+                }
+            }
+            SQLLEN affected = 0;
+            if (bind_ok && ms_ok(SQLExecute(us))) SQLRowCount(us, &affected);
+            else { ms_diag(ctx, SQL_HANDLE_STMT, us, "обновление строки");
+                   SQLFreeHandle(SQL_HANDLE_STMT, us); goto insert_done; }
+            SQLFreeHandle(SQL_HANDLE_STMT, us);
+            if (affected > 0) { written++; continue; }       /* строка была — обновили */
+        }
+
         SQLRETURN rc = SQLExecute(st);
-        if (!ms_ok(rc)) { ms_diag(ctx, SQL_HANDLE_STMT, st, "вставка строки"); break; }
+        if (!ms_ok(rc)) {
+            ms_diag(ctx, SQL_HANDLE_STMT, st,
+                    merge_mode ? "слияние строки" : "вставка строки");
+            break;
+        }
         written++;
     }
 insert_done:
-    free(inds);
+    free(inds); free(uinds);
     SQLFreeHandle(SQL_HANDLE_STMT, st);
 
     /* Успех фиксируем, неудачу откатываем целиком — приёмник либо принял
@@ -1019,7 +1266,9 @@ insert_done:
         LOG_WARN("mssql: записано %d из %d строк в %s", written, batch->nrows, entity);
         return -1;
     }
-    LOG_INFO("mssql: записано %d строк в %s.%s", written, sch, tab);
+    LOG_INFO("mssql: записано %d строк в %s.%s (%s)", written, sch, tab,
+             merge_mode ? "MERGE по ключу" :
+             upsert_pair ? "обновление или вставка по ключу" : "вставка");
     return written;   /* контракт ABI: число записанных строк */
 }
 

@@ -3418,12 +3418,86 @@ function makeConnectorConfigHTML(step, idx) {
       ${/* Кнопка вынесена из колонки с паролем в собственный ряд: внутри колонки
            она прижималась к её правому краю и висела отдельно от всего остального.
            Ряд такой же, как у прочих типов, — по левому краю формы. */''}
+      ${/* Шифрование. У SQL Server 2022 и драйвера Microsoft оно включено по
+           умолчанию, и подключение к серверу с самоподписанным сертификатом
+           без «доверять сертификату» просто не состоится — с ошибкой про
+           цепочку доверия, по которой причину не угадать. Поэтому оба поля
+           рядом и на виду. */''}
+      <div class="conn-grid" style="margin-top:.6rem">
+        <div class="form-group" style="margin:0">
+          <label>Шифрование канала</label>
+          <select onchange="pbUpdateConnConfig(${idx},'encrypt',this.value)">
+            <option value=""    ${!cfg.encrypt            ?'selected':''}>Как решит драйвер</option>
+            <option value="yes" ${cfg.encrypt==='yes'     ?'selected':''}>Обязательно</option>
+            <option value="no"  ${cfg.encrypt==='no'      ?'selected':''}>Выключено</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Сертификат сервера</label>
+          <select onchange="pbUpdateConnConfig(${idx},'trust_server_certificate',this.value)">
+            <option value=""    ${!cfg.trust_server_certificate        ?'selected':''}>Проверять</option>
+            <option value="yes" ${cfg.trust_server_certificate==='yes' ?'selected':''}>Доверять без проверки</option>
+          </select>
+        </div>
+      </div>
+
+      <details style="margin-top:.6rem">
+        <summary style="cursor:pointer;color:var(--muted);font-size:.9rem">Дополнительно</summary>
+        <div class="conn-grid" style="margin-top:.5rem">
+          <div class="form-group" style="margin:0">
+            <label>Строк за раз</label>
+            <input type="text" value="${escAttr(cfg.batch_size || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'batch_size',this.value)" placeholder="8192">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Версия сервера</label>
+            <input type="text" value="${escAttr(cfg.server_version || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'server_version',this.value)"
+                   placeholder="определяется сама"
+                   title="Мажорная версия: 16 — 2022, 15 — 2019, 14 — 2017, 11 — 2012, 10 — 2008 R2, 8 — 2000. Заполняется, только если сервер не отдаёт свою версию — тогда от неё зависит синтаксис постраничного чтения">
+          </div>
+        </div>
+        <div class="conn-grid" style="margin-top:.5rem">
+          <div class="form-group" style="margin:0">
+            <label>Версия протокола TDS</label>
+            <input type="text" value="${escAttr(cfg.tds_version || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'tds_version',this.value)"
+                   placeholder="auto"
+                   title="auto подходит серверам от 7.0 до 2025. Менять нужно крайне редко: 7.4 — 2012 и новее, 7.3 — 2008, 7.2 — 2005, 7.1 — 2000">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label>Кодировка клиента</label>
+            <input type="text" value="${escAttr(cfg.client_charset || '')}"
+                   oninput="pbUpdateConnConfig(${idx},'client_charset',this.value)"
+                   placeholder="UTF-8"
+                   title="Только для FreeTDS. Без UTF-8 кириллица из NVARCHAR приходит как «?». Драйверу Microsoft параметр не нужен">
+          </div>
+        </div>
+        <div class="form-group" style="margin:.5rem 0 0">
+          <label>Готовая строка подключения (DSN)</label>
+          <input type="text" value="${escAttr(cfg.dsn || '')}"
+                 oninput="pbUpdateConnConfig(${idx},'dsn',this.value)"
+                 placeholder="задаётся вместо полей выше"
+                 title="Когда заполнено, поля адреса, базы и учётных данных не используются — строка уходит драйверу как есть">
+        </div>
+      </details>
+
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
         <button id="pb-dbtest-${idx}" type="button" class="btn btn-primary btn-sm"
                 style="white-space:nowrap;min-width:150px;justify-content:center${step._dbok ? ';background:var(--green);border-color:var(--green);color:#fff' : ''}"
                 onclick="event.stopPropagation();pbTestConnection(${idx})">${step._dbok ? '✓ Подключено' : 'Подключиться'}</button>
       </div>
-      ${step.is_sink ? '' : `
+      ${step.is_sink ? `
+      ${/* Ключ идемпотентности — только у приёмника: он определяет, обновлять
+           существующую строку или добавлять новую. Без него повторный прогон
+           конвейера дублирует данные. */''}
+      <div class="form-group" style="margin:.6rem 0 0">
+        <label>Ключ идемпотентности</label>
+        <input type="text" value="${escAttr(cfg.primary_key || '')}"
+               oninput="pbUpdateConnConfig(${idx},'primary_key',this.value)"
+               placeholder="id — или несколько колонок через запятую"
+               title="Колонки, по которым строка считается той же самой. Заполнено — повторный прогон обновит строку вместо создания дубликата">
+      </div>` : `
       <div class="conn-grid" style="margin-top:.6rem">
         <div class="form-group" style="margin:0">
           <label>Режим чтения</label>
