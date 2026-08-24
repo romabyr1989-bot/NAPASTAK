@@ -345,23 +345,35 @@ static void conn_ticker_stop(void) {
 static const char *SCHEMA_DBS[] = { "catalog.db", "rbac.db", "audit.db", NULL };
 
 static int db_user_version(const char *path, int *out) {
-    sqlite3 *db = NULL;
-    /* Только чтение и без создания: несуществующий файл — это чистая установка,
-     * её проверять не надо, схему создадут подсистемы. */
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        if (db) sqlite3_close(db);
-        return -1;
+    /* Две попытки: сперва только чтение, затем чтение-запись БЕЗ создания
+     * (несуществующий файл — чистая установка, её проверять не надо).
+     *
+     * Почему мало одной: наши базы работают в режиме WAL, а для доступа к
+     * такой базе SQLite нужен служебный файл -shm, и создать его в
+     * readonly-режиме нельзя — PRAGMA падает с «unable to open database
+     * file». Ровно это и происходит ПОСЛЕ ВОССТАНОВЛЕНИЯ ИЗ РЕЗЕРВНОЙ КОПИИ:
+     * копируется только сам .db, без -wal и -shm. Гейтвей отказывался
+     * стартовать и советовал в сообщении восстановиться из копии — то есть
+     * ровно то действие, которое и приводило к отказу. */
+    static const int MODES[2] = { SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE };
+    for (int m = 0; m < 2; m++) {
+        sqlite3 *db = NULL;
+        if (sqlite3_open_v2(path, &db, MODES[m], NULL) != SQLITE_OK) {
+            if (db) sqlite3_close(db);
+            continue;
+        }
+        sqlite3_stmt *st = NULL;
+        int rc = -1;
+        if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &st, NULL) == SQLITE_OK
+            && sqlite3_step(st) == SQLITE_ROW) {
+            *out = sqlite3_column_int(st, 0);
+            rc = 0;
+        }
+        if (st) sqlite3_finalize(st);
+        sqlite3_close(db);
+        if (rc == 0) return 0;
     }
-    sqlite3_stmt *st = NULL;
-    int rc = -1;
-    if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &st, NULL) == SQLITE_OK
-        && sqlite3_step(st) == SQLITE_ROW) {
-        *out = sqlite3_column_int(st, 0);
-        rc = 0;
-    }
-    if (st) sqlite3_finalize(st);
-    sqlite3_close(db);
-    return rc;
+    return -1;
 }
 
 /* Отказывается запускаться на базе от более новой версии. Это защита ПОСЛЕ
