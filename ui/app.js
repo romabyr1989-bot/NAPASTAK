@@ -3445,16 +3445,20 @@ function makeConnectorConfigHTML(step, idx) {
           </div>
         </div>
       </div>
-      ${/* Драйвер ODBC — отдельным рядом: по умолчанию FreeTDS из бандла,
-           офлайн-установка работает без доустановок. Кто поставил драйвер
-           Microsoft, пишет сюда «ODBC Driver 18 for SQL Server» — код от этого
-           не меняется. Версию протокола не показываем: auto подходит всем
-           серверам от 7.0 до 2022, а ручной выбор нужен исключительно редко. */''}
+      ${/* Драйвер ODBC — отдельным рядом и необязателен: пустое поле означает
+           автоподбор (сначала вложенный в поставку, затем системный FreeTDS,
+           затем драйверы Microsoft), поэтому офлайн-установка подключается без
+           доустановок и без настройки. Заполняют его те, кому нужен именно
+           свой драйвер — например «ODBC Driver 18 for SQL Server» ради Always
+           Encrypted; тогда перебора не происходит и ошибка приходит про него.
+           Версию протокола не показываем: auto подходит всем серверам от 7.0
+           до 2022, а ручной выбор нужен исключительно редко. */''}
       <div class="conn-grid" style="margin-top:.6rem">
         <div class="form-group" style="margin:0">
           <label>Драйвер ODBC</label>
           <input type="text" value="${escAttr(cfg.odbc_driver || '')}"
-                 oninput="pbUpdateConnConfig(${idx},'odbc_driver',this.value)" placeholder="FreeTDS">
+                 oninput="pbUpdateConnConfig(${idx},'odbc_driver',this.value)"
+                 placeholder="оставьте пустым — подберётся автоматически">
         </div>
       </div>
       <div class="conn-actions" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">

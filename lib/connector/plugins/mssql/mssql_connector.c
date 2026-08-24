@@ -44,6 +44,7 @@ typedef struct {
     char     cursor_column[128];   /* задан → инкрементальное чтение */
     char     schema[128];          /* по умолчанию dbo */
     char     primary_key[256];     /* приёмник: идемпотентная запись через MERGE */
+    char     driver_used[128];     /* имя драйвера, которым подключились */
     Arena   *arena;
     char     last_err[512];
 } MsCtx;
@@ -75,6 +76,20 @@ static void ms_diag(MsCtx *ctx, SQLSMALLINT type, SQLHANDLE h, const char *what)
 }
 
 static bool ms_ok(SQLRETURN rc) { return rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO; }
+
+/* SQLSTATE первой записи диагностики. Нужен, чтобы отличить «такого драйвера
+ * в системе нет» (IM002) от «драйвер есть, но сервер отказал»: перебирать
+ * кандидатов имеет смысл только в первом случае — иначе неверный пароль
+ * превратится в пять попыток подключения подряд. */
+static void ms_sqlstate(SQLSMALLINT type, SQLHANDLE h, char out[6])
+{
+    SQLCHAR state[6] = "", msg[512];
+    SQLINTEGER native = 0;
+    SQLSMALLINT len = 0;
+    out[0] = 0;
+    if (SQLGetDiagRec(type, h, 1, state, &native, msg, sizeof(msg), &len) == SQL_SUCCESS)
+        snprintf(out, 6, "%s", (const char *)state);
+}
 
 /* ── Маппинг типа SQL Server (строка из INFORMATION_SCHEMA) в ColType ──
  * Как в pg/oracle: describe() отдаёт настоящий тип метаданными, а read_batch
@@ -203,7 +218,7 @@ static void *ms_create(const char *cfg, Arena *a)
     cfg_get(cfg, "database",      database, sizeof(database), "");
     cfg_get(cfg, "user",          user,     sizeof(user),     "");
     cfg_get(cfg, "password",      pass,     sizeof(pass),     "");
-    cfg_get(cfg, "odbc_driver",   driver,   sizeof(driver),   "FreeTDS");
+    cfg_get(cfg, "odbc_driver",   driver,   sizeof(driver),   "");
     cfg_get(cfg, "dsn",           dsn,      sizeof(dsn),      "");
     cfg_get(cfg, "batch_size",    bsz,      sizeof(bsz),      "8192");
     cfg_get(cfg, "encrypt",       enc,      sizeof(enc),      "");
@@ -217,37 +232,26 @@ static void *ms_create(const char *cfg, Arena *a)
     int b = atoi(bsz);
     if (b > 0) ctx->batch_size = b;
 
-    if (dsn[0]) {
-        snprintf(ctx->dsn, sizeof(ctx->dsn), "%s", dsn);
-    } else if (!host[0]) {
+    /* Имя драйвера ODBC. Если оператор указал своё — берём только его: чужой
+     * драйвер молча подменять нельзя. Если поле пустое, перебираем кандидатов.
+     * Первым идёт вложенный в поставку (его регистрирует install.sh под
+     * именем NAPASTAK-FreeTDS) — он собран и проверен вместе с коннектором,
+     * тогда как системный FreeTDS может оказаться сколь угодно старым. Дальше
+     * системный FreeTDS и драйверы Microsoft: машина, где стоит msodbcsql18,
+     * подключается без правки настроек. */
+    static const char *const CANDIDATES[] = {
+        "NAPASTAK-FreeTDS", "FreeTDS",
+        "ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server",
+        "SQL Server", NULL
+    };
+    const char *tried[8];
+    int ntried = 0;
+
+    if (!dsn[0] && !host[0]) {
         snprintf(ctx->last_err, sizeof(ctx->last_err),
                  "не задан host (или dsn целиком)");
         LOG_ERROR("mssql: %s", ctx->last_err);
         return ctx;
-    } else {
-        /* TDS_Version нужен именно FreeTDS: без него он берёт древний диалект
-         * из freetds.conf и валится на современных серверах. Драйверу
-         * Microsoft этот ключ безразличен — он его игнорирует. */
-        int n = snprintf(ctx->dsn, sizeof(ctx->dsn),
-                         "DRIVER=%s;SERVER=%s;PORT=%s;DATABASE=%s;UID=%s;PWD=%s;TDS_Version=%s;",
-                         driver, host, port, database, user, pass, tdsver);
-        /* ClientCharset — только для FreeTDS. Без него он работает в ISO-8859-1
-         * и молча заменяет кириллицу из NVARCHAR на «?»: в базе данные целы, а
-         * до нас доезжает мусор. Драйверу Microsoft этот ключ не нужен (он
-         * всегда отдаёт UTF-16) и на незнакомое имя ключа он ругается, поэтому
-         * добавляем ТОЛЬКО когда драйвер похож на FreeTDS. */
-        if (n > 0 && (size_t)n < sizeof(ctx->dsn) && charset[0] &&
-            (strcasestr(driver, "freetds") || strcasestr(driver, "tds"))) {
-            n += snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
-                          "ClientCharset=%s;", charset);
-        }
-        if (n > 0 && (size_t)n < sizeof(ctx->dsn)) {
-            if (enc[0])   snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
-                                   "Encrypt=%s;", enc);
-            size_t l = strlen(ctx->dsn);
-            if (trust[0]) snprintf(ctx->dsn + l, sizeof(ctx->dsn) - l,
-                                   "TrustServerCertificate=%s;", trust);
-        }
     }
 
     if (!ms_ok(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &ctx->env))) {
@@ -261,13 +265,73 @@ static void *ms_create(const char *cfg, Arena *a)
         return ctx;
     }
 
-    SQLCHAR outstr[1024];
-    SQLSMALLINT outlen = 0;
-    SQLRETURN rc = SQLDriverConnect(ctx->dbc, NULL, (SQLCHAR *)ctx->dsn, SQL_NTS,
-                                    outstr, sizeof(outstr), &outlen,
-                                    SQL_DRIVER_NOPROMPT);
+    SQLRETURN rc = SQL_ERROR;
+    for (int cand = 0; ; cand++) {
+        if (dsn[0]) {
+            snprintf(ctx->dsn, sizeof(ctx->dsn), "%s", dsn);
+        } else {
+            const char *drv = driver[0] ? driver : CANDIDATES[cand];
+            if (!drv) break;                       /* кандидаты кончились */
+            if (ntried < (int)(sizeof(tried)/sizeof(tried[0]))) tried[ntried++] = drv;
+            snprintf(ctx->driver_used, sizeof(ctx->driver_used), "%s", drv);
+
+            /* TDS_Version нужен именно FreeTDS: без него он берёт древний
+             * диалект из freetds.conf и валится на современных серверах.
+             * Драйверу Microsoft этот ключ безразличен — он его игнорирует. */
+            int n = snprintf(ctx->dsn, sizeof(ctx->dsn),
+                             "DRIVER=%s;SERVER=%s;PORT=%s;DATABASE=%s;UID=%s;PWD=%s;TDS_Version=%s;",
+                             drv, host, port, database, user, pass, tdsver);
+            /* ClientCharset — только для FreeTDS. Без него он работает в
+             * ISO-8859-1 и молча заменяет кириллицу из NVARCHAR на «?»: в базе
+             * данные целы, а до нас доезжает мусор. Драйверу Microsoft этот
+             * ключ не нужен (он всегда отдаёт UTF-16) и на незнакомое имя
+             * ключа он ругается, поэтому добавляем ТОЛЬКО когда драйвер похож
+             * на FreeTDS. */
+            if (n > 0 && (size_t)n < sizeof(ctx->dsn) && charset[0] &&
+                (strcasestr(drv, "freetds") || strcasestr(drv, "tds"))) {
+                n += snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
+                              "ClientCharset=%s;", charset);
+            }
+            if (n > 0 && (size_t)n < sizeof(ctx->dsn)) {
+                if (enc[0])   snprintf(ctx->dsn + n, sizeof(ctx->dsn) - (size_t)n,
+                                       "Encrypt=%s;", enc);
+                size_t l = strlen(ctx->dsn);
+                if (trust[0]) snprintf(ctx->dsn + l, sizeof(ctx->dsn) - l,
+                                       "TrustServerCertificate=%s;", trust);
+            }
+        }
+
+        SQLCHAR outstr[1024];
+        SQLSMALLINT outlen = 0;
+        rc = SQLDriverConnect(ctx->dbc, NULL, (SQLCHAR *)ctx->dsn, SQL_NTS,
+                              outstr, sizeof(outstr), &outlen, SQL_DRIVER_NOPROMPT);
+        if (ms_ok(rc)) break;
+
+        /* Следующего кандидата пробуем ТОЛЬКО если этого драйвера нет в
+         * системе. Любой другой отказ — не наше дело перебирать: сервер
+         * ответил, и повторять с другим драйвером бессмысленно и медленно. */
+        char state[6];
+        ms_sqlstate(SQL_HANDLE_DBC, ctx->dbc, state);
+        if (dsn[0] || driver[0] || strcmp(state, "IM002") != 0) break;
+    }
+
     if (!ms_ok(rc)) {
         ms_diag(ctx, SQL_HANDLE_DBC, ctx->dbc, "подключение");
+        /* Перебрали всё и не нашли ни одного драйвера — подсказываем, что
+         * именно искали: иначе «Data source name not found» ничего не говорит
+         * о том, какие имена коннектор считает своими. */
+        if (ntried > 1) {
+            size_t l = strlen(ctx->last_err);
+            l += (size_t)snprintf(ctx->last_err + l, sizeof(ctx->last_err) - l,
+                                  ". Проверены драйверы ODBC:");
+            for (int i = 0; i < ntried && l < sizeof(ctx->last_err) - 1; i++)
+                l += (size_t)snprintf(ctx->last_err + l, sizeof(ctx->last_err) - l,
+                                      "%s «%s»", i ? "," : "", tried[i]);
+            snprintf(ctx->last_err + l, sizeof(ctx->last_err) - l,
+                     ". Задайте своё имя в поле «Драйвер ODBC» или "
+                     "зарегистрируйте драйвер в /etc/odbcinst.ini");
+            LOG_ERROR("mssql: %s", ctx->last_err);
+        }
         SQLFreeHandle(SQL_HANDLE_DBC, ctx->dbc); ctx->dbc = SQL_NULL_HDBC;
         return ctx;
     }
@@ -289,7 +353,8 @@ static void *ms_create(const char *cfg, Arena *a)
                        : ctx->srv_major >= 9  ? "ROW_NUMBER()"
                                               : "вложенный TOP";
     LOG_INFO("mssql: подключено к %s (мажорная версия %d, драйвер %s, пагинация %s)",
-             host[0] ? host : "dsn", ctx->srv_major, driver, paging);
+             host[0] ? host : "dsn", ctx->srv_major,
+             ctx->driver_used[0] ? ctx->driver_used : "из DSN", paging);
     if (ctx->srv_major > 0 && ctx->srv_major < 9)
         LOG_WARN("mssql: сервер версии %d (2000 или старше) — пагинация через "
                  "вложенный TOP. Она устойчива ТОЛЬКО при уникальной колонке "
