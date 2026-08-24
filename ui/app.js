@@ -54,6 +54,11 @@ const CONN_SECRET_MASK = '********';
 
 const CONN_FORM_IDX = -1;
 let _connFormStep = null;
+/* Есть ли в форме подключения правки, ещё не сохранённые в справочнике.
+ * Пока они есть, кнопка не управляет постоянной сессией: сессия поднимается по
+ * СОХРАНЁННОМУ конфигу, и «подключено» после правки пароля означало бы, что
+ * проверен старый пароль, а не введённый. */
+let _connFormDirty = false;
 
 /* Единственная точка разыменования индекса шага для формы коннектора. */
 function pbStep(idx) {
@@ -1425,6 +1430,7 @@ function pbUpdateConnConfig(idx, field, val) {
   const cfg = normalizeConnConfig(safeParse(step.connector_config, {}), stepConnType(step));
   cfg[field] = val;
   step.connector_config = JSON.stringify(cfg);
+  if (idx === CONN_FORM_IDX) { _connFormDirty = true; paintConnButton(CONN_FORM_IDX); }
   if (typeof saveBuilderDraft === 'function') saveBuilderDraft();
 }
 
@@ -2020,6 +2026,44 @@ function pbConnState(step) {
  * оборвалась. Это худший вид индикатора: он утверждает то, чего нет. Теперь
  * для шагов, привязанных к справочнику, отметка берётся из состояния пула, а
  * значит гаснет сама, когда сессия рвётся по техническим причинам. */
+/* Красит кнопку «Подключиться» по текущему состоянию, НЕ перерисовывая форму.
+ *
+ * Перерисовка тут недопустима: редактор подключения и карточки шагов содержат
+ * поля, которые в этот момент заполняют, — обновление раз в несколько секунд
+ * сбрасывало бы фокус и введённый текст. Поэтому обновляем ровно одну кнопку. */
+function paintConnButton(idx) {
+  const btn = document.getElementById(`pb-dbtest-${idx}`);
+  if (!btn || btn.disabled) return;          /* идёт нажатие — не мешаем */
+  const step = pbStep(idx);
+  if (!step) return;
+  const state = pbConnState(step);
+  if (state === null) return;                /* инлайновые параметры — не наше дело */
+  if (idx === CONN_FORM_IDX && _connFormDirty) {
+    /* Правки не сохранены: зелёный относился бы к прежним параметрам. */
+    btn.style.background = ''; btn.style.borderColor = ''; btn.style.color = '';
+    btn.textContent = 'Проверить связь';
+    btn.title = 'Параметры изменены. Проверка пойдёт с введёнными значениями; '
+              + 'чтобы они стали постоянными, сохраните подключение';
+    return;
+  }
+  const live = (state === 'ok');
+  btn.style.background  = live ? 'var(--green)' : '';
+  btn.style.borderColor = live ? 'var(--green)' : '';
+  btn.style.color       = live ? '#fff' : '';
+  btn.textContent = live ? '✓ Подключено'
+                  : (state === 'off' ? 'Подключить' : 'Подключиться');
+  btn.title = live ? 'Постоянная сессия установлена. Нажмите, чтобы разорвать'
+            : (state === 'off' ? 'Отключено оператором. Нажмите, чтобы подключить'
+                               : 'Установить постоянную сессию');
+}
+
+/* Все кнопки на экране разом: карточки шагов конструктора и форма подключения. */
+function paintConnButtons() {
+  if (_connFormStep) paintConnButton(CONN_FORM_IDX);
+  const steps = (pb && Array.isArray(pb.steps)) ? pb.steps : [];
+  steps.forEach((_, i) => paintConnButton(i));
+}
+
 function syncStepConnFlags() {
   const steps = (pb && Array.isArray(pb.steps)) ? pb.steps.slice() : [];
   if (_connFormStep) steps.push(_connFormStep);
@@ -2049,7 +2093,7 @@ async function pbTestConnection(idx) {
   };
 
   /* ── Подключение из справочника: управляем постоянной сессией ── */
-  if (step.connection_id) {
+  if (step.connection_id && !(idx === CONN_FORM_IDX && _connFormDirty)) {
     const connected = pbConnState(step) === 'ok';
     set('', '', connected ? 'Отключение…' : 'Подключение…'); btn.disabled = true;
     try {
@@ -2100,6 +2144,8 @@ async function pbTestConnection(idx) {
     if (r && r.ok) {
       step._dbok = true;
       set('var(--green)', '#fff', '✓ Связь есть');
+      if (idx === CONN_FORM_IDX && _connFormDirty)
+        showToast('Связь есть. Сохраните подключение, чтобы применить параметры к постоянной сессии', 'info');
     } else {
       step._dbok = false;
       set('', '', 'Подключиться');   /* the toast carries the reason */
@@ -2721,14 +2767,17 @@ let _builderConnTimer = null;
 function startBuilderConnPolling() {
   if (_builderConnTimer) clearInterval(_builderConnTimer);
   _builderConnTimer = setInterval(async () => {
-    if (!document.getElementById('pb-steps')) { stopBuilderConnPolling(); return; }
+    const editorOpen = _connFormStep &&
+      (document.getElementById('conn-editor') || {}).style?.display === '';
+    if (!document.getElementById('pb-steps') && !editorOpen) { stopBuilderConnPolling(); return; }
     if (document.hidden) return;
     const attached = (pb && Array.isArray(pb.steps) ? pb.steps : []).some(s => s.connection_id)
                      || !!(_connFormStep && _connFormStep.connection_id);
     if (!attached) return;                  /* нечего отслеживать — не дёргаем сервер */
     try {
       await loadConnectionsCache();
-      if (syncStepConnFlags()) renderBuilderSteps();
+      syncStepConnFlags();
+      paintConnButtons();
     } catch (_) { /* сеть моргнула — следующий тик поправит */ }
   }, 7000);
 }
@@ -6587,6 +6636,7 @@ function openConnectionEditor(id, dirHint, afterSave) {
   /* Виртуальный «шаг» редактора: на нём работает та же форма коннектора, что и
    * в конструкторе. connection_id нужен пробам — сервер подставит по нему
    * настоящие секреты вместо масок. */
+  _connFormDirty = false;
   _connFormStep = {
     id: '__conn__',
     connector_type:   rec ? rec.type : 'postgresql',
@@ -6601,7 +6651,12 @@ function openConnectionEditor(id, dirHint, afterSave) {
   document.getElementById('conn-name').value = rec ? rec.name : '';
   document.getElementById('conn-status').textContent = '';
   document.getElementById('conn-editor').style.display = '';
+  /* Состояние сессии — ДО отрисовки: иначе кнопка в форме нарисуется синей у
+   * подключения, которое в списке уже помечено как подключённое. */
+  syncStepConnFlags();
   renderConnEditorForm();
+  paintConnButton(CONN_FORM_IDX);
+  startBuilderConnPolling();      /* связь может оборваться, пока форма открыта */
   document.getElementById('conn-name').focus();
 }
 
@@ -6625,6 +6680,7 @@ function renderConnEditorBody() {
   const box = document.getElementById('step-conn-cfg--1');
   if (!box || !_connFormStep) return;
   box.innerHTML = makeConnectorConfigHTML(_connFormStep, CONN_FORM_IDX);
+  setTimeout(() => paintConnButton(CONN_FORM_IDX), 0);   /* после вставки разметки */
   /* Подключение не знает про роль, а форма коннектора кое-где ветвится по
    * is_sink: часть полей доступа рисуется ТОЛЬКО в варианте приёмника
    * (у SOAP — «Пространство имён»). Показываем объединение обоих вариантов,
@@ -6750,6 +6806,7 @@ function closeConnectionEditor() {
   document.getElementById('conn-editor').style.display = 'none';
   _connEditId = null;
   _connAfterSave = null;
+  if (!document.getElementById('pb-steps')) stopBuilderConnPolling();
 }
 
 /* Тело запроса. Конфиг уже собран самой формой в _connFormStep.connector_config
@@ -6788,6 +6845,7 @@ async function saveConnection() {
       ? await apiPut('/api/connections/' + encodeURIComponent(_connEditId), body)
       : await apiPost('/api/connections', body);
     st.textContent = '';
+    _connFormDirty = false;      /* правки уехали в справочник */
     showToast('Подключение сохранено', 'ok');
     const cb = _connAfterSave;
     closeConnectionEditor();
