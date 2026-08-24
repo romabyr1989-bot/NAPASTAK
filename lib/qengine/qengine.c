@@ -596,16 +596,30 @@ static int scan_next(Operator *op, ColBatch **out) {
         if (rec_len >= sizeof(line_buf)) { fseek(st->wal_file, rec_len, SEEK_CUR); continue; }
         if (fread(line_buf, 1, rec_len, st->wal_file) != rec_len) { st->done=1; break; }
         line_buf[rec_len] = '\0';
-        /* parse comma-separated line */
-        char *p = line_buf; int col = 0;
+        /* Служебные записи (DELETE/UPDATE) — не данные, пропускаем. */
+        if ((unsigned char)line_buf[0]==WAL_OP_DELETE ||
+            (unsigned char)line_buf[0]==WAL_OP_UPDATE) continue;
+        /* Записи с WAL_OP_INSERT_ESC несут поля, экранированные по RFC4180:
+         * значение могло содержать запятую, кавычку или перевод строки, а
+         * литерал "NULL" и пустая строка закавычены, чтобы отличаться от NULL.
+         * Без этой ветки такие записи разъехались бы по первой же запятой. */
+        int esc = ((unsigned char)line_buf[0] == (unsigned char)WAL_OP_INSERT_ESC);
+        char *p = line_buf + (esc ? 1 : 0); int col = 0;
         while (col < ncols) {
+            char *tmp = arena_alloc(op->arena, rec_len + 2);
+            size_t tl = 0; int was_quoted = 0;
+            if (esc && *p == '"') {
+                was_quoted = 1; p++;
+                while (*p) {
+                    if (*p == '"') { if (p[1]=='"') { tmp[tl++]='"'; p+=2; continue; } p++; break; }
+                    tmp[tl++] = *p++;
+                }
+            } else {
+                while (*p && *p != ',' && *p != '\n' && *p != '\r') tmp[tl++] = *p++;
+            }
+            tmp[tl] = '\0';
             char *comma = strchr(p, ',');
-            size_t vlen = comma ? (size_t)(comma - p) : strlen(p);
-            /* strip \n */
-            while (vlen > 0 && (p[vlen-1]=='\n'||p[vlen-1]=='\r')) vlen--;
-            char tmp[4096]; if(vlen>=sizeof(tmp)) vlen=sizeof(tmp)-1;
-            memcpy(tmp,p,vlen); tmp[vlen]='\0';
-            if (strcmp(tmp,"NULL")==0) {
+            if (!was_quoted && strcmp(tmp,"NULL")==0) {
                 batch->null_bitmap[col][row/8] |= (1u<<(row%8));
             } else {
                 switch (schema->cols[col].type) {
