@@ -6053,7 +6053,15 @@ static int run_sink_step(App *app, Arena *a, PipelineStep *st, char *errbuf, siz
     for (int c = 0; c < rs->ncols; c++) {
         ColType lt = rs->col_types ? rs->col_types[c] : COL_TEXT;
         schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
-        schema->cols[c].type     = (lt==COL_INT64||lt==COL_DOUBLE||lt==COL_BOOL) ? lt : COL_TEXT;
+        /* Значения в батче приёмника ВСЕГДА char*, а тип нужен коннектору лишь
+         * чтобы создать родную колонку вместо сплошного TEXT. Белый список
+         * составлялся до появления DECIMAL/DATE/TIMESTAMP, и они схлопывались
+         * в TEXT: numeric из источника приезжал в приёмник текстовой колонкой,
+         * дата — тоже. Эти три хранятся текстом ровно так же, как TEXT,
+         * поэтому пропускаем их наравне с остальными. */
+        schema->cols[c].type     = (lt==COL_INT64 || lt==COL_DOUBLE || lt==COL_BOOL ||
+                                    lt==COL_DECIMAL || lt==COL_DATE || lt==COL_TIMESTAMP)
+                                 ? lt : COL_TEXT;
         schema->cols[c].nullable = true;
     }
 
