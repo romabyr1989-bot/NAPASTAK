@@ -86,19 +86,45 @@ static bool ms_ok(SQLRETURN rc) { return rc == SQL_SUCCESS || rc == SQL_SUCCESS_
  * в системе нет» (IM002) от «драйвер есть, но сервер отказал»: перебирать
  * кандидатов имеет смысл только в первом случае — иначе неверный пароль
  * превратится в пять попыток подключения подряд. */
-static void ms_sqlstate(SQLSMALLINT type, SQLHANDLE h, char out[6])
+/* SQLSTATE первой диагностической записи; msg_out (может быть NULL) получает
+ * текст сообщения — он нужен, чтобы отличить «драйвера нет» от других отказов
+ * там, где менеджер драйверов не выставляет отдельного состояния. */
+static void ms_sqlstate_msg(SQLSMALLINT type, SQLHANDLE h, char out[6],
+                            char *msg_out, size_t msg_cap)
 {
-    SQLCHAR state[6] = "", msg[512];
+    SQLCHAR state[6] = "", msg[512] = "";
     SQLINTEGER native = 0;
     SQLSMALLINT len = 0;
     out[0] = 0;
-    if (SQLGetDiagRec(type, h, 1, state, &native, msg, sizeof(msg), &len) == SQL_SUCCESS)
+    if (msg_out && msg_cap) msg_out[0] = 0;
+    if (SQLGetDiagRec(type, h, 1, state, &native, msg, sizeof(msg), &len) == SQL_SUCCESS) {
         snprintf(out, 6, "%s", (const char *)state);
+        if (msg_out && msg_cap) snprintf(msg_out, msg_cap, "%s", (const char *)msg);
+    }
 }
+
 
 /* ── Маппинг типа SQL Server (строка из INFORMATION_SCHEMA) в ColType ──
  * Как в pg/oracle: describe() отдаёт настоящий тип метаданными, а read_batch
  * эмитит всё как COL_TEXT. */
+/* Код типа из SQLDescribeCol -> логический тип. Значение всё равно читается
+ * текстом; тип нужен, чтобы приёмник создал родную колонку. decimal/numeric
+ * отдаём как COL_DECIMAL, а не COL_DOUBLE: двоичная мантисса срезала бы
+ * деньги и длинные идентификаторы. */
+static ColType ms_sqltype_to_col(SQLSMALLINT t)
+{
+    switch (t) {
+        case SQL_BIT:                                     return COL_BOOL;
+        case SQL_TINYINT: case SQL_SMALLINT:
+        case SQL_INTEGER: case SQL_BIGINT:                return COL_INT64;
+        case SQL_REAL:    case SQL_FLOAT: case SQL_DOUBLE: return COL_DOUBLE;
+        case SQL_DECIMAL: case SQL_NUMERIC:               return COL_DECIMAL;
+        case SQL_TYPE_DATE:                               return COL_DATE;
+        case SQL_TYPE_TIMESTAMP: case SQL_TIMESTAMP:      return COL_TIMESTAMP;
+        default:                                          return COL_TEXT;
+    }
+}
+
 static ColType ms_col_type(const char *t)
 {
     if (!t) return COL_TEXT;
@@ -331,10 +357,26 @@ static void *ms_create(const char *cfg, Arena *a)
 
         /* Следующего кандидата пробуем ТОЛЬКО если этого драйвера нет в
          * системе. Любой другой отказ — не наше дело перебирать: сервер
-         * ответил, и повторять с другим драйвером бессмысленно и медленно. */
-        char state[6];
-        ms_sqlstate(SQL_HANDLE_DBC, ctx->dbc, state);
-        if (dsn[0] || driver[0] || strcmp(state, "IM002") != 0) break;
+         * ответил, и повторять с другим драйвером бессмысленно и медленно.
+         *
+         * «Нет в системе» проявляется по-разному, и одного IM002 мало:
+         *   IM002 — имя не найдено среди источников данных;
+         *   IM003 — драйвер найден в odbcinst.ini, но не загрузился;
+         *   01000 — имени нет в odbcinst.ini вовсе, и менеджер драйверов
+         *           пробует открыть его как путь к файлу, отвечая
+         *           «Can't open lib '<имя>' : file not found».
+         * Последний случай и ломал автоподбор: первым кандидатом идёт
+         * вложенный NAPASTAK-FreeTDS, которого на машине без install.sh нет,
+         * менеджер отвечал 01000 — и перебор обрывался на первом же имени,
+         * не доходя до системного FreeTDS и драйверов Microsoft. То есть
+         * «драйвер подбирается сам» на деле не работало нигде, кроме машин с
+         * нашей же установкой. */
+        char state[6], dmsg[512];
+        ms_sqlstate_msg(SQL_HANDLE_DBC, ctx->dbc, state, dmsg, sizeof(dmsg));
+        bool driver_absent = (strcmp(state, "IM002") == 0 || strcmp(state, "IM003") == 0 ||
+                              strstr(dmsg, "Can't open lib") != NULL ||
+                              strstr(dmsg, "file not found") != NULL);
+        if (dsn[0] || driver[0] || !driver_absent) break;
     }
 
     if (!ms_ok(rc)) {
@@ -692,17 +734,33 @@ static int ms_fetch_sql(MsCtx *ctx, Arena *a, const char *sql, const char *bind_
     sc->cols  = arena_alloc(a, (size_t)ncols * sizeof(ColDef));
     for (SQLSMALLINT c = 0; c < ncols; c++) {
         SQLCHAR nm[256] = ""; SQLSMALLINT nlen = 0;
+        SQLSMALLINT sqltype = SQL_VARCHAR;
         SQLDescribeCol(st, (SQLUSMALLINT)(c + 1), nm, sizeof(nm), &nlen,
-                       NULL, NULL, NULL, NULL);
+                       &sqltype, NULL, NULL, NULL);
         sc->cols[c].name     = arena_strdup(a, (const char *)nm);
-        sc->cols[c].type     = COL_TEXT;   /* значения всегда текстом, см. шапку */
+        /* Логический тип берём из метаданных запроса. Раньше здесь стоял
+         * безусловный COL_TEXT, и decimal, дата и bigint приезжали в приёмник
+         * текстовыми колонками: describe() отдавал верный тип, но конвейер при
+         * заборе данных пользуется схемой ИМЕННО отсюда, а не из describe().
+         *
+         * ВАЖНО: батч ИСТОЧНИКА обязан быть типизированным — хранилище читает
+         * INT64/BOOL как int64_t, DOUBLE как double (см. table_append). Ниже
+         * массивы и выделяются по объявленному типу. DECIMAL, DATE и TIMESTAMP
+         * остаются char*: они текстовые по замыслу, и именно поэтому не теряют
+         * разрядов. */
+        sc->cols[c].type     = ms_sqltype_to_col(sqltype);
         sc->cols[c].nullable = true;
     }
 
     ColBatch *batch = arena_calloc(a, sizeof(ColBatch));
     batch->schema = sc; batch->ncols = ncols; batch->nrows = 0;
-    for (SQLSMALLINT c = 0; c < ncols; c++)
-        batch->values[c] = arena_alloc(a, (size_t)limit * sizeof(char *));
+    for (SQLSMALLINT c = 0; c < ncols; c++) {
+        size_t esz = (sc->cols[c].type == COL_DOUBLE) ? sizeof(double)
+                   : (sc->cols[c].type == COL_INT64 ||
+                      sc->cols[c].type == COL_BOOL)   ? sizeof(int64_t)
+                                                      : sizeof(char *);
+        batch->values[c] = arena_calloc(a, (size_t)limit * esz);
+    }
 
     for (SQLSMALLINT c = 0; c < ncols; c++)
         batch->null_bitmap[c] = arena_calloc(a, ((size_t)limit + 7) / 8);
@@ -719,11 +777,30 @@ static int ms_fetch_sql(MsCtx *ctx, Arena *a, const char *sql, const char *bind_
                  * приёмник превращала бы NULL в «», ломая IS NULL и внешние
                  * ключи (та же ошибка уже была в write_batch). */
                 batch->null_bitmap[c][rows / 8] |= (uint8_t)(1u << (rows % 8));
-                ((char **)batch->values[c])[rows] = (char *)DFO_NULL_SENTINEL;
+                /* Типизированные ячейки остаются нулями (arena_calloc);
+                 * маркер кладём только в текстовые — иначе указатель лёг бы
+                 * в число. */
+                if (!COL_IS_TEXTUAL(sc->cols[c].type)) { /* число/булево — ноль */ }
+                else ((char **)batch->values[c])[rows] = (char *)DFO_NULL_SENTINEL;
                 continue;
             }
             if (!val) val = "";
-            ((char **)batch->values[c])[rows] = arena_strdup(a, val);
+            switch (sc->cols[c].type) {
+                case COL_INT64:
+                    ((int64_t *)batch->values[c])[rows] = strtoll(val, NULL, 10);
+                    break;
+                case COL_DOUBLE:
+                    ((double *)batch->values[c])[rows] = strtod(val, NULL);
+                    break;
+                case COL_BOOL:
+                    /* хранилище читает булев столбец как int64_t, не как int */
+                    ((int64_t *)batch->values[c])[rows] =
+                        (val[0] == '1' || val[0] == 't' || val[0] == 'T') ? 1 : 0;
+                    break;
+                default:
+                    ((char **)batch->values[c])[rows] = arena_strdup(a, val);
+                    break;
+            }
             /* Отметка для следующей страницы — значение колонки курсора. */
             if (ctx->cursor_column[0] &&
                 !strcasecmp(sc->cols[c].name, ctx->cursor_column))
