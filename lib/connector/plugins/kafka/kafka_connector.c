@@ -2302,7 +2302,7 @@ static int kafka_write_batch(void *vctx, Arena *a, const char *entity,
                 if (len+4>cap){cap*=2;msg=realloc(msg,cap);} memcpy(msg+len,"null",4); len+=4; continue;
             }
             ColType _ct = schema->cols[c].type;
-            bool bare = ((_ct==COL_INT64||_ct==COL_DOUBLE) && kafka_is_json_num(v)) ||
+            bool bare = (COL_IS_NUMERIC(_ct) && kafka_is_json_num(v)) ||
                         (_ct==COL_BOOL && (!strcmp(v,"true")||!strcmp(v,"false")));
             if (bare) {
                 size_t vl=strlen(v); if(len+vl>cap){while(len+vl>cap)cap*=2;msg=realloc(msg,cap);}

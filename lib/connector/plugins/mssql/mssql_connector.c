@@ -107,9 +107,14 @@ static ColType ms_col_type(const char *t)
         !strcasecmp(t, "int")      || !strcasecmp(t, "bigint"))  return COL_INT64;
     if (!strcasecmp(t, "real")     || !strcasecmp(t, "float"))   return COL_DOUBLE;
     /* decimal/numeric/money НЕ отдаём как DOUBLE: двоичное представление теряет
-     * точность, а это деньги и идентификаторы. Даты — тоже текстом: в наборе
-     * ColType отдельного временного типа нет (COL_INT64/DOUBLE/TEXT/BOOL/NULL),
-     * и pg с oracle поступают так же. */
+     * точность, а это деньги и идентификаторы. Для них есть COL_DECIMAL —
+     * хранится текстом, но приёмник создаёт родную NUMERIC, а не TEXT. */
+    if (!strcasecmp(t,"decimal") || !strcasecmp(t,"numeric") ||
+        !strcasecmp(t,"money")   || !strcasecmp(t,"smallmoney"))     return COL_DECIMAL;
+    if (!strcasecmp(t,"date"))                                       return COL_DATE;
+    if (!strcasecmp(t,"datetime")  || !strcasecmp(t,"datetime2") ||
+        !strcasecmp(t,"smalldatetime") || !strcasecmp(t,"datetimeoffset"))
+                                                                     return COL_TIMESTAMP;
     return COL_TEXT;
 }
 
@@ -1020,9 +1025,24 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
     for (int c = 0; c < ncols && n > 0 && (size_t)n < sizeof(ddl); c++) {
         char qc[160];
         ms_quote_ident(schema->cols[c].name, qc, sizeof(qc));
+        /* Тип колонки — из схемы. DECIMAL СОЗНАТЕЛЬНО остаётся текстом: в
+         * SQL Server у DECIMAL нет варианта «произвольная точность», голое
+         * DECIMAL означает DECIMAL(18,0) и МОЛЧА отбрасывает дробную часть, а
+         * подставить (38,10) наугад — значит так же молча округлять чужие
+         * данные. Пока схема не переносит precision/scale, текст здесь
+         * единственный вариант без потерь. Даты переносятся нативно. */
+        const char *sqlty;
+        if (ms_is_key_col(schema->cols[c].name, keys, nkeys)) sqlty = key_type;
+        else switch (schema->cols[c].type) {
+            case COL_INT64:     sqlty = "BIGINT";        break;
+            case COL_DOUBLE:    sqlty = "FLOAT";         break;
+            case COL_DATE:      sqlty = "DATE";          break;
+            case COL_TIMESTAMP: sqlty = "DATETIME2";     break;
+            case COL_BOOL:      sqlty = "BIT";           break;
+            default:            sqlty = text_type;       break;
+        }
         n += snprintf(ddl + n, sizeof(ddl) - (size_t)n, "%s%s %s",
-                      c ? ", " : "", qc,
-                      ms_is_key_col(schema->cols[c].name, keys, nkeys) ? key_type : text_type);
+                      c ? ", " : "", qc, sqlty);
     }
     if (n > 0 && (size_t)n < sizeof(ddl)) snprintf(ddl + n, sizeof(ddl) - (size_t)n, ")");
     if (ms_exec(ctx, ddl) != 0) return -1;

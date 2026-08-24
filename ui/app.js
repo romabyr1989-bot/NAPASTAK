@@ -294,7 +294,13 @@ function makeTableCard(t) {
   const card = document.createElement('div');
   card.className = 'table-card';
   const cols = (t.columns || []).map(c => {
-    const cls = c.type === 'int64' ? 'int' : c.type === 'double' ? 'double' : c.type === 'bool' ? 'bool' : '';
+    /* decimal подсвечиваем как число, дату и метку времени — отдельным цветом:
+       иначе новые типы выглядели бы обычным текстом и оператор не отличил бы
+       колонку с точным десятичным от строковой. */
+    const cls = c.type === 'int64' ? 'int'
+              : (c.type === 'double' || c.type === 'decimal') ? 'double'
+              : c.type === 'bool' ? 'bool'
+              : (c.type === 'date' || c.type === 'timestamp') ? 'temporal' : '';
     return `<span class="col-pill ${cls}">${escHtml(c.name)}<em style="opacity:.5">:${c.type}</em></span>`;
   }).join('');
   const sourceBadge = t.source === 'pipeline'

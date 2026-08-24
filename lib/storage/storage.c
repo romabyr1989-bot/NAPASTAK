@@ -713,6 +713,33 @@ Catalog *catalog_open(const char *path) {
 
 void catalog_close(Catalog *c) { sqlite3_close(c->db); pthread_mutex_destroy(&c->mu); free(c); }
 
+const char *col_type_name(ColType t) {
+    switch (t) {
+        case COL_INT64:     return "int64";
+        case COL_DOUBLE:    return "double";
+        case COL_BOOL:      return "bool";
+        case COL_NULL:      return "null";
+        case COL_DECIMAL:   return "decimal";
+        case COL_DATE:      return "date";
+        case COL_TIMESTAMP: return "timestamp";
+        case COL_TEXT:      default: return "text";
+    }
+}
+
+ColType col_type_from_name(const char *name) {
+    if (!name)                        return COL_TEXT;
+    if (!strcmp(name,"int64"))        return COL_INT64;
+    if (!strcmp(name,"double"))       return COL_DOUBLE;
+    if (!strcmp(name,"bool"))         return COL_BOOL;
+    if (!strcmp(name,"null"))         return COL_NULL;
+    if (!strcmp(name,"decimal"))      return COL_DECIMAL;
+    if (!strcmp(name,"date"))         return COL_DATE;
+    if (!strcmp(name,"timestamp"))    return COL_TIMESTAMP;
+    /* Неизвестное имя (база новее сборки) — текст: значение всё равно лежит
+     * строкой, теряется только представление, а не данные. */
+    return COL_TEXT;
+}
+
 /* Schema → JSON helper */
 static char *schema_to_json(Schema *s, Arena *a) {
     JBuf jb; jb_init(&jb, a, 512);
@@ -721,10 +748,7 @@ static char *schema_to_json(Schema *s, Arena *a) {
         if (!s->cols[i].name) continue;
         jb_obj_begin(&jb);
         jb_key(&jb,"name"); jb_str(&jb, s->cols[i].name);
-        const char *t = "text";
-        if (s->cols[i].type==COL_INT64) t="int64";
-        else if (s->cols[i].type==COL_DOUBLE) t="double";
-        else if (s->cols[i].type==COL_BOOL) t="bool";
+        const char *t = col_type_name(s->cols[i].type);
         jb_key(&jb,"type"); jb_str(&jb, t);
         jb_key(&jb,"nullable"); jb_bool(&jb, s->cols[i].nullable);
         jb_obj_end(&jb);
@@ -779,10 +803,7 @@ int catalog_get_schema(Catalog *c, const char *table, Schema **out, Arena *a) {
         JVal *col = arr->items[i];
         schema->cols[i].name = arena_strdup(a, json_str(json_get(col,"name"),""));
         const char *t = json_str(json_get(col,"type"),"text");
-        if (!strcmp(t,"int64"))  schema->cols[i].type=COL_INT64;
-        else if (!strcmp(t,"double")) schema->cols[i].type=COL_DOUBLE;
-        else if (!strcmp(t,"bool"))   schema->cols[i].type=COL_BOOL;
-        else schema->cols[i].type=COL_TEXT;
+        schema->cols[i].type = col_type_from_name(t);
         schema->cols[i].nullable = json_bool(json_get(col,"nullable"),true);
     }
     *out = schema;

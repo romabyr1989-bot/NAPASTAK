@@ -2287,8 +2287,15 @@ static ColType infer_expr_type(Expr *e, TblData *tables, int ntables) {
         const char *tn = e->args[1]->sval ? e->args[1]->sval : e->args[1]->name;
         if (tn) {
             if (!strncasecmp(tn,"int",3)||!strncasecmp(tn,"big",3)||!strncasecmp(tn,"sma",3)) return COL_INT64;
-            if (!strncasecmp(tn,"float",5)||!strncasecmp(tn,"double",6)||!strncasecmp(tn,"num",3)
-                ||!strncasecmp(tn,"dec",3)||!strncasecmp(tn,"real",4)) return COL_DOUBLE;
+            /* numeric/decimal — точный десятичный тип, а не double: приёмник
+             * должен создать NUMERIC, и разряды не должны срезаться. */
+            if (!strncasecmp(tn,"num",3)||!strncasecmp(tn,"dec",3)||!strncasecmp(tn,"money",5))
+                return COL_DECIMAL;
+            if (!strncasecmp(tn,"float",5)||!strncasecmp(tn,"double",6)||!strncasecmp(tn,"real",4))
+                return COL_DOUBLE;
+            /* timestamp проверяем ДО date — иначе "timestamp" не совпал бы. */
+            if (!strncasecmp(tn,"timestamp",9)||!strncasecmp(tn,"datetime",8)) return COL_TIMESTAMP;
+            if (!strncasecmp(tn,"date",4)) return COL_DATE;
             if (!strncasecmp(tn,"bool",4)) return COL_BOOL;
         }
         return COL_TEXT;
@@ -3664,7 +3671,7 @@ static void h_query(HttpReq *req, HttpResp *resp) {
                 const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
                 if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)){ jb_null(&jb); }
                 else { ColType _ct=rs->col_types?rs->col_types[c]:COL_TEXT;
-                       if((_ct==COL_INT64||_ct==COL_DOUBLE)&&is_json_number(v)) jb_raw(&jb,v);
+                       if(COL_IS_NUMERIC(_ct)&&is_json_number(v)) jb_raw(&jb,v);
                        else if(_ct==COL_BOOL&&(!strcmp(v,"true")||!strcmp(v,"false"))) jb_raw(&jb,v);
                        else jb_str(&jb,v); }
             }
@@ -3813,7 +3820,7 @@ static void h_query_named(HttpReq *req, HttpResp *resp) {
                 const char *v=rs->rows[r].cells?rs->rows[r].cells[c]:NULL;
                 if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)){ jb_null(&jb); }
                 else { ColType _ct=rs->col_types?rs->col_types[c]:COL_TEXT;
-                       if((_ct==COL_INT64||_ct==COL_DOUBLE)&&is_json_number(v)) jb_raw(&jb,v);
+                       if(COL_IS_NUMERIC(_ct)&&is_json_number(v)) jb_raw(&jb,v);
                        else if(_ct==COL_BOOL&&(!strcmp(v,"true")||!strcmp(v,"false"))) jb_raw(&jb,v);
                        else jb_str(&jb,v); }
             }
@@ -4141,11 +4148,7 @@ static void h_table_schema(HttpReq *req, HttpResp *resp) {
     for(int i=0;i<schema->ncols;i++){
         jb_obj_begin(&jb);
         jb_key(&jb,"name"); jb_str(&jb,schema->cols[i].name);
-        const char *tp="text";
-        if(schema->cols[i].type==COL_INT64)  tp="int64";
-        if(schema->cols[i].type==COL_DOUBLE) tp="double";
-        if(schema->cols[i].type==COL_BOOL)   tp="bool";
-        jb_key(&jb,"type"); jb_str(&jb,tp);
+        jb_key(&jb,"type"); jb_str(&jb, col_type_name(schema->cols[i].type));
         jb_key(&jb,"nullable"); jb_bool(&jb,schema->cols[i].nullable);
         jb_obj_end(&jb);
     }
@@ -4871,7 +4874,7 @@ static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
             const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : NULL;
             if(!v||(uintptr_t)v<0x1000||!strcmp(v,DFO_NULL_SENTINEL)){ jb_null(&jb); }
             else { ColType _ct=rs->col_types?rs->col_types[c]:COL_TEXT;
-                   if((_ct==COL_INT64||_ct==COL_DOUBLE)&&is_json_number(v)) jb_raw(&jb,v);
+                   if(COL_IS_NUMERIC(_ct)&&is_json_number(v)) jb_raw(&jb,v);
                    else if(_ct==COL_BOOL&&(!strcmp(v,"true")||!strcmp(v,"false"))) jb_raw(&jb,v);
                    else jb_str(&jb,v); }
         }
@@ -8463,11 +8466,10 @@ static void h_connector_probe_schema(HttpReq *req, HttpResp *resp) {
     jb_obj_begin(&jb);
     jb_key(&jb,"entity"); jb_str(&jb, entity);
     jb_key(&jb,"columns"); jb_arr_begin(&jb);
-    static const char *type_names[] = {"int64","double","text","bool","null"};
     for (int c = 0; c < sc->ncols; c++) {
         jb_obj_begin(&jb);
         jb_key(&jb,"name");     jb_str(&jb, sc->cols[c].name);
-        jb_key(&jb,"type");     jb_str(&jb, type_names[sc->cols[c].type]);
+        jb_key(&jb,"type");     jb_str(&jb, col_type_name(sc->cols[c].type));
         jb_key(&jb,"nullable"); jb_bool(&jb, sc->cols[c].nullable);
         jb_obj_end(&jb);
     }

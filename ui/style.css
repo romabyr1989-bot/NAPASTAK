@@ -173,6 +173,7 @@ h2 { font-size: 1rem; font-weight: 600; margin: 1.25rem 0 .75rem; color: var(--t
 .col-pill.int    { color: #60a5fa; }
 .col-pill.double { color: #34d399; }
 .col-pill.bool   { color: #f59e0b; }
+.col-pill.temporal { color: #a78bfa; }   /* date / timestamp */
 
 /* ── Buttons ── */
 .btn {

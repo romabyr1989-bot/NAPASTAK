@@ -43,9 +43,16 @@ static ColType pg_col_type(const char *pg_type) {
      * до ~15-17 значащих цифр, а это деньги и идентификаторы. Возим текстом —
      * так же, как ms_col_type в mssql_connector.c. */
     if (strstr(pg_type, "float") || strstr(pg_type, "real"))    return COL_DOUBLE;
-    if (strstr(pg_type, "numeric") || strstr(pg_type, "decimal")) return COL_TEXT;
+    /* numeric/decimal — точное десятичное: через double терялись бы копейки,
+     * а как TEXT приёмник создавал бы текстовую колонку вместо NUMERIC. */
+    if (strstr(pg_type, "numeric") || strstr(pg_type, "decimal")) return COL_DECIMAL;
     if (strncmp(pg_type, "bool", 4) == 0)                      return COL_BOOL;
-    if (strstr(pg_type, "timestamp") || strstr(pg_type, "date")) return COL_INT64;
+    /* Порядок важен: "timestamp" проверяем ДО "date", иначе timestamp попал бы
+     * в дату. Раньше и то и другое объявлялось как COL_INT64, хотя read_batch
+     * отдавал текст — describe и чтение противоречили друг другу, и на
+     * приёмнике под дату создавался BIGINT. */
+    if (strstr(pg_type, "timestamp"))                          return COL_TIMESTAMP;
+    if (strstr(pg_type, "date"))                               return COL_DATE;
     return COL_TEXT;
 }
 
@@ -460,6 +467,9 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         if (oid==20||oid==21||oid==23||oid==26)            sc->cols[c].type = COL_INT64;
         else if (oid==700||oid==701)                       sc->cols[c].type = COL_DOUBLE;
         else if (oid==16)                                  sc->cols[c].type = COL_BOOL;
+        else if (oid==1700)                                sc->cols[c].type = COL_DECIMAL;   /* numeric */
+        else if (oid==1082)                                sc->cols[c].type = COL_DATE;      /* date */
+        else if (oid==1114||oid==1184)                     sc->cols[c].type = COL_TIMESTAMP; /* timestamp[tz] */
         else                                               sc->cols[c].type = COL_TEXT;
         sc->cols[c].nullable = true;
     }
@@ -652,6 +662,11 @@ static int pg_write_batch(void *vctx, Arena *a, const char *entity,
             switch (schema->cols[c].type) {
                 case COL_INT64:  sqlty = "BIGINT";  break;
                 case COL_DOUBLE: sqlty = "NUMERIC"; break;
+                /* NUMERIC без параметров — произвольной точности, разрядов не
+                 * теряет. Именно поэтому DECIMAL можно отдать нативно. */
+                case COL_DECIMAL:   sqlty = "NUMERIC";   break;
+                case COL_DATE:      sqlty = "DATE";      break;
+                case COL_TIMESTAMP: sqlty = "TIMESTAMP"; break;
                 case COL_BOOL:   sqlty = "BOOLEAN"; break;
                 default:         sqlty = "TEXT";    break;
             }

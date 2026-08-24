@@ -659,8 +659,14 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                     qi.typeInfo.precision <= 18)
                     _ct = COL_INT64;
                 else
-                    _ct = COL_TEXT;
+                    _ct = COL_DECIMAL;   /* точное десятичное, хранится текстом */
             }
+            else if (_ot == DPI_ORACLE_TYPE_DATE)
+                _ct = COL_DATE;
+            else if (_ot == DPI_ORACLE_TYPE_TIMESTAMP ||
+                     _ot == DPI_ORACLE_TYPE_TIMESTAMP_TZ ||
+                     _ot == DPI_ORACLE_TYPE_TIMESTAMP_LTZ)
+                _ct = COL_TIMESTAMP;
             else if (_ot == DPI_ORACLE_TYPE_BOOLEAN)
                 _ct = COL_BOOL;
             sc->cols[ncols_out].type = _ct;
@@ -812,7 +818,21 @@ static int ora_write_batch(void *vctx, Arena *a, const char *entity,
         size_t cap = 256 + (size_t)ncols * 80; char *cols = malloc(cap); size_t off = 0;
         for (int c = 0; c < ncols; c++) {
             char ci_[130]; ora_col_ident(ci_, sizeof(ci_), schema->cols[c].name);
-            off += (size_t)snprintf(cols+off, cap-off, "%s%s VARCHAR2(4000)", c?", ":"", ci_);
+            /* Раньше все колонки создавались VARCHAR2(4000). NUMBER без
+             * параметров держит до 38 значащих цифр, поэтому DECIMAL уходит
+             * нативно и без потерь. BOOLEAN в таблицах Oracle до 23c нет —
+             * общепринятая замена NUMBER(1). */
+            const char *sqlty;
+            switch (schema->cols[c].type) {
+                case COL_INT64:     sqlty = "NUMBER(19)";    break;
+                case COL_DOUBLE:    sqlty = "BINARY_DOUBLE"; break;
+                case COL_DECIMAL:   sqlty = "NUMBER";        break;
+                case COL_DATE:      sqlty = "DATE";          break;
+                case COL_TIMESTAMP: sqlty = "TIMESTAMP";     break;
+                case COL_BOOL:      sqlty = "NUMBER(1)";     break;
+                default:            sqlty = "VARCHAR2(4000)"; break;
+            }
+            off += (size_t)snprintf(cols+off, cap-off, "%s%s %s", c?", ":"", ci_, sqlty);
         }
         size_t dcap = cap + 600; char *ddl = malloc(dcap);
         /* Имя таблицы НЕ цитируем — Oracle приведёт его к UPPER, ровно так же

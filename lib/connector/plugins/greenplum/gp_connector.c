@@ -528,7 +528,21 @@ static int gp_write_batch(void *vctx, Arena *a, const char *entity,
         off += (size_t)snprintf(ddl+off, cap-off, "CREATE TABLE IF NOT EXISTS %s (", eident);
         for (int c = 0; c < ncols; c++) {
             char *col = PQescapeIdentifier(ctx->conn, schema->cols[c].name, strlen(schema->cols[c].name));
-            off += (size_t)snprintf(ddl+off, cap-off, "%s%s TEXT", c?", ":"", col ? col : "\"col\"");
+            /* Раньше все колонки создавались TEXT, и число из источника
+             * приезжало в Greenplum строкой. Тип берём из схемы: NUMERIC без
+             * параметров хранит десятичное произвольной точности, поэтому
+             * DECIMAL отдаётся нативно и без потерь. */
+            const char *sqlty;
+            switch (schema->cols[c].type) {
+                case COL_INT64:     sqlty = "BIGINT";    break;
+                case COL_DOUBLE:    sqlty = "NUMERIC";   break;
+                case COL_DECIMAL:   sqlty = "NUMERIC";   break;
+                case COL_DATE:      sqlty = "DATE";      break;
+                case COL_TIMESTAMP: sqlty = "TIMESTAMP"; break;
+                case COL_BOOL:      sqlty = "BOOLEAN";   break;
+                default:            sqlty = "TEXT";      break;
+            }
+            off += (size_t)snprintf(ddl+off, cap-off, "%s%s %s", c?", ":"", col ? col : "\"col\"", sqlty);
             if (col) PQfreemem(col);
         }
         snprintf(ddl+off, cap-off, ")");
