@@ -285,8 +285,8 @@ static const char *dbl_fmt(Arena *a, double d) {
      * money value (balances up to ~1e13 with cents) and clean output —
      * "123456789.99" not "123456790" (the old %.10g) and not the float-noise
      * "...10000002" that a full round-trip (%.17g) would expose on sums. */
-    char buf[40];
-    snprintf(buf, sizeof(buf), "%.15g", d);
+    char buf[64];
+    json_fmt_double(buf, sizeof(buf), d);
     return arena_strdup(a, buf);
 }
 
@@ -3650,8 +3650,11 @@ static char *named_params_expand(Arena *a, const char *sql, JVal *params) {
             NP_RESERVE(4); memcpy(out+off, "NULL", 4); off += 4;
         } else if (val->type == JV_NUMBER) {
             char num[64]; double d = json_dbl(val, 0);
-            if (d == (double)(long long)d) snprintf(num, sizeof(num), "%lld", (long long)d);
-            else                           snprintf(num, sizeof(num), "%.15g", d);
+            /* Здесь строится SQL-ЛИТЕРАЛ — это путь значения, а не показа:
+             * срезанные разряды уедут в приёмник как есть. Формат общий. */
+            if (d == (double)(long long)d && d >= -9.2e18 && d <= 9.2e18)
+                snprintf(num, sizeof(num), "%lld", (long long)d);
+            else json_fmt_double(num, sizeof(num), d);
             size_t nl = strlen(num); NP_RESERVE(nl); memcpy(out+off, num, nl); off += nl;
         } else if (val->type == JV_BOOL) {
             const char *b = val->b ? "true" : "false"; size_t bl = strlen(b);
@@ -5760,7 +5763,8 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, const char *
                     char  **sv = arena_alloc(pa, (size_t)batch->nrows * sizeof(char *));
                     for (int r = 0; r < batch->nrows; r++)
                         sv[r] = (bm && ((bm[r/8] >> (r%8)) & 1u)) ? NULL
-                              : arena_sprintf(pa, "%.15g", dv[r]);
+                              : ({ char _b[64]; json_fmt_double(_b,sizeof _b,dv[r]);
+                                     arena_strdup(pa,_b); });
                     batch->values[c] = sv;
                 }
                 batch->schema->cols[c].type = COL_TEXT;

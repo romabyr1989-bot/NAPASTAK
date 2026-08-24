@@ -38,8 +38,12 @@ typedef struct {
 static ColType pg_col_type(const char *pg_type) {
     if (!pg_type) return COL_TEXT;
     if (strstr(pg_type, "int")   || strstr(pg_type, "serial")) return COL_INT64;
-    if (strstr(pg_type, "float") || strstr(pg_type, "numeric") ||
-        strstr(pg_type, "decimal") || strstr(pg_type, "real"))  return COL_DOUBLE;
+    /* float4/float8 двоичные изначально — double их не портит. А numeric и
+     * decimal ДЕСЯТИЧНЫЕ произвольной точности: прогон через double срезает их
+     * до ~15-17 значащих цифр, а это деньги и идентификаторы. Возим текстом —
+     * так же, как ms_col_type в mssql_connector.c. */
+    if (strstr(pg_type, "float") || strstr(pg_type, "real"))    return COL_DOUBLE;
+    if (strstr(pg_type, "numeric") || strstr(pg_type, "decimal")) return COL_TEXT;
     if (strncmp(pg_type, "bool", 4) == 0)                      return COL_BOOL;
     if (strstr(pg_type, "timestamp") || strstr(pg_type, "date")) return COL_INT64;
     return COL_TEXT;
@@ -447,11 +451,14 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
          * TEXT (below): the platform's "text-always values + logical-type" model
          * keeps storage/compress/engine string-based (no native read-back crash)
          * while the catalog carries the logical type so the output renders typed
-         * (numbers as JSON numbers). int/serial -> INT64, float/numeric -> DOUBLE,
-         * bool -> BOOL; timestamps/dates/text stay TEXT. */
+         * (numbers as JSON numbers). int/serial -> INT64, float4/float8 -> DOUBLE,
+         * bool -> BOOL; timestamps/dates/text stay TEXT.
+         * ВНИМАНИЕ: numeric/decimal (OID 1700) СЮДА НЕ ВХОДЯТ — они десятичные с
+         * произвольной точностью, и разбор в double ниже необратимо срезал бы
+         * разряды. Они уходят в TEXT и доезжают до приёмника байт в байт. */
         Oid oid = PQftype(res, c);
         if (oid==20||oid==21||oid==23||oid==26)            sc->cols[c].type = COL_INT64;
-        else if (oid==700||oid==701||oid==1700)            sc->cols[c].type = COL_DOUBLE;
+        else if (oid==700||oid==701)                       sc->cols[c].type = COL_DOUBLE;
         else if (oid==16)                                  sc->cols[c].type = COL_BOOL;
         else                                               sc->cols[c].type = COL_TEXT;
         sc->cols[c].nullable = true;

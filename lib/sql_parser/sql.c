@@ -8,6 +8,7 @@
  * и управление транзакциями. Все узлы AST/плана размещаются в Arena.
  */
 #include "sql.h"
+#include "../core/json.h"   /* json_fmt_double — единый формат double */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -899,7 +900,9 @@ static void parse_update(Lexer *l, Stmt *s) {
         } else if (val.type == TK_NUM_INT) {
             snprintf(s->dml.set_vals[i], 256, "%s%lld", neg?"-":"", (long long)val.ival);
         } else if (val.type == TK_NUM_FLOAT) {
-            snprintf(s->dml.set_vals[i], 256, "%s%.10g", neg?"-":"", val.fval);
+            { /* значение уходит в UPDATE ... SET — путь данных, нужен точный формат */
+              char _b[64]; json_fmt_double(_b, sizeof _b, val.fval);
+              snprintf(s->dml.set_vals[i], 256, "%s%s", neg?"-":"", _b); }
         } else if (val.type == TK_NULL) {
             snprintf(s->dml.set_vals[i], 256, "NULL");
         } else if (val.type == TK_TRUE) {

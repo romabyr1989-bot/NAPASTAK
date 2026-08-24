@@ -19,6 +19,10 @@ void jb_str(JBuf *j, const char *s);
 void jb_strn(JBuf *j, const char *s, size_t n);
 void jb_int(JBuf *j, long long v);
 void jb_double(JBuf *j, double v);
+/* Кратчайшая запись double, читающаяся обратно в те же биты (см. json.c).
+ * Единая точка форматирования: и JSON-вывод, и показ в API идут через неё,
+ * иначе одно и то же число печатается по-разному в разных местах. */
+int  json_fmt_double(char *buf, size_t cap, double v);
 void jb_bool(JBuf *j, bool v);
 void jb_null(JBuf *j);
 void jb_raw(JBuf *j, const char *raw);  /* append pre-built JSON verbatim */

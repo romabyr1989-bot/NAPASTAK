@@ -77,8 +77,30 @@ void jb_int(JBuf *j, long long v) {
     jb_comma(j); jb_append(j, buf, (size_t)n);
 }
 
+/* Кратчайшая десятичная запись, читающаяся обратно В ТЕ ЖЕ БИТЫ.
+ * Начинаем с 15 значащих цифр, чтобы простые числа оставались чистыми
+ * (0.1 -> "0.1"), и наращиваем только если короче не хватает.
+ *
+ * Прежний %.10g округлял деньги свыше ~1e8 (123456789.99 -> 123456790), а
+ * фиксированные 15 цифр не вытягивали контрольную сумму на 16 разрядов
+ * (10000123456790.16 -> 10000123456790.2) — то есть ровно те балансы порядка
+ * 1e13 с копейками, ради которых 15 и выбирали. Здесь потолок не фиксирован:
+ * сколько разрядов нужно значению, столько и пишем, но не больше 17 —
+ * дальше double всё равно не различает. */
+int json_fmt_double(char *buf, size_t cap, double v) {
+    int n = 0;
+    for (int p = 15; ; p++) {
+        n = snprintf(buf, cap, "%.*g", p, v);
+        if (p >= 17) break;
+        char *end = NULL;
+        double back = strtod(buf, &end);
+        if (back == v) break;
+    }
+    return n;
+}
+
 void jb_double(JBuf *j, double v) {
-    char buf[64]; int n = snprintf(buf, sizeof(buf), "%.10g", v);
+    char buf[64]; int n = json_fmt_double(buf, sizeof(buf), v);
     jb_comma(j); jb_append(j, buf, (size_t)n);
 }
 

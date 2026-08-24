@@ -265,7 +265,22 @@ int table_append(Table *t, ColBatch *batch) {
                     off += n; break;
                 }
                 case COL_DOUBLE: {
-                    int n = snprintf(row_buf+off, ROW_BUF_CAP-off, "%.10g", ((double*)batch->values[c])[r]);
+                    /* Кратчайшая запись, которая читается обратно В ТЕ ЖЕ БИТЫ.
+                     * Здесь ПЕРСИСТЕНТНОСТЬ, а не показ: прежний %.10g округлял
+                     * деньги свыше ~1e8 (123456789.99 -> 123456790) прямо при
+                     * записи в WAL, то есть значение портилось ещё до того, как
+                     * дойдёт до форматирования на выводе — и dbl_fmt в api.c,
+                     * который эту же беду уже чинил для показа, спасти его уже
+                     * не мог. Идём от короткого к длинному, чтобы простые числа
+                     * оставались чистыми (0.1 -> "0.1"), а не "0.1000000000000
+                     * 0001", но при этом ни один разряд не терялся. */
+                    double _dv = ((double*)batch->values[c])[r];
+                    char _db[40];
+                    for (int _p = 15; ; _p++) {
+                        snprintf(_db, sizeof(_db), "%.*g", _p, _dv);
+                        if (_p >= 17 || strtod(_db, NULL) == _dv) break;
+                    }
+                    int n = snprintf(row_buf+off, ROW_BUF_CAP-off, "%s", _db);
                     if (n < 0 || off + n >= ROW_BUF_CAP) { free(row_buf); return -1; }
                     off += n; break;
                 }

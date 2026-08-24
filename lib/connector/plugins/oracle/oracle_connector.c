@@ -646,8 +646,21 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
         {
             dpiOracleTypeNum _ot = qi.typeInfo.oracleTypeNum;
             ColType _ct = COL_TEXT;
-            if (_ot == DPI_ORACLE_TYPE_NUMBER)
-                _ct = (qi.typeInfo.scale == 0) ? COL_INT64 : COL_DOUBLE;
+            if (_ot == DPI_ORACLE_TYPE_NUMBER) {
+                /* NUMBER — десятичный тип до 38 значащих цифр. Ни double
+                 * (двоичная мантисса, ~15-17 цифр), ни int64 (потолок ~9.2e18,
+                 * то есть 19 цифр) его не вмещают: NUMBER(38,2) с деньгами
+                 * округлялся, а NUMBER(38,0) с идентификатором упирался в
+                 * потолок strtoll. Колонка выше не зря забирается как VARCHAR
+                 * «чтобы сохранить точность» — здесь эта точность и терялась.
+                 * В INT64 отдаём только гарантированно влезающее, остальное
+                 * возим текстом (как ms_col_type в mssql_connector.c). */
+                if (qi.typeInfo.scale == 0 && qi.typeInfo.precision > 0 &&
+                    qi.typeInfo.precision <= 18)
+                    _ct = COL_INT64;
+                else
+                    _ct = COL_TEXT;
+            }
             else if (_ot == DPI_ORACLE_TYPE_BOOLEAN)
                 _ct = COL_BOOL;
             sc->cols[ncols_out].type = _ct;

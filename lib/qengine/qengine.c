@@ -78,7 +78,10 @@ static const char *qe_text(Scalar s, Arena *a) {
     switch (s.type) {
     case SV_TEXT:   return s.val.sval;
     case SV_INT:    return arena_sprintf(a, "%lld", (long long)s.val.ival);
-    case SV_DOUBLE: return arena_sprintf(a, "%.10g", s.val.fval);
+    /* 15 значащих цифр, как dbl_fmt в api.c: %.10g округлял деньги свыше ~1e8,
+     * и concat/сравнение строк получали уже испорченное число. */
+    case SV_DOUBLE: { char _b[64]; json_fmt_double(_b, sizeof _b, s.val.fval);
+                      return arena_strdup(a, _b); }
     case SV_BOOL:   return s.val.bval ? "true" : "false";
     default:        return NULL;  /* SV_NULL */
     }
