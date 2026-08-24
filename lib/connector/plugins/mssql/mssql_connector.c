@@ -611,6 +611,19 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
  * Тип зависит от версии: NVARCHAR(MAX) появился в 2005, на 2000 и старше его
  * нет — там NTEXT. Без этого различия приёмник на старом сервере не смог бы
  * даже создать таблицу. */
+/* NVARCHAR(4000) — предел широкой строки в параметре; всё, что длиннее,
+ * должно уходить как WLONGVARCHAR, иначе драйвер обрежет или откажет. */
+#define MS_TEXT_SQL_TYPE(len) ((SQLSMALLINT)((len) > 4000 ? SQL_WLONGVARCHAR : SQL_WVARCHAR))
+
+/* Возврат автокоммита. Соединение живёт между батчами (mssql держит сессию),
+ * поэтому оставить его в ручном режиме — значит подвесить чужие запросы в
+ * незакрытой транзакции. */
+static void ms_autocommit_back(MsCtx *ctx, int had_tx) {
+    if (had_tx)
+        SQLSetConnectAttr(ctx->dbc, SQL_ATTR_AUTOCOMMIT,
+                          (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+}
+
 static int ms_write_batch(void *vctx, Arena *a, const char *entity,
                           const Schema *schema, const ColBatch *batch, int mode)
 {
@@ -658,10 +671,27 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
     /* SINK_OVERWRITE — заменить содержимое. DELETE, а не TRUNCATE: TRUNCATE
      * требует прав ALTER на таблицу и падает при внешних ключах, а приёмник
      * должен работать с обычными правами на запись. */
+    /* Батч пишем одной транзакцией. Иначе оборванная на середине вставка
+     * оставляет часть строк в таблице, а планировщик повторяет шаг — и
+     * повтор дублирует уже записанное. Именно так и вышло на проверке:
+     * строка с кириллицей упала, две предыдущие остались, следующий прогон
+     * добавил их второй раз. Автокоммит возвращаем в любом исходе. */
+    int had_tx = 0;
+    if (ms_ok(SQLSetConnectAttr(ctx->dbc, SQL_ATTR_AUTOCOMMIT,
+                                (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0)))
+        had_tx = 1;
+
+    /* Очистка — внутри той же транзакции, что и вставка. Снаружи она
+     * означала бы, что упавший батч оставляет приёмник пустым: старых
+     * строк уже нет, новых ещё нет. */
     if (mode == DFO_SINK_OVERWRITE) {
         char del[MS_MAX_SQL];
         snprintf(del, sizeof(del), "DELETE FROM %s.%s", qs, qt);
-        if (ms_exec(ctx, del) != 0) return -1;
+        if (ms_exec(ctx, del) != 0) {
+            if (had_tx) SQLEndTran(SQL_HANDLE_DBC, ctx->dbc, SQL_ROLLBACK);
+            ms_autocommit_back(ctx, had_tx);
+            return -1;
+        }
     }
 
     /* Вставка построчно через подготовленный запрос: значения уходят
@@ -679,31 +709,80 @@ static int ms_write_batch(void *vctx, Arena *a, const char *entity,
     snprintf(ins + n, sizeof(ins) - (size_t)n, ")");
 
     SQLHSTMT st = SQL_NULL_HSTMT;
-    if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &st))) return -1;
+    if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &st))) {
+        ms_autocommit_back(ctx, had_tx); return -1;
+    }
     if (!ms_ok(SQLPrepare(st, (SQLCHAR *)ins, SQL_NTS))) {
         ms_diag(ctx, SQL_HANDLE_STMT, st, "подготовка вставки");
         SQLFreeHandle(SQL_HANDLE_STMT, st);
+        ms_autocommit_back(ctx, had_tx);
         return -1;
     }
 
     int written = 0;
     SQLLEN *inds = calloc((size_t)ncols, sizeof(SQLLEN));
-    if (!inds) { SQLFreeHandle(SQL_HANDLE_STMT, st); return -1; }
+    if (!inds) { SQLFreeHandle(SQL_HANDLE_STMT, st); ms_autocommit_back(ctx, had_tx); return -1; }
     for (int r = 0; r < batch->nrows; r++) {
         for (int c = 0; c < ncols; c++) {
-            char *v = ((char **)batch->values[c])[r];
-            if (!v) v = (char *)"";
+            const uint8_t *bm = batch->null_bitmap[c];
+            int isnull = (bm && ((bm[r / 8] >> (r % 8)) & 1u));
+            char *v = isnull ? NULL : ((char **)batch->values[c])[r];
+
+            /* NULL отдаём индикатором, а не пустой строкой: в приёмнике это
+             * разные значения, и «пусто» вместо NULL ломает и IS NULL, и
+             * внешние ключи. */
+            if (!v) {
+                inds[c] = SQL_NULL_DATA;
+                if (!ms_ok(SQLBindParameter(st, (SQLUSMALLINT)(c + 1), SQL_PARAM_INPUT,
+                                            SQL_C_CHAR, MS_TEXT_SQL_TYPE(0), 1, 0,
+                                            (SQLPOINTER)"", 0, &inds[c]))) {
+                    ms_diag(ctx, SQL_HANDLE_STMT, st, "привязка параметра");
+                    goto insert_done;
+                }
+                continue;
+            }
+
+            /* Тип параметра — ШИРОКИЙ (SQL_WVARCHAR), хотя буфер узкий
+             * (SQL_C_CHAR). Колонки создаются как NVARCHAR, и при SQL_VARCHAR
+             * драйвер пытается свернуть UTF-8 в однобайтовую кодировку
+             * сервера: на латинской сортировке кириллица не пролезает, и
+             * FreeTDS отвечает невнятным «[HY000] Unknown error». Объявив
+             * параметр широким, мы просим драйвер перевести UTF-8 в UCS-2 —
+             * это он делает верно (и FreeTDS с ClientCharset=UTF-8, и
+             * msodbcsql18). Длинные значения — WLONGVARCHAR, иначе упрёмся в
+             * предел NVARCHAR(4000). */
             inds[c] = (SQLLEN)strlen(v);
-            SQLBindParameter(st, (SQLUSMALLINT)(c + 1), SQL_PARAM_INPUT, SQL_C_CHAR,
-                             SQL_VARCHAR, inds[c] ? (SQLULEN)inds[c] : 1, 0,
-                             v, inds[c], &inds[c]);
+            SQLSMALLINT sqltype = MS_TEXT_SQL_TYPE(inds[c]);
+            /* Размер — в символах; байтовая длина UTF-8 их не меньше, а
+             * завышение здесь безвредно (это заявленная ёмкость, не буфер). */
+            SQLULEN colsize = inds[c] ? (SQLULEN)inds[c] : 1;
+            if (!ms_ok(SQLBindParameter(st, (SQLUSMALLINT)(c + 1), SQL_PARAM_INPUT,
+                                        SQL_C_CHAR, sqltype, colsize, 0,
+                                        v, inds[c], &inds[c]))) {
+                ms_diag(ctx, SQL_HANDLE_STMT, st, "привязка параметра");
+                goto insert_done;
+            }
         }
         SQLRETURN rc = SQLExecute(st);
         if (!ms_ok(rc)) { ms_diag(ctx, SQL_HANDLE_STMT, st, "вставка строки"); break; }
         written++;
     }
+insert_done:
     free(inds);
     SQLFreeHandle(SQL_HANDLE_STMT, st);
+
+    /* Успех фиксируем, неудачу откатываем целиком — приёмник либо принял
+     * батч, либо остался в том состоянии, в каком был. */
+    if (had_tx) {
+        SQLRETURN trc = SQLEndTran(SQL_HANDLE_DBC, ctx->dbc,
+                                   (written == batch->nrows) ? SQL_COMMIT : SQL_ROLLBACK);
+        if (written == batch->nrows && !ms_ok(trc)) {
+            ms_diag(ctx, SQL_HANDLE_DBC, ctx->dbc, "фиксация транзакции");
+            written = -1;
+        }
+        ms_autocommit_back(ctx, had_tx);
+        if (written < 0) return -1;
+    }
 
     if (written != batch->nrows) {
         LOG_WARN("mssql: записано %d из %d строк в %s", written, batch->nrows, entity);
