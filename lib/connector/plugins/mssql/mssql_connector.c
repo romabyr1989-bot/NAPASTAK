@@ -45,6 +45,7 @@ typedef struct {
     char     schema[128];          /* по умолчанию dbo */
     char     primary_key[256];     /* приёмник: идемпотентная запись через MERGE */
     char     driver_used[128];     /* имя драйвера, которым подключились */
+    char     host[256];            /* для внятного текста в сообщениях об обрыве */
     Arena   *arena;
     char     last_err[512];
 } MsCtx;
@@ -369,6 +370,7 @@ static void *ms_create(const char *cfg, Arena *a)
             ctx->srv_major = forced;
         }
     }
+    snprintf(ctx->host, sizeof(ctx->host), "%s", host[0] ? host : "по DSN");
     const char *paging = ctx->srv_major >= 11 ? "OFFSET/FETCH"
                        : ctx->srv_major >= 9  ? "ROW_NUMBER()"
                                               : "вложенный TOP";
@@ -401,9 +403,24 @@ static const char *ms_last_error(void *vctx)
 static int ms_ping(void *vctx)
 {
     MsCtx *ctx = (MsCtx *)vctx;
-    if (!ctx || ctx->dbc == SQL_NULL_HDBC) return -1;
+    if (!ctx || ctx->dbc == SQL_NULL_HDBC) {
+        if (ctx) snprintf(ctx->last_err, sizeof(ctx->last_err),
+                          "нет подключения к серверу");
+        return -1;
+    }
     char one[16] = "";
-    return ms_scalar(ctx, "SELECT 1", one, sizeof(one));
+    if (ms_scalar(ctx, "SELECT 1", one, sizeof(one)) == 0) return 0;
+
+    /* Причина ложится в last_err и попадает прямо в интерфейс — рядом с
+     * погасшим индикатором подключения. Драйвер на оборванной сессии отвечает
+     * «[HY000] Unknown error», по которому оператору нечего понять; дописываем
+     * то, что произошло на самом деле, сохраняя и текст драйвера. */
+    char drv[320];
+    snprintf(drv, sizeof(drv), "%s", ctx->last_err);
+    snprintf(ctx->last_err, sizeof(ctx->last_err),
+             "сервер %s не отвечает — связь потеряна (%s)",
+             ctx->host[0] ? ctx->host : "SQL Server", drv);
+    return -1;
 }
 
 /* ── list_entities ─────────────────────────────────────────────────────────

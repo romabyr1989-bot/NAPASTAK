@@ -8969,7 +8969,11 @@ static void conn_write_public(JBuf *jb, JVal *rec) {
     const char *state = NULL, *lerr = NULL; int64_t lok = 0;
     int live = conn_pool_status(g_app.conn_pool, json_str(json_get(rec, "id"), ""),
                                 &state, &lok, &lerr);
-    jb_key(jb, "status");   jb_str(jb, state ? state : "idle");
+    /* Разрыв по команде оператора — САМОСТОЯТЕЛЬНОЕ состояние, не «нет связи».
+     * Иначе намеренно отключённое подключение выглядело бы в списке аварией и
+     * его бы «чинили», хотя чинить нечего. */
+    bool off = json_bool(json_get(rec, "disabled"), false);
+    jb_key(jb, "status");   jb_str(jb, off ? "off" : (state ? state : "idle"));
     jb_key(jb, "sessions"); jb_int(jb, live);
     jb_key(jb, "last_ok");  jb_int(jb, lok);
     if (lerr && lerr[0]) { jb_key(jb, "last_error"); jb_str(jb, lerr); }
@@ -9123,6 +9127,10 @@ void api_conn_pool_maintain(void) {
         const char *type = json_str(json_get(rec, "type"), "");
         if (!id[0] || !type[0]) continue;
 
+        /* Отключённое оператором не поднимаем: иначе разрыв жил бы до
+         * ближайшего обхода, а индикатор зеленел бы сам собой. */
+        if (json_bool(json_get(rec, "disabled"), false)) continue;
+
         const char *state = NULL;
         conn_pool_status(g_app.conn_pool, id, &state, NULL, NULL);
         if (state && !strcmp(state, "ok")) continue;   /* сессия уже живая */
@@ -9177,6 +9185,110 @@ static void h_connection_get(HttpReq *req, HttpResp *resp) {
     conn_write_public(&jb, rec);
     http_resp_json(resp, 200, (char *)jb_done(&jb));
     arena_destroy(a);
+}
+
+/* ── Ручное управление постоянной сессией ──────────────────────────────────
+ *
+ * Сессии к внешним системам живут постоянно: их поднимает и пингует фоновый
+ * обход (api_conn_pool_maintain). Оператору нужны две вещи, которых не было:
+ * поднять сессию немедленно, не дожидаясь обхода, и разорвать её осознанно —
+ * например, чтобы остановить обращения к системе на время её обслуживания.
+ *
+ * Разрыв обязан ПЕРЕЖИВАТЬ обход и перезапуск гейтвея. Иначе отключение
+ * бессмысленно: фоновый прогрев поднял бы сессию через минуту, а индикатор
+ * снова позеленел бы сам собой. Поэтому признак хранится в самой записи
+ * справочника полем "disabled", а обход его уважает. */
+static int conn_set_disabled(const char *id, bool disabled, char *errbuf, size_t errsz) {
+    Arena *a = arena_create(32768);
+    char *raw = NULL;
+    if (catalog_load_connection(g_app.catalog, id, &raw, a) != 0) {
+        snprintf(errbuf, errsz, "подключение не найдено");
+        arena_destroy(a); return -1;
+    }
+    JVal *rec = json_parse(a, raw, strlen(raw));
+    if (!rec || rec->type != JV_OBJECT) {
+        snprintf(errbuf, errsz, "запись повреждена");
+        arena_destroy(a); return -1;
+    }
+    /* Пересобираем запись целиком: конфиг переносится КАК ЕСТЬ, из хранилища,
+     * а не через публичную выдачу — там секреты замаскированы, и запись
+     * вернулась бы с «••••••» вместо пароля. */
+    JBuf jb; jb_init(&jb, a, 4096);
+    jb_obj_begin(&jb);
+    for (size_t i = 0; i < rec->nkeys; i++) {
+        if (!strcmp(rec->keys[i], "disabled")) continue;
+        jb_key(&jb, rec->keys[i]);
+        jval_serialize(&jb, rec->vals[i]);
+    }
+    jb_key(&jb, "disabled"); jb_bool(&jb, disabled);
+    jb_obj_end(&jb);
+
+    if (catalog_save_connection(g_app.catalog, id, (char *)jb_done(&jb)) != 0) {
+        snprintf(errbuf, errsz, "не удалось сохранить состояние подключения");
+        arena_destroy(a); return -1;
+    }
+    arena_destroy(a);
+    return 0;
+}
+
+/* POST /api/connections/:id/connect — поднять постоянную сессию сейчас. */
+static void h_connection_connect(HttpReq *req, HttpResp *resp) {
+    const char *id = hm_get(&req->params, "id");
+    if (!id || !id[0]) { http_resp_error(resp, 400, "missing id"); return; }
+
+    char err[256] = {0};
+    if (conn_set_disabled(id, false, err, sizeof(err)) != 0) {
+        http_resp_error(resp, 404, err[0] ? err : "connection not found"); return;
+    }
+
+    Arena *a = arena_create(32768);
+    char *raw = NULL;
+    if (catalog_load_connection(g_app.catalog, id, &raw, a) != 0) {
+        http_resp_error(resp, 404, "connection not found"); arena_destroy(a); return;
+    }
+    JVal *rec = json_parse(a, raw, strlen(raw));
+    const char *type = json_str(json_get(rec, "type"), "");
+    if (!type[0]) { http_resp_error(resp, 400, "у подключения не задан тип"); arena_destroy(a); return; }
+
+    char so_path[1024];
+    snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
+             g_app.plugins_dir, connector_so_name(type));
+    const char *cfg = conn_merge_config(a, json_get(rec, "config"), NULL);
+
+    /* verify=true — сессия считается поднятой только после успешного ping.
+     * Иначе кнопка зеленела бы на самом факте загрузки библиотеки, ничего не
+     * говоря о доступности системы. */
+    ConnLease *l = conn_pool_acquire(g_app.conn_pool, id, so_path, cfg, true, err, sizeof(err));
+    JBuf jb; jb_init(&jb, a, 512);
+    jb_obj_begin(&jb);
+    if (l) {
+        conn_pool_release(l, true);          /* вернули сразу — сессия живёт дальше */
+        jb_key(&jb, "ok");     jb_bool(&jb, true);
+        jb_key(&jb, "status"); jb_str(&jb, "ok");
+        LOG_INFO("подключение '%s': сессия поднята по команде оператора", id);
+    } else {
+        jb_key(&jb, "ok");     jb_bool(&jb, false);
+        jb_key(&jb, "status"); jb_str(&jb, "error");
+        jb_key(&jb, "error");  jb_str(&jb, err[0] ? err : "не удалось установить сессию");
+        LOG_WARN("подключение '%s': сессию поднять не удалось: %s", id, err);
+    }
+    jb_obj_end(&jb);
+    http_resp_json(resp, 200, (char *)jb_done(&jb));
+    arena_destroy(a);
+}
+
+/* POST /api/connections/:id/disconnect — разорвать сессию по команде оператора. */
+static void h_connection_disconnect(HttpReq *req, HttpResp *resp) {
+    const char *id = hm_get(&req->params, "id");
+    if (!id || !id[0]) { http_resp_error(resp, 400, "missing id"); return; }
+
+    char err[256] = {0};
+    if (conn_set_disabled(id, true, err, sizeof(err)) != 0) {
+        http_resp_error(resp, 404, err[0] ? err : "connection not found"); return;
+    }
+    conn_pool_invalidate(g_app.conn_pool, id);
+    LOG_INFO("подключение '%s': сессия разорвана оператором", id);
+    http_resp_json(resp, 200, "{\"ok\":true,\"status\":\"off\"}");
 }
 
 /* POST /api/connections — создание. id можно передать свой, иначе генерится. */
@@ -9290,6 +9402,8 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",   "/api/connections/:id",  h_connection_get);
     router_add(r,"PUT",   "/api/connections/:id",  h_connection_update);
     router_add(r,"DELETE","/api/connections/:id",  h_connection_delete);
+    router_add(r,"POST",  "/api/connections/:id/connect",    h_connection_connect);
+    router_add(r,"POST",  "/api/connections/:id/disconnect", h_connection_disconnect);
     // Auth endpoints
     router_add(r,"POST", "/api/auth/token",    h_auth_token);
     router_add(r,"POST", "/api/auth/apikeys",  h_auth_apikey_create);

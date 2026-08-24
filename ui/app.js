@@ -2004,6 +2004,42 @@ function kafkaFriendlyError(err) {
 /* Toggle the DB connection for a step. First click tests + (on success) turns
  * the button green and remembers it (step._dbok, survives re-render). Clicking
  * the green button "disconnects" — resets the state. */
+/* Состояние ПОСТОЯННОЙ сессии подключения из справочника. Возвращает
+ * 'ok' | 'error' | 'off' | 'idle', либо null — когда параметры доступа заданы
+ * в самом шаге и постоянной сессии для них не существует. */
+function pbConnState(step) {
+  if (!step || !step.connection_id) return null;
+  const c = (Array.isArray(connCache) ? connCache : []).find(x => x.id === step.connection_id);
+  return c ? (c.status || 'idle') : null;
+}
+
+/* Приводит зелёную отметку кнопки в соответствие с ЖИВЫМ состоянием сессии.
+ *
+ * Раньше step._dbok был флажком в памяти страницы: кнопка зеленела после
+ * удачной проверки и оставалась такой до перезагрузки — даже если связь давно
+ * оборвалась. Это худший вид индикатора: он утверждает то, чего нет. Теперь
+ * для шагов, привязанных к справочнику, отметка берётся из состояния пула, а
+ * значит гаснет сама, когда сессия рвётся по техническим причинам. */
+function syncStepConnFlags() {
+  const steps = (pb && Array.isArray(pb.steps)) ? pb.steps.slice() : [];
+  if (_connFormStep) steps.push(_connFormStep);
+  let changed = false;
+  steps.forEach(st => {
+    const state = pbConnState(st);
+    if (state === null) return;              /* инлайновые параметры — не трогаем */
+    const live = (state === 'ok');
+    if (!!st._dbok !== live) { st._dbok = live; changed = true; }
+  });
+  return changed;
+}
+
+/* Кнопка «Подключиться».
+ *
+ * Для шага, привязанного к справочнику, это НАСТОЯЩЕЕ управление постоянной
+ * сессией: нажатие поднимает её на сервере, повторное — разрывает, и разрыв
+ * держится (фоновый обход отключённые подключения не поднимает). Для шага с
+ * инлайновыми параметрами постоянной сессии не существует, поэтому там
+ * остаётся разовая проверка связи. */
 async function pbTestConnection(idx) {
   const btn = document.getElementById(`pb-dbtest-${idx}`);
   if (!btn) return;
@@ -2012,11 +2048,37 @@ async function pbTestConnection(idx) {
     btn.style.background = bg; btn.style.borderColor = bg; btn.style.color = fg; btn.textContent = txt;
   };
 
-  /* already connected → disconnect (toggle off) */
+  /* ── Подключение из справочника: управляем постоянной сессией ── */
+  if (step.connection_id) {
+    const connected = pbConnState(step) === 'ok';
+    set('', '', connected ? 'Отключение…' : 'Подключение…'); btn.disabled = true;
+    try {
+      const path = `/api/connections/${encodeURIComponent(step.connection_id)}/${connected ? 'disconnect' : 'connect'}`;
+      const r = await apiPost(path, {});
+      await loadConnectionsCache();          /* забрать свежее состояние сессии */
+      syncStepConnFlags();
+      if (connected) {
+        showToast('Соединение разорвано', 'ok');
+      } else if (r && r.ok) {
+        showToast('Подключено', 'ok');
+      } else {
+        showToast(`Не удалось подключиться: ${(r && r.error) || 'причина не сообщена'}`, 'error');
+      }
+    } catch (e) {
+      showToast(`Не удалось: ${String(e)}`, 'error');
+    } finally {
+      btn.disabled = false;
+      set(step._dbok ? 'var(--green)' : '', step._dbok ? '#fff' : '',
+          step._dbok ? '✓ Подключено' : 'Подключиться');
+    }
+    return;
+  }
+
+  /* ── Инлайновые параметры: разовая проверка связи ── */
   if (step._dbok) {
     step._dbok = false;
     set('', '', 'Подключиться');
-    showToast('Соединение разорвано', 'ok');
+    showToast('Отметка проверки снята', 'ok');
     return;
   }
 
@@ -2037,7 +2099,7 @@ async function pbTestConnection(idx) {
         connection_id: step.connection_id || '' });
     if (r && r.ok) {
       step._dbok = true;
-      set('var(--green)', '#fff', '✓ Подключено');
+      set('var(--green)', '#fff', '✓ Связь есть');
     } else {
       step._dbok = false;
       set('', '', 'Подключиться');   /* the toast carries the reason */
@@ -2649,7 +2711,35 @@ function pbToggleDep(stepIdx, depIdx, checked) {
 }
 
 /* ── Rendering ── */
+/* Пока конструктор открыт, состояние сессий перечитывается: связь может
+ * оборваться сама — упала сеть, перезапустили СУБД, — и кнопка обязана
+ * погаснуть без участия оператора. Перерисовываем ТОЛЬКО когда состояние
+ * действительно изменилось: иначе карточки шагов моргали бы каждые несколько
+ * секунд и сбрасывали бы фокус в полях, которые в этот момент заполняют. */
+let _builderConnTimer = null;
+
+function startBuilderConnPolling() {
+  if (_builderConnTimer) clearInterval(_builderConnTimer);
+  _builderConnTimer = setInterval(async () => {
+    if (!document.getElementById('pb-steps')) { stopBuilderConnPolling(); return; }
+    if (document.hidden) return;
+    const attached = (pb && Array.isArray(pb.steps) ? pb.steps : []).some(s => s.connection_id)
+                     || !!(_connFormStep && _connFormStep.connection_id);
+    if (!attached) return;                  /* нечего отслеживать — не дёргаем сервер */
+    try {
+      await loadConnectionsCache();
+      if (syncStepConnFlags()) renderBuilderSteps();
+    } catch (_) { /* сеть моргнула — следующий тик поправит */ }
+  }, 7000);
+}
+
+function stopBuilderConnPolling() {
+  if (_builderConnTimer) { clearInterval(_builderConnTimer); _builderConnTimer = null; }
+}
+
 function renderBuilderSteps() {
+  syncStepConnFlags();
+  startBuilderConnPolling();
   renderFlowGraph();
   const container = document.getElementById('pb-steps');
   if (!pb.steps.length) {
@@ -6343,10 +6433,63 @@ async function loadConnectionsView() {
     const list = await apiGet('/api/connections');
     _connList = list || [];        /* apiGet после 401 отдаёт undefined, а не бросает */
     connCache = _connList;
+    _connStatusSig = _connList.map(c => `${c.id}:${c.status}:${c.sessions || 0}`).join('|');
     renderConnectionsList();
+    startConnStatusPolling();
   } catch (err) {
     el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
   }
+}
+
+/* Ручное управление постоянной сессией. Оба действия сохраняются на сервере:
+ * отключённое подключение фоновый обход не поднимает, поэтому разрыв держится
+ * до явного «Подключить», а не до ближайшего тика. */
+async function connConnect(id) {
+  try {
+    const r = await apiPost(`/api/connections/${encodeURIComponent(id)}/connect`, {});
+    if (r && r.ok) showToast('Подключено', 'ok');
+    else showToast('Подключиться не удалось: ' + ((r && r.error) || 'причина не сообщена'), 'error');
+  } catch (e) { showToast('Подключиться не удалось: ' + String(e), 'error'); }
+  await refreshConnectionsStatus(true);
+}
+
+async function connDisconnect(id) {
+  try {
+    await apiPost(`/api/connections/${encodeURIComponent(id)}/disconnect`, {});
+    showToast('Отключено', 'ok');
+  } catch (e) { showToast('Отключить не удалось: ' + String(e), 'error'); }
+  await refreshConnectionsStatus(true);
+}
+
+/* Состояние сессии меняется без участия страницы: её мог разорвать сбой сети
+ * или перезапуск внешней системы. Поэтому список сам перечитывает статусы,
+ * пока раздел открыт, — иначе «подключено» на экране жило бы до перезагрузки
+ * страницы и вводило бы в заблуждение. */
+let _connStatusTimer = null;
+
+async function refreshConnectionsStatus(force) {
+  const el = document.getElementById('connections-list');
+  if (!el) return;                                   /* раздел закрыт */
+  if (!force && document.hidden) return;             /* вкладка не на виду — не дёргаем сервер */
+  try {
+    const list = await apiGet('/api/connections');
+    if (!list) return;
+    _connList = list; connCache = list;
+    /* Перерисовываем только когда состояние действительно изменилось: иначе
+     * список моргал бы каждые несколько секунд и терял бы фокус на кнопках. */
+    const sig = list.map(c => `${c.id}:${c.status}:${c.sessions || 0}`).join('|');
+    if (force || sig !== _connStatusSig) { _connStatusSig = sig; renderConnectionsList(); }
+  } catch (_) { /* сеть моргнула — покажем прежнее состояние, следующий тик поправит */ }
+}
+let _connStatusSig = '';
+
+function startConnStatusPolling() {
+  if (_connStatusTimer) clearInterval(_connStatusTimer);
+  _connStatusTimer = setInterval(() => refreshConnectionsStatus(false), 7000);
+}
+
+function stopConnStatusPolling() {
+  if (_connStatusTimer) { clearInterval(_connStatusTimer); _connStatusTimer = null; }
 }
 
 function renderConnectionsList() {
@@ -6382,9 +6525,11 @@ function makeConnectionRow(c) {
   const st = c.status || 'idle';
   const stBadge = st === 'ok'
     ? `<span class="badge badge-ok" title="Постоянная сессия установлена${c.last_ok ? ', проверена ' + new Date(c.last_ok * 1000).toLocaleString('ru-RU') : ''}">● подключено${c.sessions > 1 ? ' ×' + c.sessions : ''}</span>`
-    : (st === 'error'
-      ? `<span class="badge badge-err" title="${escAttr(c.last_error || 'сессия недоступна')}">● нет связи</span>`
-      : `<span class="badge" title="Сессия ещё не поднята — фоновый обход поднимет её в течение минуты">○ подключается…</span>`);
+    : (st === 'off'
+      ? `<span class="badge" title="Отключено оператором. Фоновый обход такие подключения не поднимает — нажмите «Подключить»">◌ отключено</span>`
+      : (st === 'error'
+        ? `<span class="badge badge-err" title="${escAttr(c.last_error || 'сессия недоступна')}">● нет связи</span>`
+        : `<span class="badge" title="Сессия ещё не поднята — фоновый обход поднимет её в течение минуты">○ подключается…</span>`));
   /* Конвейеры, которые опираются на это подключение, — плашками, как шаги в
    * строке конвейера (.step-list / .step-badge). */
   const users = (Array.isArray(_pipelinesAll) ? _pipelinesAll : [])
@@ -6411,6 +6556,9 @@ function makeConnectionRow(c) {
       <div class="step-list">${users}</div>
     </div>
     <div class="pipeline-actions">
+      ${st === 'ok'
+        ? `<button class="btn btn-sm" title="Разорвать постоянную сессию. Обращения к системе прекратятся, пока не подключите снова" onclick="connDisconnect('${escAttr(c.id)}')">⏻ Отключить</button>`
+        : `<button class="btn btn-sm" title="Установить постоянную сессию не дожидаясь фонового обхода" onclick="connConnect('${escAttr(c.id)}')">⏻ Подключить</button>`}
       <button class="btn btn-sm btn-primary" onclick="openConnectionEditor('${escAttr(c.id)}')">✎ Изменить</button>
       <button class="btn btn-sm btn-danger" onclick="deleteConnection('${escAttr(c.id)}')">✕</button>
     </div>`;
