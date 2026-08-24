@@ -55,6 +55,14 @@ typedef struct {
 /* Old INSERT records have no op byte (first byte is printable CSV char >= 0x20). */
 #define WAL_OP_DELETE 0x02   /* [0x02][8-byte BE offset of deleted row] */
 #define WAL_OP_UPDATE 0x03   /* [0x03][8-byte BE offset][new CSV row\n] */
+/* [0x04][CSV-строка с экранированием по RFC4180]. Обычная INSERT-запись писала
+ * поля через запятую БЕЗ экранирования, поэтому значение с запятой внутри
+ * («Иванов, Иван») при чтении обрезалось по первой же запятой, пустая строка
+ * была неотличима от NULL, а текст "NULL" превращался в SQL NULL. Записи с
+ * таким байтом разбираются строго; строки без него читаются по-старому, так
+ * что накопленные WAL остаются валидными. Байт ставится ТОЛЬКО когда
+ * экранирование реально понадобилось. */
+#define WAL_OP_INSERT_ESC 0x04
 
 /* ── WAL write callback (for replication) ── */
 typedef void (*WalWriteCallback)(const char *table_name, uint64_t lsn,

@@ -299,8 +299,67 @@ int table_append(Table *t, ColBatch *batch) {
         }
         if (off >= ROW_BUF_CAP - 1) { free(row_buf); return -1; }
         row_buf[off++] = '\n';
+
+        /* Нужно ли экранирование? Проверяем ТОЛЬКО текстовые ячейки: числа и
+         * булевы спецсимволов не содержат. Экранируем поле, если внутри есть
+         * разделитель, кавычка или перевод строки, либо если оно пустое или
+         * буквально равно "NULL" — иначе при чтении его не отличить от SQL NULL. */
+        int need_esc = 0;
+        for (int c = 0; c < ncols && !need_esc; c++) {
+            if (batch->null_bitmap[c] && bit_get(batch->null_bitmap[c], r)) continue;
+            if (!batch->schema || batch->schema->cols[c].type != COL_TEXT) continue;
+            const char *v = ((char**)batch->values[c])[r];
+            if (!v) continue;
+            if (!v[0] || strcmp(v, "NULL") == 0) { need_esc = 1; break; }
+            for (const char *q = v; *q; q++)
+                if (*q == ',' || *q == '"' || *q == '\n' || *q == '\r') { need_esc = 1; break; }
+        }
+
         int64_t row_offset = wal_tell(t->wal);
-        wal_append(t->wal, row_buf, (size_t)off);
+        if (!need_esc) {
+            wal_append(t->wal, row_buf, (size_t)off);
+        } else {
+            /* Пересобираем строку с кавычками: [0x04]f1,"f,2",f3\n */
+            size_t cap2 = (size_t)off * 2 + (size_t)ncols * 4 + 8;
+            char *eb = malloc(cap2);
+            if (!eb) { free(row_buf); return -1; }
+            size_t o2 = 0;
+            eb[o2++] = (char)WAL_OP_INSERT_ESC;
+            for (int c = 0; c < ncols; c++) {
+                if (c) eb[o2++] = ',';
+                if (batch->null_bitmap[c] && bit_get(batch->null_bitmap[c], r)) {
+                    memcpy(eb + o2, "NULL", 4); o2 += 4; continue;
+                }
+                char numtmp[64]; const char *v = NULL;
+                ColType ct = batch->schema ? batch->schema->cols[c].type : COL_TEXT;
+                if (ct == COL_INT64) { snprintf(numtmp,sizeof numtmp,"%lld",(long long)((int64_t*)batch->values[c])[r]); v=numtmp; }
+                else if (ct == COL_BOOL) { v = ((int64_t*)batch->values[c])[r] ? "true" : "false"; }
+                else if (ct == COL_DOUBLE) {
+                    double _dv = ((double*)batch->values[c])[r];
+                    for (int _p = 15; ; _p++) { snprintf(numtmp,sizeof numtmp,"%.*g",_p,_dv);
+                        if (_p >= 17 || strtod(numtmp,NULL) == _dv) break; }
+                    v = numtmp;
+                } else { v = ((char**)batch->values[c])[r]; if (!v) v = ""; }
+
+                int q = 0;
+                if (ct == COL_TEXT) {
+                    if (!v[0] || strcmp(v,"NULL") == 0) q = 1;
+                    else for (const char *z=v; *z; z++)
+                        if (*z==','||*z=='"'||*z=='\n'||*z=='\r') { q = 1; break; }
+                }
+                size_t vl = strlen(v);
+                if (o2 + vl*2 + 8 > cap2) { size_t nc = (o2 + vl*2 + 64)*2; char *nb = realloc(eb,nc); if(!nb){free(eb);free(row_buf);return -1;} eb=nb; cap2=nc; }
+                if (!q) { memcpy(eb+o2, v, vl); o2 += vl; }
+                else {
+                    eb[o2++]='"';
+                    for (size_t z=0; z<vl; z++) { if (v[z]=='"') eb[o2++]='"'; eb[o2++]=v[z]; }
+                    eb[o2++]='"';
+                }
+            }
+            eb[o2++]='\n';
+            wal_append(t->wal, eb, o2);
+            free(eb);
+        }
         t->row_count++;
         if (t->nindexes > 0 && batch->schema) {
             for (int idx = 0; idx < t->nindexes; idx++) {

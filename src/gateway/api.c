@@ -195,7 +195,8 @@ static void split_line_simple(char *line, char delim, char **out, int max_cols, 
  *   - rejects an unterminated quote, a stray '"' in an unquoted field, and any
  *     garbage after a closing quote (sets *err and returns NULL);
  * Field-count enforcement (vs. header) is the caller's job. */
-static char **split_line_rfc4180(Arena *a, const char *line, char delim, int *n_out, int *err) {
+static char **split_line_rfc4180_q(Arena *a, const char *line, char delim,
+                                   int *n_out, int *err, unsigned char *quoted) {
     if (err) *err = 0;
     int cap=16; char **parts=arena_alloc(a,(size_t)cap*sizeof(char*)); int n=0;
     const char *p = line;
@@ -226,10 +227,50 @@ static char **split_line_rfc4180(Arena *a, const char *line, char delim, int *n_
             field = arena_strndup(a, start, (size_t)(p - start));
         }
         if (n==cap){cap*=2;char**nb=arena_alloc(a,(size_t)cap*sizeof(char*));memcpy(nb,parts,(size_t)n*sizeof(char*));parts=nb;}
+        if (quoted) quoted[n] = in_quote ? 1u : 0u;
         parts[n++]=field;
         if (*p==delim) p++; else break;
     }
     *n_out=n; return parts;
+}
+
+/* Прежняя сигнатура — для мест, которым закавыченность поля не нужна. */
+static char **split_line_rfc4180(Arena *a, const char *line, char delim, int *n_out, int *err) {
+    return split_line_rfc4180_q(a, line, delim, n_out, err, NULL);
+}
+
+/* Разбор строки WAL на поля. Записи, помеченные WAL_OP_INSERT_ESC, разбираются
+ * строго по RFC4180: значение могло содержать запятую, кавычку или перевод
+ * строки, а простое расщепление такие теряло — «Иванов, Иван» обрезался по
+ * первой запятой. Пустое поле и текст "NULL" там тоже закавычены, иначе их не
+ * отличить от SQL NULL. Записи без этого байта разбираются по-старому, чтобы
+ * уже накопленные WAL читались байт в байт. */
+static void wal_split_row(Arena *a, char *line, char **vals, int max_cols, int *nv) {
+    if ((unsigned char)line[0] == (unsigned char)WAL_OP_INSERT_ESC) {
+        int err = 0, n = 0;
+        unsigned char *qf = arena_calloc(a, (size_t)max_cols + 1);
+        char **parts = split_line_rfc4180_q(a, line + 1, ',', &n, &err, qf);
+        if (parts && !err) {
+            if (n > max_cols) n = max_cols;
+            for (int i = 0; i < n; i++)
+                /* НЕзакавыченное NULL — это SQL NULL; закавыченное "NULL" —
+                 * обычный текст. Ради этой развилки писатель и закавычивает
+                 * литерал "NULL". */
+                vals[i] = (!qf[i] && strcmp(parts[i], "NULL") == 0)
+                        ? (char *)DFO_NULL_SENTINEL : parts[i];
+            *nv = n;
+            return;
+        }
+        split_line_simple(line + 1, ',', vals, max_cols, nv);
+        return;
+    }
+    split_line_simple(line, ',', vals, max_cols, nv);
+    /* Старый формат: экранирования не было, поэтому NULL там всегда означал
+     * SQL NULL — так его пишет table_append и так же читает qengine. Без этого
+     * NULL приезжал ТЕКСТОМ "NULL": IS NULL не находил строку, COUNT(col) её
+     * считал, а сравнение col = 'NULL' срабатывало. */
+    for (int i = 0; i < *nv; i++)
+        if (vals[i] && strcmp(vals[i], "NULL") == 0) vals[i] = (char *)DFO_NULL_SENTINEL;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -1446,7 +1487,7 @@ static char **parse_wal_row(Arena *a, FILE *wf, int ncols) {
     size_t rl = strlen(line);
     while (rl > 0 && (line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl]='\0';
     char *vals[MAX_COLS]={0}; int nv=0;
-    split_line_simple(line, ',', vals, MAX_COLS, &nv);
+    wal_split_row(a, line, vals, MAX_COLS, &nv);
     char **row = arena_alloc(a, (size_t)ncols * sizeof(char*));
     for (int i = 0; i < ncols; i++) row[i] = (i<nv&&vals[i]) ? vals[i] : "";
     return row;
@@ -1628,9 +1669,16 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
         size_t rl=strlen(line);
         while(rl>0&&(line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl]='\0';
 
+        /* Служебные записи (DELETE/UPDATE) учтены отдельным проходом — отсеиваем
+         * их ЯВНО по оп-байту. Раньше они отбрасывались лишь потому, что в них
+         * мало печатных байт, и ради этого порог стоял на двух символах. Из-за
+         * него молча пропадала любая строка короче двух печатных знаков: в
+         * таблице из одной колонки значения "a", "5" или пробел не читались
+         * вовсе. Мусором считаем только запись, где печатных байт нет совсем. */
+        if ((unsigned char)line[0]==WAL_OP_DELETE || (unsigned char)line[0]==WAL_OP_UPDATE) continue;
         int printable=0;
         for (size_t ci=0;ci<rl;ci++) if ((unsigned char)line[ci]>=0x20) printable++;
-        if (printable < 2) continue;
+        if (printable < 1) continue;
 
         /* Check tombstones */
         bool dead=false; char *upd_csv=NULL; size_t upd_len=0;
@@ -1649,7 +1697,7 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
             size_t ul=strlen(uline);
             while(ul>0&&(uline[ul-1]=='\n'||uline[ul-1]=='\r')) uline[--ul]='\0';
             char *vals[MAX_COLS]={0}; int nv=0;
-            split_line_simple(uline,',',vals,MAX_COLS,&nv);
+            wal_split_row(a, uline, vals, MAX_COLS, &nv);
             char **row=arena_alloc(a,(size_t)ncols*sizeof(char*));
             for(int i=0;i<ncols;i++) row[i]=(i<nv&&vals[i])?vals[i]:"";
             if(n==cap){cap*=2;char***nb=arena_alloc(a,(size_t)cap*sizeof(char**));memcpy(nb,rows,(size_t)n*sizeof(char**));rows=nb;}
@@ -1658,7 +1706,7 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
         }
 
         char *vals[MAX_COLS]={0}; int nv=0;
-        split_line_simple(line,',',vals,MAX_COLS,&nv);
+        wal_split_row(a, line, vals, MAX_COLS, &nv);
         char **row=arena_alloc(a,(size_t)ncols*sizeof(char*));
         for(int i=0;i<ncols;i++) row[i]=(i<nv&&vals[i])?vals[i]:"";
 
@@ -2723,9 +2771,13 @@ static void stream_tbl_scan(ExecState *st, TblData *td) {
         {
             size_t rl0 = strlen(line);
             while (rl0 > 0 && (line[rl0-1]=='\n' || line[rl0-1]=='\r')) line[--rl0] = '\0';
+            if ((unsigned char)line[0]==WAL_OP_DELETE || (unsigned char)line[0]==WAL_OP_UPDATE) {
+                if (((++nrec) & 2047u) == 0) { arena_destroy(sa); sa = arena_create(1 << 20); st->eval_a = sa; }
+                continue;
+            }
             int pr0 = 0;
             for (size_t ci = 0; ci < rl0; ci++) if ((unsigned char)line[ci] >= 0x20) pr0++;
-            if (pr0 < 2) {
+            if (pr0 < 1) {
                 if (((++nrec) & 2047u) == 0) { arena_destroy(sa); sa = arena_create(1 << 20); st->eval_a = sa; }
                 continue;
             }
@@ -2737,12 +2789,12 @@ static void stream_tbl_scan(ExecState *st, TblData *td) {
             size_t ul = strlen(uline);
             while (ul > 0 && (uline[ul-1]=='\n' || uline[ul-1]=='\r')) uline[--ul] = '\0';
             char *vals[MAX_COLS] = {0}; int nv = 0;
-            split_line_simple(uline, ',', vals, MAX_COLS, &nv);
+            wal_split_row(sa, uline, vals, MAX_COLS, &nv);
             row = arena_alloc(sa, (size_t)ncols * sizeof(char *));
             for (int i = 0; i < ncols; i++) row[i] = (i < nv && vals[i]) ? vals[i] : "";
         } else {
             char *vals[MAX_COLS] = {0}; int nv = 0;
-            split_line_simple(line, ',', vals, MAX_COLS, &nv);
+            wal_split_row(sa, line, vals, MAX_COLS, &nv);
             row = arena_alloc(sa, (size_t)ncols * sizeof(char *));
             for (int i = 0; i < ncols; i++) row[i] = (i < nv && vals[i]) ? vals[i] : "";
         }
@@ -3318,16 +3370,23 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
             /* Strip trailing newline */
             size_t rl = strlen(line);
             while (rl > 0 && (line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl] = '\0';
+        /* Служебные записи (DELETE/UPDATE) учтены отдельным проходом — отсеиваем
+         * их ЯВНО по оп-байту. Раньше они отбрасывались лишь потому, что в них
+         * мало печатных байт, и ради этого порог стоял на двух символах. Из-за
+         * него молча пропадала любая строка короче двух печатных знаков: в
+         * таблице из одной колонки значения "a", "5" или пробел не читались
+         * вовсе. Мусором считаем только запись, где печатных байт нет совсем. */
+            if ((unsigned char)line[0]==WAL_OP_DELETE || (unsigned char)line[0]==WAL_OP_UPDATE) continue;
             int printable = 0;
             for (size_t ci = 0; ci < rl; ci++) if ((unsigned char)line[ci] >= 0x20) printable++;
-            if (printable < 2) continue;
+            if (printable < 1) continue;
 
             /* Parse CSV row */
             char *vals[MAX_COLS] = {0}; int nv = 0;
             char row_copy[262144];
             strncpy(row_copy, line, sizeof(row_copy)-1);
             row_copy[sizeof(row_copy)-1] = '\0';
-            split_line_simple(row_copy, ',', vals, MAX_COLS, &nv);
+            wal_split_row(a, row_copy, vals, MAX_COLS, &nv);
             char **cells = arena_alloc(a, (size_t)ncols * sizeof(char*));
             for (int i = 0; i < ncols; i++) cells[i] = (i < nv && vals[i]) ? vals[i] : "";
 
