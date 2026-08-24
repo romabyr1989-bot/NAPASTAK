@@ -211,6 +211,7 @@ static void *ms_create(const char *cfg, Arena *a)
      * договаривается с сервером о наибольшей общей версии протокола, покрывая
      * весь ряд от 7.0 (SQL Server 7.0) до 7.4. Кому нужен конкретный диалект —
      * задаёт tds_version в конфиге явно. */
+    char srvver[16]="";
     char tdsver[16]="auto", trust[16]="", charset[32]="UTF-8";
 
     cfg_get(cfg, "host",          host,     sizeof(host),     "");
@@ -223,6 +224,7 @@ static void *ms_create(const char *cfg, Arena *a)
     cfg_get(cfg, "batch_size",    bsz,      sizeof(bsz),      "8192");
     cfg_get(cfg, "encrypt",       enc,      sizeof(enc),      "");
     cfg_get(cfg, "tds_version",   tdsver,   sizeof(tdsver),   "auto");
+    cfg_get(cfg, "server_version", srvver,   sizeof(srvver),   "");
     cfg_get(cfg, "trust_server_certificate", trust, sizeof(trust), "");
     cfg_get(cfg, "client_charset", charset, sizeof(charset), "UTF-8");
     cfg_get(cfg, "schema",        ctx->schema,        sizeof(ctx->schema),        "dbo");
@@ -348,6 +350,24 @@ static void *ms_create(const char *cfg, Arena *a)
         if (ms_scalar(ctx, "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(64))",
                       raw, sizeof(raw)) == 0)
             ctx->srv_major = atoi(raw);
+    }
+
+    /* Ручное переопределение версии. Нужно в двух случаях. Первый рабочий:
+     * сервер за прокси или с урезанными правами не отдаёт SERVERPROPERTY, и
+     * без подсказки коннектор свалится в самый консервативный синтаксис.
+     * Второй — проверочный: синтаксис для 2005-2008R2 и для 2000 иначе негде
+     * исполнить. Образов SQL Server под Linux старше 2017 не существует, а
+     * ROW_NUMBER() и вложенный TOP понимают и новые серверы — занизив версию,
+     * мы гоняем ровно тот SQL, который поедет на старый сервер, но против
+     * живой СУБД. */
+    if (srvver[0]) {
+        int forced = atoi(srvver);
+        if (forced > 0) {
+            LOG_WARN("mssql: версия сервера задана вручную: %d (определено %d). "
+                     "Синтаксис пагинации и типы колонок выбираются по заданной.",
+                     forced, ctx->srv_major);
+            ctx->srv_major = forced;
+        }
     }
     const char *paging = ctx->srv_major >= 11 ? "OFFSET/FETCH"
                        : ctx->srv_major >= 9  ? "ROW_NUMBER()"
@@ -523,6 +543,91 @@ static int ms_describe(void *vctx, Arena *a, const char *entity, Schema **out)
  *
  * Значения эмитим как COL_TEXT — согласовано с pg/oracle: у движка баг чтения
  * нативных INT64/DOUBLE, типизацию несёт describe(). */
+/* ── Чтение значения любой длины ───────────────────────────────────────────
+ * SQLGetData в фиксированный буфер молча режет длинные значения: драйвер
+ * возвращает SQL_SUCCESS_WITH_INFO с состоянием 01004 («String data, right
+ * truncated»), а такой код проходит проверку успеха. NVARCHAR(MAX) и NTEXT
+ * при этом теряли бы всё после первых килобайт, и заметить это в конвейере
+ * невозможно — данные просто приезжают короче. Поэтому дочитываем в цикле,
+ * пока драйвер сообщает об усечении. */
+static const char *ms_get_text(MsCtx *ctx, Arena *a, SQLHSTMT st,
+                               SQLUSMALLINT col, SQLLEN *ind_out)
+{
+    char chunk[4096];
+    SQLLEN ind = 0;
+    SQLRETURN g = SQLGetData(st, col, SQL_C_CHAR, chunk, sizeof(chunk), &ind);
+    *ind_out = ind;
+    if (g == SQL_NO_DATA || !ms_ok(g) || ind == SQL_NULL_DATA) return NULL;
+
+    /* Признак «влезло не всё» — сам код возврата: SQL_SUCCESS_WITH_INFO.
+     * Сверяться с SQLSTATE 01004 не годится: драйвер вправе не заполнять
+     * диагностику при усечении, и тогда мы принимали бы первый кусок за всё
+     * значение — NVARCHAR(MAX) молча приезжал бы обрезанным до 4 КБ. */
+    if (g != SQL_SUCCESS_WITH_INFO) return arena_strdup(a, chunk);
+
+    size_t cap = sizeof(chunk) * 4, len = strlen(chunk);
+    char *buf = arena_alloc(a, cap);
+    memcpy(buf, chunk, len + 1);
+
+    while (g == SQL_SUCCESS_WITH_INFO) {
+        g = SQLGetData(st, col, SQL_C_CHAR, chunk, sizeof(chunk), &ind);
+        if (g == SQL_NO_DATA || !ms_ok(g)) break;
+        size_t add = strlen(chunk);
+        if (add == 0) break;
+        if (len + add + 1 > cap) {
+            size_t ncap = cap * 2;
+            while (len + add + 1 > ncap) ncap *= 2;
+            char *nb = arena_alloc(a, ncap);
+            memcpy(nb, buf, len + 1);
+            buf = nb; cap = ncap;
+        }
+        memcpy(buf + len, chunk, add + 1);
+        len += add;
+    }
+    (void)ctx;
+    return buf;
+}
+
+/* Список колонок таблицы с префиксом алиаса — «t.[id], t.[name], …».
+ * Нужен ветке ROW_NUMBER(): наружу из подзапроса нельзя выпускать «*», иначе
+ * туда попадёт служебный номер строки. */
+static int ms_column_list(MsCtx *ctx, const char *sch, const char *tab,
+                          const char *alias, char *out, size_t outsz)
+{
+    char sql[MS_MAX_SQL];
+    snprintf(sql, sizeof(sql),
+             "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+             "WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = '%s' "
+             "ORDER BY ORDINAL_POSITION", sch, tab);
+
+    SQLHSTMT st = SQL_NULL_HSTMT;
+    if (!ms_ok(SQLAllocHandle(SQL_HANDLE_STMT, ctx->dbc, &st))) return -1;
+    if (!ms_ok(SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS))) {
+        ms_diag(ctx, SQL_HANDLE_STMT, st, "список колонок");
+        SQLFreeHandle(SQL_HANDLE_STMT, st);
+        return -1;
+    }
+    size_t off = 0;
+    int n = 0;
+    while (SQLFetch(st) == SQL_SUCCESS) {
+        char nm[256] = ""; SQLLEN ind = 0;
+        if (!ms_ok(SQLGetData(st, 1, SQL_C_CHAR, nm, sizeof(nm), &ind))) continue;
+        char q[300];
+        ms_quote_ident(nm, q, sizeof(q));
+        int w = snprintf(out + off, outsz - off, "%s%s.%s", n ? ", " : "", alias, q);
+        if (w < 0 || (size_t)w >= outsz - off) break;
+        off += (size_t)w; n++;
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (n == 0) {
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "не удалось получить список колонок %s.%s", sch, tab);
+        LOG_ERROR("mssql: %s", ctx->last_err);
+        return -1;
+    }
+    return 0;
+}
+
 static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                          const char *entity, ColBatch **out)
 {
@@ -530,7 +635,13 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     if (!ctx || ctx->dbc == SQL_NULL_HDBC || !entity) return -1;
     *out = NULL;
 
+    /* Размер страницы. batch_size из настроек подключения ограничивает выборку
+     * и тогда, когда вызывающий просит больше: иначе настройка не действовала
+     * бы вовсе — конвейер всегда запрашивает целый BATCH_SIZE, — а именно ею
+     * ограничивают выборку на серверах с жёсткими лимитами памяти и таймаутом
+     * запроса. */
     int64_t limit = (req && req->limit > 0) ? req->limit : ctx->batch_size;
+    if (ctx->batch_size > 0 && limit > ctx->batch_size) limit = ctx->batch_size;
     if (limit > BATCH_SIZE) limit = BATCH_SIZE;
     const char *cur = (req && req->cursor) ? req->cursor : NULL;
 
@@ -580,30 +691,57 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                      "OFFSET %lld ROWS FETCH NEXT %lld ROWS ONLY",
                      qs, qt, qo, off, (long long)limit);
         } else if (ctx->srv_major >= 9) {
-            /* 2005-2008 R2: OFFSET/FETCH ещё нет, ROW_NUMBER() уже есть. */
+            /* 2005-2008 R2: OFFSET/FETCH ещё нет, ROW_NUMBER() уже есть.
+             *
+             * Служебный номер строки ОБЯЗАН остаться внутри подзапроса.
+             * Схема батча строится из самой выдачи (SQLDescribeCol ниже), так
+             * что «SELECT *» поверх подзапроса протащил бы _rn наружу лишней
+             * колонкой: приёмник создал бы её у себя, а describe() о ней не
+             * знает. Поэтому наружу перечисляем колонки поимённо.
+             *
+             * И ORDER BY снаружи обязателен: WHERE отбирает нужный диапазон
+             * номеров, но не задаёт порядок выдачи — без него сервер вправе
+             * вернуть страницу в любом порядке. */
+            char cols[MS_MAX_SQL / 2] = "";
+            if (ms_column_list(ctx, sch, tab, "t", cols, sizeof(cols)) != 0)
+                return -1;
             snprintf(sql, sizeof(sql),
-                     "SELECT * FROM (SELECT ROW_NUMBER() OVER (ORDER BY %s) AS _rn, * "
-                     "FROM %s.%s) t WHERE t._rn > %lld AND t._rn <= %lld",
-                     qo, qs, qt, off, off + (long long)limit);
+                     "SELECT %s FROM (SELECT ROW_NUMBER() OVER (ORDER BY %s) AS _rn, * "
+                     "FROM %s.%s) t WHERE t._rn > %lld AND t._rn <= %lld "
+                     "ORDER BY t._rn",
+                     cols, qo, qs, qt, off, off + (long long)limit);
         } else {
             /* 2000 и старше (major 8 и ниже): нет ни OFFSET/FETCH, ни
-             * ROW_NUMBER(). Остаётся вложенный TOP: берём первые off+limit
-             * строк по возрастанию, из них — последние limit по убыванию, и
-             * снова разворачиваем. Дороже предыдущих вариантов, но это
-             * единственный переносимый способ на таких серверах.
-             * ВАЖНО: устойчиво только при УНИКАЛЬНОМ ключе сортировки —
-             * на дубликатах страницы могут повторять строки. Предупреждаем. */
+             * ROW_NUMBER(). Берём срез по КЛЮЧУ: пропускаем off первых
+             * значений ключа подзапросом и читаем следующие limit.
+             *
+             * Раньше здесь был приём «TOP off+limit ASC → TOP limit DESC →
+             * развернуть». Он даёт верную страницу, пока страницы есть, но у
+             * него нет конца: когда off перерастает число строк, внутренний
+             * TOP всё равно возвращает всю таблицу, а средний — её последние
+             * limit строк. Читающий цикл останавливается только на пустом
+             * батче, поэтому чтение зацикливалось и гнало последнюю страницу
+             * снова и снова (на проверке: 7 строк источника превратились в
+             * 8696 строк приёмника, из них id=6 — 4351 раз).
+             *
+             * Со срезом по ключу конец наступает сам: когда пропущены все
+             * значения, MAX подзапроса равен последнему ключу и условие
+             * «ключ > MAX» не выбирает ничего.
+             *
+             * ВАЖНО: устойчиво только при УНИКАЛЬНОМ ключе сортировки — на
+             * дубликатах строки с одинаковым ключом попадут в один срез или
+             * будут пропущены. Об этом предупреждаем при подключении. */
             if (off == 0) {
                 snprintf(sql, sizeof(sql),
                          "SELECT TOP %lld * FROM %s.%s ORDER BY %s",
                          (long long)limit, qs, qt, qo);
             } else {
                 snprintf(sql, sizeof(sql),
-                         "SELECT * FROM (SELECT TOP %lld * FROM "
-                         "(SELECT TOP %lld * FROM %s.%s ORDER BY %s ASC) AS a "
-                         "ORDER BY %s DESC) AS b ORDER BY %s ASC",
-                         (long long)limit, off + (long long)limit,
-                         qs, qt, qo, qo, qo);
+                         "SELECT TOP %lld * FROM %s.%s WHERE %s > "
+                         "(SELECT MAX(%s) FROM (SELECT TOP %lld %s FROM %s.%s "
+                         "ORDER BY %s ASC) AS a) ORDER BY %s ASC",
+                         (long long)limit, qs, qt, qo,
+                         qo, off, qo, qs, qt, qo, qo);
             }
         }
     }
@@ -641,14 +779,25 @@ static int ms_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     for (SQLSMALLINT c = 0; c < ncols; c++)
         batch->values[c] = arena_alloc(a, (size_t)limit * sizeof(char *));
 
+    for (SQLSMALLINT c = 0; c < ncols; c++)
+        batch->null_bitmap[c] = arena_calloc(a, ((size_t)limit + 7) / 8);
+
     int rows = 0;
     char last_cursor[256] = "";
     while (rows < limit && SQLFetch(st) == SQL_SUCCESS) {
         for (SQLSMALLINT c = 0; c < ncols; c++) {
-            char buf[4096] = ""; SQLLEN ind = 0;
-            SQLRETURN g = SQLGetData(st, (SQLUSMALLINT)(c + 1), SQL_C_CHAR,
-                                     buf, sizeof(buf), &ind);
-            const char *val = (ms_ok(g) && ind != SQL_NULL_DATA) ? buf : "";
+            SQLLEN ind = 0;
+            const char *val = ms_get_text(ctx, a, st, (SQLUSMALLINT)(c + 1), &ind);
+            if (ind == SQL_NULL_DATA) {
+                /* NULL и пустая строка — разные значения. Отмечаем в битовой
+                 * карте и кладём общий для проекта маркер: без него запись в
+                 * приёмник превращала бы NULL в «», ломая IS NULL и внешние
+                 * ключи (та же ошибка уже была в write_batch). */
+                batch->null_bitmap[c][rows / 8] |= (uint8_t)(1u << (rows % 8));
+                ((char **)batch->values[c])[rows] = (char *)DFO_NULL_SENTINEL;
+                continue;
+            }
+            if (!val) val = "";
             ((char **)batch->values[c])[rows] = arena_strdup(a, val);
             /* Отметка для следующей страницы — значение колонки курсора. */
             if (ctx->cursor_column[0] &&
