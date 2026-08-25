@@ -9,6 +9,7 @@
 #include "app.h"
 #include "../../lib/core/json.h"
 #include "../../lib/core/log.h"
+#include "../../lib/core/textenc.h"
 #include "../../lib/sql_parser/sql.h"
 #include "../../lib/qengine/qengine.h"   /* qe_word_similarity / qe_normalize_* (also SQL fns) */
 #include "../../lib/yaml/yaml_loader.h"
@@ -4298,14 +4299,36 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
 
     if(!req->body||req->body_len==0){http_resp_error(resp,400,"empty body");return;}
 
+    /* ── Кодировка файла ──────────────────────────────────────────────────
+     * Выгрузки из Excel и учётных систем приходят в Windows-1251, реже CP866
+     * или UTF-16; Excel к тому же ставит в начало UTF-8 файла метку порядка
+     * байтов. Раньше содержимое принималось как есть: кириллица превращалась
+     * в мусор, а невидимая метка приклеивалась к имени первой колонки — «id»
+     * переставал совпадать с «id». Ошибки при этом не было, данные просто
+     * оказывались испорчены уже в хранилище.
+     *
+     * Кодировку можно задать явно параметром encoding=; пусто или auto —
+     * определяем сами. */
+    const char *enc_param = "";
+    if (qs) { const char *e = strstr(qs, "encoding=");
+              if (e) { static __thread char ebuf[32];
+                       sscanf(e + 9, "%31[^&]", ebuf); enc_param = ebuf; } }
+    size_t body_len = 0;
+    TextEnc enc_used = TEXTENC_UNKNOWN;
+    char *body_utf8 = textenc_to_utf8(req->body, req->body_len,
+                                      textenc_parse(enc_param), &body_len, &enc_used);
+    if (!body_utf8) { http_resp_error(resp,500,"нехватка памяти при чтении файла"); return; }
+    if (enc_used != TEXTENC_UTF8)
+        LOG_INFO("ingest csv: файл прочитан как %s", textenc_name(enc_used));
+
     char tmp_path[256]; snprintf(tmp_path,sizeof(tmp_path),"/tmp/dfo_upload_%lld.csv",(long long)time(NULL));
-    FILE *f=fopen(tmp_path,"w"); if(!f){http_resp_error(resp,500,"can't write tmp");return;}
-    fwrite(req->body,1,req->body_len,f); fclose(f);
+    FILE *f=fopen(tmp_path,"w"); if(!f){free(body_utf8);http_resp_error(resp,500,"can't write tmp");return;}
+    fwrite(body_utf8,1,body_len,f); fclose(f);
 
     Arena *a=arena_create(131072);
-    const char *body=req->body;
-    const char *nl=memchr(body,'\n',req->body_len);
-    if(!nl){http_resp_error(resp,400,"no header");arena_destroy(a);return;}
+    const char *body=body_utf8;
+    const char *nl=memchr(body,'\n',body_len);
+    if(!nl){http_resp_error(resp,400,"no header");arena_destroy(a); free(body_utf8);return;}
 
     char *header=arena_strndup(a,body,(size_t)(nl-body));
     char delim = detect_delim(body, (size_t)(nl-body));
@@ -4313,8 +4336,8 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
      * authoritative even when header fields are quoted (e.g. "a,b"). */
     int ncols=0; int herr=0;
     char **hcols = split_line_rfc4180(a, header, delim, &ncols, &herr);
-    if (herr || !hcols || ncols < 1) { arena_destroy(a); http_resp_error(resp, 400, "malformed CSV header"); return; }
-    if (ncols > MAX_COLS) { arena_destroy(a); http_resp_error(resp, 400, "too many columns"); return; }
+    if (herr || !hcols || ncols < 1) { arena_destroy(a); free(body_utf8); http_resp_error(resp, 400, "malformed CSV header"); return; }
+    if (ncols > MAX_COLS) { arena_destroy(a); free(body_utf8); http_resp_error(resp, 400, "too many columns"); return; }
 
     Schema *schema=arena_calloc(a,sizeof(Schema));
     schema->ncols=ncols; schema->cols=arena_alloc(a,ncols*sizeof(ColDef));
@@ -4335,8 +4358,8 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         Arena *va = arena_create(65536);
         char *vrow = arena_alloc(va, 65536);
         const char *vp = nl + 1;
-        while (vp < body + req->body_len) {
-            const char *vne = csv_record_end(vp, body + req->body_len);
+        while (vp < body + body_len) {
+            const char *vne = csv_record_end(vp, body + body_len);
             size_t vrlen = (size_t)(vne - vp);
             if (vrlen == 0 || (vrlen == 1 && vp[0] == '\r')) { vp = vne + 1; continue; }
             /* Reject an over-long row LOUDLY instead of silently truncating it to
@@ -4344,7 +4367,7 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
              * dropping data. Rejecting here, in the pre-pass, keeps the ingest
              * atomic (0 rows committed). */
             if (vrlen >= 65536) {
-                arena_destroy(va); arena_destroy(a);
+                arena_destroy(va); arena_destroy(a); free(body_utf8);
                 http_resp_error(resp, 400, "CSV row exceeds the 65535-byte maximum row size");
                 return;
             }
@@ -4354,12 +4377,12 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
             int vnf = 0, vperr = 0;
             char **vf = split_line_rfc4180(va, vrow, delim, &vnf, &vperr);
             if (vperr || !vf) {
-                arena_destroy(va); arena_destroy(a);
+                arena_destroy(va); arena_destroy(a); free(body_utf8);
                 http_resp_error(resp, 400, "malformed CSV row (bad quoting)");
                 return;
             }
             if (vnf > ncols) {
-                arena_destroy(va); arena_destroy(a);
+                arena_destroy(va); arena_destroy(a); free(body_utf8);
                 http_resp_error(resp, 400, "CSV row has more fields than header");
                 return;
             }
@@ -4390,8 +4413,8 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     for (int c = 0; c < ncols; c++) batch.values[c] = col_vals[c];
     char *row_copy = arena_alloc(a, 65536);
 
-    while (p < body + req->body_len) {
-        const char *ne = csv_record_end(p, body + req->body_len);
+    while (p < body + body_len) {
+        const char *ne = csv_record_end(p, body + body_len);
         size_t rlen = (size_t)(ne - p);
         if (rlen == 0 || (rlen == 1 && p[0] == '\r')) { p = ne + 1; continue; }
         if (rlen >= 65536) rlen = 65535;
@@ -4406,12 +4429,12 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         unsigned char *fq = arena_calloc(a, (size_t)MAX_COLS + 1);
         char **fields = split_line_rfc4180_q(a, row_copy, delim, &nfields, &perr, fq);
         if (perr || !fields) {
-            arena_destroy(a);
+            arena_destroy(a); free(body_utf8);
             http_resp_error(resp, 400, "malformed CSV row (bad quoting)");
             return;
         }
         if (nfields > ncols) {
-            arena_destroy(a);
+            arena_destroy(a); free(body_utf8);
             http_resp_error(resp, 400, "CSV row has more fields than header");
             return;
         }
@@ -4448,11 +4471,11 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         if (batch.nrows == BATCH_SIZE) {
             if (req->txn_id != 0) {
                 if (txn_buffer_insert(g_app.txn_mgr, req->txn_id, tname, &batch) != 0) {
-                    arena_destroy(a); http_resp_error(resp, 500, "txn buffer failed"); return;
+                    arena_destroy(a); free(body_utf8); http_resp_error(resp, 500, "txn buffer failed"); return;
                 }
             } else {
                 if (table_append(t, &batch) != 0) {
-                    arena_destroy(a); http_resp_error(resp, 500, "ingest write failed"); return;
+                    arena_destroy(a); free(body_utf8); http_resp_error(resp, 500, "ingest write failed"); return;
                 }
             }
             batch.nrows = 0;
@@ -4462,11 +4485,11 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     if (batch.nrows > 0) {
         if (req->txn_id != 0) {
             if (txn_buffer_insert(g_app.txn_mgr, req->txn_id, tname, &batch) != 0) {
-                arena_destroy(a); http_resp_error(resp, 500, "txn buffer failed"); return;
+                arena_destroy(a); free(body_utf8); http_resp_error(resp, 500, "txn buffer failed"); return;
             }
         } else {
             if (table_append(t, &batch) != 0) {
-                arena_destroy(a); http_resp_error(resp, 500, "ingest write failed"); return;
+                arena_destroy(a); free(body_utf8); http_resp_error(resp, 500, "ingest write failed"); return;
             }
         }
     }

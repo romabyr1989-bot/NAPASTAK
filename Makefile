@@ -26,6 +26,7 @@ LIBDIR  = $(OUTDIR)/lib
 
 # ── Core library objects ──
 CORE_SRCS = lib/core/arena.c lib/core/log.c lib/core/hashmap.c \
+            lib/core/textenc.c \
             lib/core/threadpool.c lib/core/json.c lib/auth/auth.c \
             lib/auth/rbac.c lib/auth/audit.c
 NET_SRCS  = lib/net/http.c lib/net/tls.c

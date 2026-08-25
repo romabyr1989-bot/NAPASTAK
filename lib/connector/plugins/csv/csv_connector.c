@@ -5,6 +5,8 @@
  * "" -> "). Значения хранятся как TEXT (см. csv_create). Реализует DfoConnector
  * ABI; CDC не поддерживается (cdc_start/cdc_stop = NULL). */
 #include "../../connector.h"
+#include "../../../core/textenc.h"
+#include "../../../core/log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +26,49 @@ typedef struct {
     char **headers;
     int    ncols;
     Arena *arena;
+    TextEnc enc;      /* кодировка файла: задана в настройках или определена */
+    char  last_err[256];
 } CsvCtx;
+
+/* ── Кодировка файла ───────────────────────────────────────────────────────
+ * Выгрузки из Excel и учётных систем приходят в Windows-1251, реже CP866, и
+ * Excel ставит в начало UTF-8 файла метку порядка байтов. Раньше файл читался
+ * байт в байт: кириллица приезжала мусором, а метка приклеивалась к имени
+ * первой колонки. Ошибки не возникало — данные просто оказывались испорчены.
+ *
+ * Определяем кодировку по началу файла один раз, при создании контекста, и
+ * дальше переводим каждую прочитанную запись. Однобайтовые кодировки так
+ * переводятся корректно: граница символа совпадает с границей байта, и
+ * разбиение на записи от перевода не зависит. */
+static TextEnc csv_sniff_encoding(const char *path, const char *cfg_enc)
+{
+    TextEnc want = textenc_parse(cfg_enc);
+    if (want != TEXTENC_UNKNOWN) return want;
+    FILE *f = fopen(path, "rb");
+    if (!f) return TEXTENC_UTF8;
+    char probe[65536];
+    size_t n = fread(probe, 1, sizeof(probe), f);
+    fclose(f);
+    return n ? textenc_detect(probe, n) : TEXTENC_UTF8;
+}
+
+/* Переводит запись в UTF-8, если файл не в UTF-8. Результат живёт в арене. */
+static char *csv_to_utf8(CsvCtx *ctx, Arena *a, char *line)
+{
+    if (!line) return line;
+    /* Метку порядка байтов снимаем всегда — в том числе у файла, который и так
+     * в UTF-8: иначе она достаётся имени первой колонки, и заголовок «id»
+     * перестаёт совпадать с «id». */
+    size_t bl = textenc_bom_len(line, strlen(line));
+    if (bl) line += bl;
+    if (ctx->enc == TEXTENC_UTF8 || ctx->enc == TEXTENC_UNKNOWN) return line;
+    size_t out_n = 0;
+    char *conv = textenc_to_utf8(line, strlen(line), ctx->enc, &out_n, NULL);
+    if (!conv) return line;
+    char *res = arena_strndup(a, conv, out_n);
+    free(conv);
+    return res ? res : line;
+}
 
 /* ── Schema inference ── */
 /* Угадывает тип столбца по строковому значению (NULL/bool/int/double/text).
@@ -132,12 +176,36 @@ static void *csv_create(const char *cfg, Arena *a) {
         if (h) { h=strchr(h,':');if(h){h++;while(*h==' ')h++;if(*h=='"')h++;
                  ctx->has_header=(*h!='f'&&*h!='F'&&*h!='0');}}
     }
+    /* Кодировка: из настроек ("encoding") либо по содержимому файла. */
+    char enc_cfg[32] = "";
+    if (cfg) {
+        const char *e = strstr(cfg, "\"encoding\"");
+        if (e) { e = strchr(e, ':');
+                 if (e) { e++; while (*e == ' ') e++;
+                          if (*e == '"') { e++; const char *q = strchr(e, '"');
+                                           if (q) snprintf(enc_cfg, sizeof(enc_cfg), "%.*s", (int)(q - e), e); } } }
+    }
+    ctx->enc = csv_sniff_encoding(ctx->path, enc_cfg);
+    if (ctx->enc == TEXTENC_UTF16LE || ctx->enc == TEXTENC_UTF16BE) {
+        /* Файл читается построчно, а в UTF-16 каждый второй байт нулевой —
+         * разбиение на записи развалится. Честнее отказать с объяснением, чем
+         * отдать испорченные данные. */
+        snprintf(ctx->last_err, sizeof(ctx->last_err),
+                 "файл в кодировке %s: пересохраните его в UTF-8 или Windows-1251",
+                 textenc_name(ctx->enc));
+        LOG_ERROR("csv: %s (%s)", ctx->last_err, ctx->path);
+        return ctx;
+    }
+    if (ctx->enc != TEXTENC_UTF8)
+        LOG_INFO("csv: %s читается как %s", ctx->path, textenc_name(ctx->enc));
+
     /* infer schema from first two lines */
     FILE *f = fopen(ctx->path, "r");
     if (!f) return ctx;
     char line[65536];
     if (csv_read_record(f, line, sizeof(line))) {
-        int n; int perr=0; char **hdrs=split_line_ex(a,line,ctx->delimiter,&n,&perr);
+        char *line_u = csv_to_utf8(ctx, a, line);
+        int n; int perr=0; char **hdrs=split_line_ex(a,line_u,ctx->delimiter,&n,&perr);
         if (perr || !hdrs) { fclose(f); return ctx; } /* malformed header — leave schema NULL */
         ctx->ncols=n;
         if (ctx->has_header) {
@@ -241,7 +309,8 @@ static int csv_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     unsigned char vq[MAX_COLS];
     while (row<BATCH_SIZE && csv_read_record(f,line,sizeof(line))) {
         int n; int perr=0; memset(vq,0,sizeof vq);
-        char **vals=split_line_ex_q(a,line,ctx->delimiter,&n,&perr,vq);
+        char *rec = csv_to_utf8(ctx, a, line);
+        char **vals=split_line_ex_q(a,rec,ctx->delimiter,&n,&perr,vq);
         /* RFC-4180 strictness: a quote-parse error (unterminated/stray quote) is a
          * hard failure — do not silently succeed with a truncated/garbled row. */
         if (perr || !vals) { fclose(f); return -1; }
@@ -361,6 +430,11 @@ static int csv_write_batch(void *vctx, Arena *a, const char *entity,
     return batch->nrows;
 }
 
+static const char *csv_last_error(void *vctx) {
+    CsvCtx *ctx = vctx;
+    return (ctx && ctx->last_err[0]) ? ctx->last_err : NULL;
+}
+
 const DfoConnector dfo_connector_entry = {
     .abi_version = DFO_CONNECTOR_ABI_VERSION,
     .name        = "csv",
@@ -375,4 +449,5 @@ const DfoConnector dfo_connector_entry = {
     .cdc_stop    = NULL,
     .ping        = csv_ping,
     .write_batch = csv_write_batch,
+    .last_error  = csv_last_error,
 };
