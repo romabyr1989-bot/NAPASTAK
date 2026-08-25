@@ -661,6 +661,13 @@ static int ora_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                 else
                     _ct = COL_DECIMAL;   /* точное десятичное, хранится текстом */
             }
+            else if (_ot == DPI_ORACLE_TYPE_NATIVE_DOUBLE ||
+                     _ot == DPI_ORACLE_TYPE_NATIVE_FLOAT)
+                /* BINARY_DOUBLE/BINARY_FLOAT — двоичные с самого начала, в
+                 * double укладываются без потерь. Без этой ветки они уходили в
+                 * COL_TEXT, и приёмник создавал под них VARCHAR2 вместо
+                 * BINARY_DOUBLE (данные целы, но тип терялся). */
+                _ct = COL_DOUBLE;
             else if (_ot == DPI_ORACLE_TYPE_DATE)
                 _ct = COL_DATE;
             else if (_ot == DPI_ORACLE_TYPE_TIMESTAMP ||
